@@ -1,0 +1,154 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color-scheme: light dark;
+  color: rgba(255, 255, 255, 0.87);
+  background-color: #0f172a;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #1e293b;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #475569;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
+}
+
+/* Status badge styles */
+.status-badge {
+  @apply px-2 py-1 rounded-full text-xs font-medium;
+}
+
+.status-badge.valid {
+  @apply bg-status-valid/20 text-status-valid;
+}
+
+.status-badge.expiring {
+  @apply bg-status-attention/20 text-status-attention;
+}
+
+.status-badge.warning {
+  @apply bg-status-warning/20 text-status-warning;
+}
+
+.status-badge.critical {
+  @apply bg-status-critical/20 text-status-critical;
+}
+
+.status-badge.expired {
+  @apply bg-status-expired/20 text-status-expired;
+}
+
+/* Extended status variants (domain / revocation / expiration) */
+.status-badge.attention   { @apply bg-status-attention/20 text-status-attention; }
+.status-badge.expires_today { @apply bg-status-critical/20 text-status-critical; }
+.status-badge.active      { @apply bg-status-valid/20 text-status-valid; }
+.status-badge.unreachable { @apply bg-status-warning/20 text-status-warning; }
+.status-badge.dormant     { @apply bg-slate-500/20 text-slate-400; }
+.status-badge.good        { @apply bg-status-valid/20 text-status-valid; }
+.status-badge.revoked     { @apply bg-status-critical/20 text-status-critical; }
+.status-badge.unknown,
+.status-badge.not_checked { @apply bg-slate-500/20 text-slate-400; }
+.status-badge.info        { @apply bg-primary-500/20 text-primary-400; }
+
+/* Card styles */
+.card {
+  @apply bg-slate-800 rounded-lg border border-slate-700 p-4;
+}
+
+/* Cause panels keep observed facts and interpretations visually distinct. */
+.cause-block {
+  @apply rounded border p-3;
+}
+
+.cause-confirmed {
+  @apply border-emerald-700/50 bg-emerald-950/20;
+}
+
+.cause-inferred {
+  @apply border-amber-700/50 bg-amber-950/20;
+}
+
+/* Button styles */
+.btn {
+  @apply px-4 py-2 rounded-lg font-medium transition-colors duration-200;
+}
+
+.btn-primary {
+  @apply bg-primary-600 text-white hover:bg-primary-700;
+}
+
+.btn-secondary {
+  @apply bg-slate-700 text-slate-200 hover:bg-slate-600;
+}
+
+.btn-danger {
+  @apply bg-red-600 text-white hover:bg-red-700;
+}
+
+/* Input styles */
+.input {
+  @apply w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-slate-100
+         placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-primary-500
+         focus:border-transparent;
+}
+
+/* Table styles */
+.table {
+  @apply w-full text-sm;
+}
+
+.table th {
+  @apply px-4 py-3 text-left font-medium text-slate-400 bg-slate-800/50 border-b border-slate-700;
+}
+
+.table td {
+  @apply px-4 py-3 border-b border-slate-700/50;
+}
+
+.table tr:hover td {
+  @apply bg-slate-800/30;
+}
+
+/* Loading spinner */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.spinner {
+  width: 20px;
+  height: 20px;
+  border: 2px solid #475569;
+  border-top-color: #3b82f6;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}

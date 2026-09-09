@@ -1,0 +1,91 @@
+server:
+  host: "0.0.0.0"
+  port: 28000
+  cors: true
+  cors_origins: ["http://127.0.0.1:25173", "http://localhost:25173"]
+  cors_max_age: 12h
+  read_timeout: 30s
+  write_timeout: 60s
+  idle_timeout: 120s
+  shutdown_timeout: 20s
+
+database:
+  host: "localhost"
+  port: 15432
+  user: "postgres"
+  password: "123456"
+  database: "ahclm"
+  sslmode: "disable"
+  max_open_connections: 25
+  max_idle_connections: 5
+  conn_max_lifetime: 30m
+
+scanner:
+  tls_port: 443
+  timeout: 15s
+  retries: 2
+  retry_backoff_unit: 1s
+  workers: 20
+  rate_limit: 50
+  http_idle_conn_timeout: 30s
+  http_expect_continue_timeout: 1s
+  user_agent: "AHCLM-CertMonitor/2.0 (+https://github.com/ahclm)"
+  check_revocation: true    # OCSP (stapled + active) revocation checking
+  check_crl: true           # CRL fallback — REQUIRED for CRL-only CAs like Let's Encrypt; CRLs are cached by URL
+  crl_cache_ttl: 6h
+  check_ari: true           # ACME Renewal Information (RFC 9773) — CA-recommended renewal window + emergency signal
+  revocation_timeout: 15s
+  ari_timeout: 10s
+  ari_cache_default_ttl: 24h
+  ari_cache_minimum_ttl: 1h
+  ari_providers:
+    - name: "Let's Encrypt"
+      directory_url: "https://acme-v02.api.letsencrypt.org/directory"
+      issuer_common_name_patterns: ["^[RE][0-9]{1,2}$"]
+      issuer_organization_contains: ["Let's Encrypt"]
+    - name: "Google Trust Services"
+      directory_url: "https://dv.acme-v02.api.pki.goog/directory"
+      issuer_common_name_patterns: ["^W[RE][0-9]{1,2}$"]
+      issuer_organization_contains: ["Google Trust Services"]
+
+scheduler:
+  enabled: true
+  tick_interval: 1m
+  # Re-scan each certificate as it crosses these day-marks before expiry:
+  milestones: [30, 14, 10, 7, 3, 1]
+  # ...and these day-marks after expiry (catch renewals / take-downs):
+  post_expiry_checks: [1, 3, 7]
+  baseline_interval: 168h    # far-from-expiry cadence (7 days)
+  near_expiry_interval: 6h   # cadence within ~1 day of expiry
+  min_gap: 1h                # never scan the same domain more often than this
+  ari_poll_interval: 24h     # fallback ARI renewalInfo poll when the CA omits Retry-After
+  revocation_poll_interval: 24h # low-frequency OCSP/CRL sweep for unchanged certificates
+  max_daily_scans: 100000
+  scan_timeout: 90s
+  failure_backoff_unit: 6h
+  failure_backoff_max: 72h
+  near_expiry_window: 48h
+  ari_change_threshold: 1h
+  ari_poll_due_tolerance: 1m
+
+tranco:
+  enabled: true
+  source_url: "https://tranco-list.eu/top-1m.csv.zip"
+  max_domains: 1000
+  fetch_on_start: true
+  refresh_interval: 24h
+  request_timeout: 120s
+  cache_ttl: 12h
+  max_response_bytes: 134217728
+  user_agent: "AHCLM-CertMonitor/2.0"
+
+alerts:
+  enabled: true
+  webhook_enabled: false
+  webhook_url: ""
+  smtp_host: ""
+  smtp_port: 587
+  email_from: ""
+  email_to: ""
+  email_user: ""
+  email_password: ""

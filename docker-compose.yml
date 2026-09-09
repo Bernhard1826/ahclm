@@ -1,0 +1,28 @@
+# PostgreSQL for AHCLM.
+#
+# This file is optional. Every host-side port and database credential must be
+# supplied through the environment; there are no Compose-side defaults.
+#
+#   docker compose up -d
+#
+services:
+  ahclm_postgres:
+    image: postgres:18
+    container_name: ahclm_postgres
+    environment:
+      POSTGRES_USER: "${AHCLM_DB_USER:?set AHCLM_DB_USER}"
+      POSTGRES_PASSWORD: "${AHCLM_DB_PASSWORD:?set AHCLM_DB_PASSWORD}"
+      POSTGRES_DB: "${AHCLM_DB_NAME:?set AHCLM_DB_NAME}"
+    ports:
+      - "${AHCLM_DB_PORT:?set AHCLM_DB_PORT}:5432"
+    volumes:
+      - ahclm_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  ahclm_pgdata:
