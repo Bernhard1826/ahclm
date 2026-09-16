@@ -34,6 +34,28 @@ func TestParseRankedCSV_SkipsHeaderAndJunk(t *testing.T) {
 	}
 }
 
+func TestParseRankedCSV_PreservesSubdomains(t *testing.T) {
+	csv := "1,edge.example.test\n2,api.eu.example.co.uk\n"
+	m := parseRankedCSV(strings.NewReader(csv), 100)
+	if m["edge.example.test"] != 1 || m["api.eu.example.co.uk"] != 2 {
+		t.Fatalf("subdomain labels were not preserved: %v", m)
+	}
+}
+
+func TestParseRankedCSV_RejectsRanksOutsideLimit(t *testing.T) {
+	csv := "0,zero.example\n1,one.example\n3,three.example\n4,four.example\n"
+	m := parseRankedCSV(strings.NewReader(csv), 3)
+	if len(m) != 2 {
+		t.Fatalf("expected two valid rows, got %d (%v)", len(m), m)
+	}
+	if _, ok := m["zero.example"]; ok {
+		t.Fatalf("rank zero must be rejected: %v", m)
+	}
+	if _, ok := m["four.example"]; ok {
+		t.Fatalf("rank above max must be rejected: %v", m)
+	}
+}
+
 func TestRankedToSlice_OrderedByRank(t *testing.T) {
 	m := map[string]int{"b.com": 2, "a.com": 1, "c.com": 3}
 	got := rankedToSlice(m)

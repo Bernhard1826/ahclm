@@ -1,11 +1,13 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 
+	"ahclm/internal/cost"
 	"ahclm/internal/database"
 	"ahclm/internal/models"
 	"ahclm/internal/scanner"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 // Handler serves the REST API.
@@ -59,6 +62,7 @@ func (h *Handler) SetupRouter() *gin.Engine {
 		api.GET("/domains", h.listDomains)
 		api.GET("/domains/:domain", h.getDomain)
 		api.GET("/domains/:domain/observations", h.getDomainObservations)
+		api.GET("/domains/:domain/measurements", h.getDomainMeasurements)
 
 		// Certificates (distinct certs inventory)
 		api.GET("/certificates", h.listCertificates)
@@ -68,6 +72,8 @@ func (h *Handler) SetupRouter() *gin.Engine {
 		// Revocation & analysis
 		api.GET("/revocations", h.revocations)
 		api.GET("/analysis/anomalies", h.anomalies)
+		api.GET("/analysis/anomalies/cost", h.anomalyCost)
+		api.GET("/analysis/diagnosis", h.diagnosis)
 		api.GET("/analysis/patterns", h.patterns)
 
 		// Scanning
@@ -81,6 +87,7 @@ func (h *Handler) SetupRouter() *gin.Engine {
 		api.POST("/scheduler/pause", h.pauseScheduler)
 		api.POST("/scheduler/resume", h.resumeScheduler)
 		api.POST("/scheduler/tranco", h.triggerTranco)
+		api.POST("/scheduler/local-lists", h.triggerLocalLists)
 		api.GET("/schedule/upcoming", h.upcomingSchedule)
 
 		// Alerts
@@ -132,11 +139,13 @@ func (h *Handler) health(c *gin.Context) {
 func (h *Handler) runtimeConfig(c *gin.Context) {
 	cfg := h.config
 	h.ok(c, gin.H{
-		"server":    gin.H{"host": cfg.Server.Host, "port": cfg.Server.Port, "cors": cfg.Server.CORS, "cors_origins": cfg.Server.CORSOrigins},
-		"database":  gin.H{"host": cfg.Database.Host, "port": cfg.Database.Port, "database": cfg.Database.Database, "sslmode": cfg.Database.SSLMode, "max_open_connections": cfg.Database.MaxOpenConnections, "max_idle_connections": cfg.Database.MaxIdleConnections, "conn_max_lifetime": cfg.Database.ConnMaxLifetime.String()},
-		"scanner":   gin.H{"tls_port": cfg.Scanner.TLSPort, "timeout": cfg.Scanner.Timeout.String(), "workers": cfg.Scanner.Workers, "rate_limit": cfg.Scanner.RateLimit, "check_revocation": cfg.Scanner.CheckRevocation, "check_crl": cfg.Scanner.CheckCRL, "check_ari": cfg.Scanner.CheckARI},
-		"scheduler": gin.H{"enabled": cfg.Scheduler.Enabled, "milestones": cfg.Scheduler.Milestones, "post_expiry_checks": cfg.Scheduler.PostExpiryChecks, "baseline_interval": cfg.Scheduler.BaselineInterval.String(), "near_expiry_interval": cfg.Scheduler.NearExpiryInterval.String(), "min_gap": cfg.Scheduler.MinGap.String(), "ari_poll_interval": cfg.Scheduler.ARIPollInterval.String(), "revocation_poll_interval": cfg.Scheduler.RevocationPollInterval.String(), "max_daily_scans": cfg.Scheduler.MaxDailyScans},
-		"tranco":    gin.H{"enabled": cfg.Tranco.Enabled, "source_url": cfg.Tranco.SourceURL, "max_domains": cfg.Tranco.MaxDomains, "refresh_interval": cfg.Tranco.RefreshInterval.String(), "fetch_on_start": cfg.Tranco.FetchOnStart},
+		"server":      gin.H{"host": cfg.Server.Host, "port": cfg.Server.Port, "cors": cfg.Server.CORS, "cors_origins": cfg.Server.CORSOrigins},
+		"database":    gin.H{"host": cfg.Database.Host, "port": cfg.Database.Port, "database": cfg.Database.Database, "sslmode": cfg.Database.SSLMode, "max_open_connections": cfg.Database.MaxOpenConnections, "max_idle_connections": cfg.Database.MaxIdleConnections, "conn_max_lifetime": cfg.Database.ConnMaxLifetime.String()},
+		"scanner":     gin.H{"tls_port": cfg.Scanner.TLSPort, "timeout": cfg.Scanner.Timeout.String(), "workers": cfg.Scanner.Workers, "rate_limit": cfg.Scanner.RateLimit, "check_revocation": cfg.Scanner.CheckRevocation, "check_crl": cfg.Scanner.CheckCRL, "check_ari": cfg.Scanner.CheckARI, "dns_resolvers": cfg.Scanner.DNSResolvers, "max_endpoint_samples": cfg.Scanner.MaxEndpointSamples, "endpoint_probe_concurrency": cfg.Scanner.EndpointProbeConcurrency, "check_caa": cfg.Scanner.CheckCAA, "check_ct": cfg.Scanner.CheckCT, "ct_endpoint": cfg.Scanner.CTEndpoint, "check_http_fingerprint": cfg.Scanner.CheckHTTPFingerprint},
+		"scheduler":   gin.H{"enabled": cfg.Scheduler.Enabled, "milestones": cfg.Scheduler.Milestones, "post_expiry_checks": cfg.Scheduler.PostExpiryChecks, "baseline_interval": cfg.Scheduler.BaselineInterval.String(), "near_expiry_interval": cfg.Scheduler.NearExpiryInterval.String(), "min_gap": cfg.Scheduler.MinGap.String(), "ari_poll_interval": cfg.Scheduler.ARIPollInterval.String(), "revocation_poll_interval": cfg.Scheduler.RevocationPollInterval.String(), "max_daily_scans": cfg.Scheduler.MaxDailyScans},
+		"cost":        gin.H{"currency": cfg.Cost.Currency, "issuance_cost": cfg.Cost.IssuanceCost, "ct_per_certificate_cost": cfg.Cost.CTPerCertificateCost, "deployment_cost": cfg.Cost.DeploymentCost, "verification_cost": cfg.Cost.VerificationCost, "active_measurement_cost": cfg.Cost.ActiveMeasurementCost, "manual_review_cost": cfg.Cost.ManualReviewCost, "retry_cost": cfg.Cost.RetryCost, "rollback_cost": cfg.Cost.RollbackCost, "revoked_service_per_hour": cfg.Cost.RevokedServicePerHour, "residual_exposure_per_hour": cfg.Cost.ResidualExposurePerHour, "expired_service_per_hour": cfg.Cost.ExpiredServicePerHour, "partial_deployment_per_hour": cfg.Cost.PartialDeploymentPerHour, "stale_certificate_per_hour": cfg.Cost.StaleCertificatePerHour, "unreachable_service_per_hour": cfg.Cost.UnreachableServicePerHour, "expiry_incident_cost": cfg.Cost.ExpiryIncidentCost},
+		"tranco":      gin.H{"enabled": cfg.Tranco.Enabled, "source_url": cfg.Tranco.SourceURL, "max_domains": cfg.Tranco.MaxDomains, "refresh_interval": cfg.Tranco.RefreshInterval.String(), "fetch_on_start": cfg.Tranco.FetchOnStart},
+		"local_lists": gin.H{"enabled": cfg.LocalLists.Enabled, "refresh_interval": cfg.LocalLists.RefreshInterval.String(), "fetch_on_start": cfg.LocalLists.FetchOnStart, "sources": cfg.LocalLists.Sources},
 	})
 }
 
@@ -176,11 +185,12 @@ func (h *Handler) getDomain(c *gin.Context) {
 		h.fail(c, http.StatusNotFound, fmt.Errorf("domain not found"))
 		return
 	}
-	h.ok(c, gin.H{
+	response := gin.H{
 		"domain":              dc,
 		"view":                toDomainView(dc),
 		"current_certificate": dc.CurrentCertificate,
-	})
+	}
+	h.ok(c, response)
 }
 
 func (h *Handler) getDomainObservations(c *gin.Context) {
@@ -188,10 +198,29 @@ func (h *Handler) getDomainObservations(c *gin.Context) {
 	limit := queryInt(c, "limit", 200)
 	obs, err := h.db.GetDomainTimeline(domain, limit)
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, database.ErrDomainNotMonitored) {
+			h.fail(c, http.StatusNotFound, fmt.Errorf("domain not found"))
+			return
+		}
 		h.fail(c, http.StatusInternalServerError, err)
 		return
 	}
 	h.ok(c, gin.H{"domain": domain, "count": len(obs), "observations": obs})
+}
+
+func (h *Handler) getDomainMeasurements(c *gin.Context) {
+	domain := models.GetDomain(c.Param("domain"))
+	limit := queryInt(c, "limit", 120)
+	snapshots, err := h.db.GetMeasurementSnapshots(domain, limit)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, database.ErrDomainNotMonitored) {
+			h.fail(c, http.StatusNotFound, fmt.Errorf("domain not found"))
+			return
+		}
+		h.fail(c, http.StatusInternalServerError, err)
+		return
+	}
+	h.ok(c, gin.H{"domain": domain, "count": len(snapshots), "measurements": snapshots})
 }
 
 // ---------------------------------------------------------------------------
@@ -247,7 +276,86 @@ func (h *Handler) anomalies(c *gin.Context) {
 		h.fail(c, http.StatusInternalServerError, err)
 		return
 	}
+	if c.Query("include_cost") == "true" {
+		if err := h.attachAnomalyCosts(items); err != nil {
+			h.fail(c, http.StatusInternalServerError, err)
+			return
+		}
+	}
 	h.ok(c, gin.H{"count": len(items), "anomalies": items})
+}
+
+// anomalyCost returns the current-certificate cost comparison for one
+// anomaly domain. Cost is intentionally a separate, on-demand request so the
+// anomaly list remains a fast evidence index even when it contains hundreds
+// of historical or low-priority findings.
+func (h *Handler) anomalyCost(c *gin.Context) {
+	domain := models.GetDomain(c.Query("domain"))
+	if domain == "" {
+		h.fail(c, http.StatusBadRequest, fmt.Errorf("domain is required"))
+		return
+	}
+	evidence, err := h.db.GetCostEvidence(domain)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			h.fail(c, http.StatusNotFound, fmt.Errorf("domain not found"))
+			return
+		}
+		h.fail(c, http.StatusInternalServerError, fmt.Errorf("load cost evidence: %w", err))
+		return
+	}
+	now := time.Now()
+	if !cost.HasMeasuredProblem(*evidence, now) {
+		h.ok(c, gin.H{"domain": domain, "cost": nil})
+		return
+	}
+	breakdown := cost.Calculate(*evidence, h.config.Cost, now)
+	h.ok(c, gin.H{"domain": domain, "cost": breakdown})
+}
+
+func (h *Handler) diagnosis(c *gin.Context) {
+	domain := models.GetDomain(c.Query("domain"))
+	if domain == "" {
+		h.fail(c, http.StatusBadRequest, fmt.Errorf("domain is required"))
+		return
+	}
+	diagnosis, err := h.db.GetDomainDiagnosis(domain)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			h.fail(c, http.StatusNotFound, fmt.Errorf("domain not found"))
+			return
+		}
+		h.fail(c, http.StatusInternalServerError, fmt.Errorf("load diagnosis: %w", err))
+		return
+	}
+	h.ok(c, gin.H{"domain": domain, "diagnosis": diagnosis})
+}
+
+// attachAnomalyCosts adds one current-certificate cost comparison per anomaly
+// domain. The domain guard prevents repeated anomaly types for the same domain
+// from triggering repeated evidence queries or duplicated calculations. Only the
+// first anomaly row for a domain carries the result; the frontend promotes it
+// to the domain-level cost section instead of repeating a card per finding.
+func (h *Handler) attachAnomalyCosts(items []models.Anomaly) error {
+	now := time.Now()
+	loaded := make(map[string]bool)
+	for i := range items {
+		domain := items[i].Domain
+		if loaded[domain] {
+			continue
+		}
+		loaded[domain] = true
+		evidence, err := h.db.GetCostEvidence(domain)
+		if err != nil {
+			return fmt.Errorf("load cost evidence for %s: %w", domain, err)
+		}
+		if !cost.HasMeasuredProblem(*evidence, now) {
+			continue
+		}
+		breakdown := cost.Calculate(*evidence, h.config.Cost, now)
+		items[i].Cost = &breakdown
+	}
+	return nil
 }
 
 func (h *Handler) patterns(c *gin.Context) {
@@ -272,6 +380,10 @@ func (h *Handler) scanDomain(c *gin.Context) {
 	}
 	result, err := h.scheduler.ScanNow(req.Domain)
 	if err != nil {
+		if errors.Is(err, database.ErrDomainNotMonitored) {
+			h.fail(c, http.StatusNotFound, fmt.Errorf("domain is not in the current monitoring population"))
+			return
+		}
 		h.fail(c, http.StatusInternalServerError, err)
 		return
 	}
@@ -356,6 +468,19 @@ func (h *Handler) triggerTranco(c *gin.Context) {
 		return
 	}
 	n, err := h.scheduler.ScheduleTrancoScans()
+	if err != nil {
+		h.fail(c, http.StatusInternalServerError, err)
+		return
+	}
+	h.ok(c, gin.H{"status": "registered", "domains": n})
+}
+
+func (h *Handler) triggerLocalLists(c *gin.Context) {
+	if h.scheduler == nil {
+		h.fail(c, http.StatusBadRequest, fmt.Errorf("scheduler not configured"))
+		return
+	}
+	n, err := h.scheduler.RefreshLocalLists(c.Request.Context())
 	if err != nil {
 		h.fail(c, http.StatusInternalServerError, err)
 		return
@@ -529,6 +654,7 @@ func toDomainView(dc *models.DomainCertificate) models.DomainView {
 	v := models.DomainView{
 		Domain:                dc.Domain,
 		TrancoRank:            dc.TrancoRank,
+		LocalListMember:       dc.LocalListMember,
 		Status:                dc.Status,
 		RevocationStatus:      dc.RevocationStatus,
 		CurrentFingerprint:    dc.CurrentFingerprint,

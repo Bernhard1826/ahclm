@@ -1,6 +1,7 @@
 # AHCLM — Adaptive HTTPS Certificate Lifecycle Monitor
 
-A Go system that continuously scans the **Tranco Top** sites, captures their deployed
+A Go system that continuously scans the **Tranco Top** sites plus configured local domain
+lists, captures their deployed
 HTTPS certificates (zgrab-style TLS handshakes), and tracks each certificate's
 **lifecycle** over time — renewals, issuer changes, revocations and expiry — using an
 **adaptive scanning strategy** that clusters scans around expiry milestones so it
@@ -33,7 +34,14 @@ addresses that with two ideas:
   caching). CRL is on by default because CRL-only CAs such as Let's Encrypt no longer
   serve OCSP.
 - **Real Tranco ingestion** — downloads the actual `top-1m.csv.zip`, unzips in memory,
-  registers the top-N (configurable) as the scanning population.
+  and registers exactly the first 10,000 entries as the ranked scanning population.
+  Every refresh removes domains that fell out of the current list while retaining
+  domains supplied by local lists.
+  Tranco is a ranking source, not a subdomain enumerator; apart from deliberate leading
+  `www` normalization, supplied FQDN labels are preserved.
+- **Combined domain populations** — plain-line and JSONL local lists are streamed,
+  normalized, de-duplicated, and refreshed daily alongside Tranco. On-demand scans
+  accept only domains in this combined current population.
 - **Adaptive per-certificate scheduling** driven by `next_scan_at`.
 - **ARI polling** — supported CAs are re-polled using `Retry-After` or a
   configurable fallback cadence, and the poll is scheduled through the normal
@@ -59,6 +67,7 @@ ahclm/
 │   │   ├── revocation/            # OCSP (stapled/active) + CRL with cache
 │   │   ├── scheduler/             # adaptive next_scan_at engine + worker pool
 │   │   ├── tranco/                # real top-1m.csv.zip fetcher
+│   │   ├── domainlist/             # plain-line and JSONL local-list loaders
 │   │   └── alerts/                # webhook + SMTP notifier
 │   └── config.yaml
 ├── ahclm_frontend/                # React + Vite + Tailwind + Recharts
@@ -100,7 +109,9 @@ $env:AHCLM_CONFIG_FILE = (Resolve-Path .\config.yaml).Path
 go run ./cmd --config $env:AHCLM_CONFIG_FILE
 ```
 The file passed with `--config` is required. On start, if enabled there, AHCLM downloads the
-configured Tranco source and begins adaptive scanning.
+configured Tranco source, loads local lists, and begins adaptive scanning. The shipped
+configuration reads the two temporary files from `../analysis/` relative to
+`ahclm_backend/config.yaml`; change those paths if the files move.
 
 ### Frontend (PowerShell)
 ```powershell
@@ -125,11 +136,34 @@ scheduler:
   near_expiry_interval: 6h              # within ~1 day of expiry
   ari_poll_interval: 24h                # fallback when ARI omits Retry-After
   max_daily_scans: 100000
-tranco:    { enabled: true, max_domains: 1000, fetch_on_start: true }
+cost:
+  currency: normalized_unit             # replace with a measured money/resource unit
+  issuance_cost: 1.0
+  ct_per_certificate_cost: 0.25        # CT monitoring overhead per new certificate
+  deployment_cost: 2.0
+  verification_cost: 0.5
+  active_measurement_cost: 0.1
+  expiry_incident_cost: 20.0
+tranco:    { enabled: true, max_domains: 10000, fetch_on_start: true }
+local_lists:
+  enabled: true
+  fetch_on_start: true
+  refresh_interval: 24h
+  sources:
+    - { name: secrank-topdomain1m, path: ../analysis/secrank-topdomain1M-domainonly-20240722.txt, format: lines, max_domains: 0 }
+    - { name: secrank-icp, path: ../analysis/domains_secrank-icp-out.txt, format: jsonl, max_domains: 0 }
 ```
 
+Cost values are applied only after AHCLM active measurement records a problem
+for the currently deployed certificate. They are shown only in the Anomalies
+view. Clients can load them on demand with
+`/api/analysis/anomalies/cost?domain=`; `include_cost=true` remains available on
+the anomalies index for compatibility. Clean domains and historical-only
+findings receive no cost calculation.
+
 Environment overrides: `AHCLM_CONFIG_FILE`, `AHCLM_BACKEND_HOST`, `AHCLM_BACKEND_PORT`,
-`AHCLM_DB_HOST/PORT/USER/PASSWORD/NAME`, `AHCLM_WORKERS`, `AHCLM_MAX_DOMAINS`.
+`AHCLM_DB_HOST/PORT/USER/PASSWORD/NAME`, and `AHCLM_WORKERS`. Tranco remains fixed at
+its first 10,000 entries; local lists are additional and refreshed as a union.
 
 The frontend requires `AHCLM_FRONTEND_HOST`, `AHCLM_FRONTEND_PORT`, `AHCLM_API_PROXY` and
 `VITE_API_URL`. The backend and database ports are read from the explicit configuration or
@@ -147,11 +181,12 @@ the corresponding environment override; no executable contains a fallback port. 
 | GET | `/api/certificates` | distinct-certificate inventory |
 | GET | `/api/certificates/expiring?days=`, `/expired` | expiry views |
 | GET | `/api/revocations` | revoked deployments |
-| GET | `/api/analysis/anomalies` | explainable findings with occurrence count, monitoring-round count, evidence and reason |
+| GET | `/api/analysis/anomalies` | fast explainable finding index with cause and monitoring evidence |
+| GET | `/api/analysis/anomalies/cost?domain=` | on-demand current-problem cost comparison for the selected anomaly domain |
 | GET | `/api/schedule/upcoming` | upcoming adaptive scans |
-| POST | `/api/scan`, `/api/scan/batch` | on-demand scans |
+| POST | `/api/scan`, `/api/scan/batch` | on-demand scans for current monitored domains |
 | GET | `/api/scan/jobs` | recent scan-job audit trail |
-| GET/POST | `/api/scheduler/status`, `/pause`, `/resume`, `/tranco` | scheduler control |
+| GET/POST | `/api/scheduler/status`, `/pause`, `/resume`, `/tranco`, `/local-lists` | scheduler control and population refresh |
 | GET | `/api/statistics/daily` | daily counters |
 | GET/POST/PUT/DELETE | `/api/alerts` | alert rules |
 
@@ -161,8 +196,9 @@ the corresponding environment override; no executable contains a fallback port. 
 cd ahclm_backend && go test ./...     # scheduling math, milestone crossing, OCSP/CRL, Tranco parsing
 ```
 
-Revocation can be checked live against `revoked.badssl.com` (→ revoked, via CRL) and
-`google.com` (→ good, via OCSP).
+Revocation parsing and CRL/OCSP fallback are covered by unit tests. Runtime monitoring
+accepts only domains in the current combined population; unrelated manual/test hosts
+are not retained in the production population.
 
 ## License
 MIT

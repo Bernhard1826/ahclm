@@ -38,6 +38,16 @@ scanner:
   ari_timeout: 10s
   ari_cache_default_ttl: 24h
   ari_cache_minimum_ttl: 1h
+  # Independent public recursive views used to distinguish CDN steering from
+  # a real topology transition.
+  dns_resolvers: ["https://cloudflare-dns.com/dns-query", "https://dns.google/resolve", "https://dns.quad9.net/dns-query"]
+  max_endpoint_samples: 16
+  endpoint_probe_concurrency: 4
+  check_caa: true
+  check_ct: true
+  ct_timeout: 8s
+  ct_endpoint: "https://crt.sh"
+  check_http_fingerprint: true
   ari_providers:
     - name: "Let's Encrypt"
       directory_url: "https://acme-v02.api.letsencrypt.org/directory"
@@ -68,16 +78,56 @@ scheduler:
   ari_change_threshold: 1h
   ari_poll_due_tolerance: 1m
 
+# Deterministic cost basis for actively measured problem certificates.
+# The shipped values are normalized units, not claims about monetary prices.
+# Replace them with measured internal costs before interpreting totals as money.
+cost:
+  # Sensitivity assumptions around normalized weights, not confidence bounds.
+  weight_lower_multiplier: 1.0
+  weight_upper_multiplier: 1.0
+  currency: "normalized_unit"
+  issuance_cost: 1.0
+  ct_per_certificate_cost: 0.25
+  deployment_cost: 2.0
+  verification_cost: 0.5
+  active_measurement_cost: 0.1
+  manual_review_cost: 1.0
+  retry_cost: 1.0
+  rollback_cost: 2.0
+  revoked_service_per_hour: 8.0
+  residual_exposure_per_hour: 6.0
+  expired_service_per_hour: 10.0
+  partial_deployment_per_hour: 4.0
+  stale_certificate_per_hour: 3.0
+  unreachable_service_per_hour: 5.0
+  expiry_incident_cost: 20.0
+
 tranco:
   enabled: true
   source_url: "https://tranco-list.eu/top-1m.csv.zip"
-  max_domains: 1000
+  max_domains: 10000
   fetch_on_start: true
   refresh_interval: 24h
   request_timeout: 120s
   cache_ttl: 12h
   max_response_bytes: 134217728
   user_agent: "AHCLM-CertMonitor/2.0"
+
+# Additional populations are combined with the current Tranco Top-10000.
+# Paths are resolved relative to this config file (ahclm_backend/).
+local_lists:
+  enabled: true
+  fetch_on_start: true
+  refresh_interval: 24h
+  sources:
+    - name: "secrank-topdomain1m"
+      path: "../analysis/secrank-topdomain1M-domainonly-20240722.txt"
+      format: "lines"
+      max_domains: 10000
+    - name: "secrank-icp"
+      path: "../analysis/domains_secrank-icp-out.txt"
+      format: "jsonl"
+      max_domains: 10000
 
 alerts:
   enabled: true

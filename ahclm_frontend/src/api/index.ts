@@ -1,6 +1,7 @@
 import axios, { AxiosError } from 'axios';
 import type {
   APIResponse,
+  CostBreakdown,
   PaginatedResponse,
   Anomaly,
   CertObservation,
@@ -20,6 +21,8 @@ import type {
   SystemStats,
   TrancoList,
   RuntimeConfig,
+  CauseDiagnosis,
+  MeasurementSnapshot,
 } from '@/types';
 
 const apiURL = String(import.meta.env.VITE_API_URL || '').trim();
@@ -72,6 +75,13 @@ export const getDomainObservations = (domain: string, limit = 200) =>
     )
     .then((r) => r.data);
 
+export const getDomainMeasurements = (domain: string, limit = 120) =>
+  api
+    .get<APIResponse<{ domain: string; count: number; measurements: MeasurementSnapshot[] }>>(
+      `/domains/${encodeURIComponent(domain)}/measurements?limit=${limit}`
+    )
+    .then((r) => r.data);
+
 // Certificates inventory
 export const getCertificates = (filter?: DomainFilter) =>
   api.get<PaginatedResponse<Certificate>>(`/certificates?${qs(filter as Record<string, unknown>)}`).then((r) => r.data);
@@ -88,8 +98,20 @@ export const getExpiredCertificates = () =>
 export const getRevocations = () =>
   api.get<APIResponse<{ count: number; domains: DomainView[] }>>('/revocations').then((r) => r.data);
 
-export const getAnomalies = (limit = 100) =>
-  api.get<APIResponse<{ count: number; anomalies: Anomaly[] }>>(`/analysis/anomalies?limit=${limit}`).then((r) => r.data);
+export const getAnomalies = (limit = 100, includeCost = false) =>
+  api
+    .get<APIResponse<{ count: number; anomalies: Anomaly[] }>>(`/analysis/anomalies?${qs({ limit, include_cost: includeCost ? 'true' : undefined })}`)
+    .then((r) => r.data);
+
+export const getAnomalyCost = (domain: string) =>
+  api
+    .get<APIResponse<{ domain: string; cost?: CostBreakdown }>>(`/analysis/anomalies/cost?${qs({ domain })}`)
+    .then((r) => r.data);
+
+export const getDiagnosis = (domain: string) =>
+  api
+    .get<APIResponse<{ domain: string; diagnosis: CauseDiagnosis }>>(`/analysis/diagnosis?${qs({ domain })}`)
+    .then((r) => r.data);
 
 export const getPatterns = () =>
   api.get<APIResponse<Patterns>>('/analysis/patterns').then((r) => r.data);

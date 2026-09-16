@@ -2,10 +2,13 @@ package scanner
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -41,6 +44,28 @@ type PersistentCacheStore interface {
 
 // NewScanner creates a new certificate scanner.
 func NewScanner(cfg *models.ScannerConfig, cacheStore PersistentCacheStore) (*Scanner, error) {
+	// Optional evidence controls have safe operational defaults. Explicitly
+	// configured values are preserved; this keeps older config files useful while
+	// enabling the deeper measurement path for new deployments.
+	if len(cfg.DNSResolvers) == 0 {
+		cfg.DNSResolvers = []string{
+			"https://cloudflare-dns.com/dns-query",
+			"https://dns.google/resolve",
+			"https://dns.quad9.net/dns-query",
+		}
+	}
+	if cfg.MaxEndpointSamples <= 0 {
+		cfg.MaxEndpointSamples = 16
+	}
+	if cfg.EndpointProbeConcurrency <= 0 {
+		cfg.EndpointProbeConcurrency = 4
+	}
+	if cfg.CTTimeout <= 0 {
+		cfg.CTTimeout = 5 * time.Second
+	}
+	if strings.TrimSpace(cfg.CTEndpoint) == "" {
+		cfg.CTEndpoint = "https://crt.sh/"
+	}
 	rl := make(chan struct{}, cfg.RateLimit)
 	for i := 0; i < cfg.RateLimit; i++ {
 		rl <- struct{}{}
@@ -96,10 +121,13 @@ func (s *Scanner) scan(ctx context.Context, domain string, enrich bool) (*models
 		RevocationCheckedVia: models.CheckedViaNone,
 		EvidenceStatus:       models.EvidenceStatusUnknown,
 	}
-	// Keep the resolver snapshot beside the TLS observation. It is cheap enough
-	// for the baseline and is the only defensible public signal for a later
-	// topology-change comparison.
-	result.ResolvedIPs = s.resolveIPs(ctx, domain)
+	// Keep independent public-recursive resolver snapshots beside the TLS
+	// observation. A union alone cannot tell CDN steering from a real topology
+	// transition, so the resolver quorum and CNAME chain are retained as well.
+	result.Topology = s.resolveTopology(ctx, domain)
+	if result.Topology != nil {
+		result.ResolvedIPs = append([]string(nil), result.Topology.PublicIPs...)
+	}
 	result.ResolvedIPsKnown = len(result.ResolvedIPs) > 0
 
 	select {
@@ -150,6 +178,11 @@ func (s *Scanner) scan(ctx context.Context, domain string, enrich bool) (*models
 		}
 	}
 	result.RawChain = chain
+	ip := ""
+	if connInfo != nil {
+		ip = connInfo.IPAddress
+	}
+	result.TLSFindings = validateChain(domain, ip, chain, time.Now())
 	result.StapledOCSP = append([]byte(nil), stapled...)
 	result.Cert = models.FromX509Cert(chain[0], start)
 	result.Cert.Chain = models.BuildChainJSON(chain)
@@ -167,83 +200,231 @@ func (s *Scanner) scan(ctx context.Context, domain string, enrich bool) (*models
 	return result, nil
 }
 
-// resolveIPs captures the current A/AAAA set without making DNS failure hide a
-// successful TLS observation. The empty result means the resolver did not
-// provide a usable snapshot, not that the domain has no DNS records.
+// resolveIPs is retained for callers that only need the public-IP union. New
+// code should use resolveTopology so resolver identity and agreement are not
+// discarded.
 func (s *Scanner) resolveIPs(ctx context.Context, domain string) []string {
-	lookupCtx, cancel := context.WithTimeout(ctx, s.config.Timeout)
-	defer cancel()
-	addresses := make([]net.IP, 0)
-	for _, recordType := range []string{"A", "AAAA"} {
-		values, err := s.resolveIPsViaDoH(lookupCtx, domain, recordType)
-		if err != nil {
-			continue
-		}
-		addresses = append(addresses, values...)
-	}
-	if len(addresses) == 0 {
-		// The TLS handshake may still succeed through the host resolver, but a
-		// failed public DNS snapshot must remain unknown rather than becoming
-		// topology evidence from a synthetic WSL/enterprise answer.
+	topology := s.resolveTopology(ctx, domain)
+	if topology == nil {
 		return nil
 	}
-	result := make([]string, 0, len(addresses))
-	for _, address := range addresses {
-		ip := address.String()
-		if !models.IsPublicIP(ip) {
-			continue
-		}
-		result = addUniqueIP(result, ip)
-	}
-	sort.Strings(result)
-	return result
+	return append([]string(nil), topology.PublicIPs...)
 }
 
-// resolveIPsViaDoH uses public recursive resolvers so WSL/enterprise
-// synthetic DNS answers cannot be persisted as public topology evidence.
-func (s *Scanner) resolveIPsViaDoH(ctx context.Context, domain, recordType string) ([]net.IP, error) {
-	clients := []string{
-		"https://cloudflare-dns.com/dns-query?name=" + url.QueryEscape(domain) + "&type=" + recordType,
-		"https://dns.google/resolve?name=" + url.QueryEscape(domain) + "&type=" + recordType,
+type dohAnswer struct {
+	Name string `json:"name"`
+	Type int    `json:"type"`
+	TTL  int    `json:"TTL"`
+	Data string `json:"data"`
+}
+
+type dohPayload struct {
+	Status    int         `json:"Status"`
+	AD        bool        `json:"AD"`
+	Answer    []dohAnswer `json:"Answer"`
+	Authority []dohAnswer `json:"Authority"`
+}
+
+// queryDoH uses a single configured public recursive resolver and returns the
+// raw RRset. It deliberately accepts both Google's /resolve endpoint and the
+// RFC 8484 JSON endpoint used by Cloudflare/Quad9.
+func (s *Scanner) queryDoH(ctx context.Context, resolver, domain, recordType string) ([]dohAnswer, error) {
+	endpoint, err := url.Parse(strings.TrimSpace(resolver))
+	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" {
+		return nil, fmt.Errorf("invalid DoH resolver %q", resolver)
 	}
+	query := endpoint.Query()
+	query.Set("name", domain)
+	query.Set("type", recordType)
+	endpoint.RawQuery = query.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/dns-json")
 	client := &http.Client{Timeout: s.config.Timeout}
-	for _, endpoint := range clients {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-		if err != nil {
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("DoH resolver returned HTTP %d", resp.StatusCode)
+	}
+	var payload dohPayload
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
+		return nil, err
+	}
+	if payload.Status != 0 && payload.Status != 3 { // NOERROR or NXDOMAIN
+		return nil, fmt.Errorf("DNS status %d", payload.Status)
+	}
+	return append(payload.Answer, payload.Authority...), nil
+}
+
+// resolveTopology captures A/AAAA/CNAME answers from independent public
+// resolvers. PublicIPs is the union (for bounded probing), while ConsensusIPs
+// is the majority view used for transition decisions.
+func (s *Scanner) resolveTopology(ctx context.Context, domain string) *models.TopologySnapshot {
+	resolvers := append([]string(nil), s.config.DNSResolvers...)
+	if len(resolvers) == 0 {
+		resolvers = []string{"https://cloudflare-dns.com/dns-query", "https://dns.google/resolve", "https://dns.quad9.net/dns-query"}
+	}
+	type resolverResult struct {
+		index int
+		obs   models.DNSResolverObservation
+	}
+	results := make(chan resolverResult, len(resolvers))
+	var wg sync.WaitGroup
+	for i, resolver := range resolvers {
+		wg.Add(1)
+		go func(index int, resolver string) {
+			defer wg.Done()
+			obs := models.DNSResolverObservation{Resolver: resolver}
+			resolverCtx, cancel := context.WithTimeout(ctx, s.config.Timeout)
+			defer cancel()
+			for _, typ := range []string{"A", "AAAA", "CNAME"} {
+				answers, err := s.queryDoH(resolverCtx, resolver, domain, typ)
+				if err != nil {
+					obs.Error = err.Error()
+					continue
+				}
+				for _, answer := range answers {
+					if answer.TTL > 0 && (obs.TTL == 0 || answer.TTL < obs.TTL) {
+						obs.TTL = answer.TTL
+					}
+					switch answer.Type {
+					case 1:
+						if ip := net.ParseIP(strings.TrimSpace(answer.Data)); ip != nil && models.IsPublicIP(ip.String()) {
+							obs.A = addUniqueIP(obs.A, ip.String())
+						}
+					case 28:
+						if ip := net.ParseIP(strings.TrimSpace(answer.Data)); ip != nil && models.IsPublicIP(ip.String()) {
+							obs.AAAA = addUniqueIP(obs.AAAA, ip.String())
+						}
+					case 5:
+						name := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(answer.Data)), ".")
+						if name != "" {
+							obs.CNAME = addUniqueIP(obs.CNAME, name)
+						}
+					}
+				}
+			}
+			sort.Strings(obs.A)
+			sort.Strings(obs.AAAA)
+			sort.Strings(obs.CNAME)
+			// A CNAME-only response is useful control-plane evidence, but it is
+			// not an address answer and must not increase the address resolver
+			// quorum used for topology transitions.
+			obs.Success = len(obs.A) > 0 || len(obs.AAAA) > 0
+			if !obs.Success && obs.Error == "" {
+				if len(obs.CNAME) > 0 {
+					obs.Error = "resolver returned CNAME but no usable public address"
+				} else {
+					obs.Error = "resolver returned no usable public records"
+				}
+			}
+			results <- resolverResult{index: index, obs: obs}
+		}(i, resolver)
+	}
+	wg.Wait()
+	close(results)
+	ordered := make([]models.DNSResolverObservation, len(resolvers))
+	for item := range results {
+		ordered[item.index] = item.obs
+	}
+	snapshot := &models.TopologySnapshot{Resolvers: ordered}
+	addressResolvers := make(map[string]int)
+	successful := 0
+	for _, obs := range ordered {
+		// Keep CNAME evidence even when the resolver did not return an address.
+		// This lets the diagnosis explain a control-plane change without turning
+		// a CNAME-only view into a false address quorum.
+		for _, cname := range obs.CNAME {
+			if !containsString(snapshot.CNAMEChain, cname) {
+				snapshot.CNAMEChain = append(snapshot.CNAMEChain, cname)
+			}
+		}
+		if !obs.Success {
 			continue
 		}
-		req.Header.Set("Accept", "application/dns-json")
-		resp, err := client.Do(req)
-		if err != nil {
-			continue
-		}
-		var payload struct {
-			Answer []struct {
-				Type int    `json:"type"`
-				Data string `json:"data"`
-			} `json:"Answer"`
-		}
-		err = json.NewDecoder(resp.Body).Decode(&payload)
-		_ = resp.Body.Close()
-		if err != nil {
-			continue
-		}
-		values := make([]net.IP, 0, len(payload.Answer))
-		for _, answer := range payload.Answer {
-			ip := net.ParseIP(strings.TrimSpace(answer.Data))
-			if ip == nil {
+		successful++
+		seen := make(map[string]struct{})
+		for _, ip := range append(append([]string{}, obs.A...), obs.AAAA...) {
+			ip = strings.TrimSpace(ip)
+			if ip == "" {
 				continue
 			}
-			if (recordType == "A" && answer.Type != 1) || (recordType == "AAAA" && answer.Type != 28) {
-				continue
+			seen[ip] = struct{}{}
+			if !containsString(snapshot.PublicIPs, ip) {
+				snapshot.PublicIPs = append(snapshot.PublicIPs, ip)
 			}
-			values = append(values, ip)
 		}
-		if len(values) > 0 {
-			return values, nil
+		for ip := range seen {
+			addressResolvers[ip]++
 		}
 	}
-	return nil, fmt.Errorf("public DNS resolution failed for %s", domain)
+	if successful > 0 {
+		quorum := successful/2 + 1
+		for ip, count := range addressResolvers {
+			if count >= quorum {
+				snapshot.ConsensusIPs = append(snapshot.ConsensusIPs, ip)
+			}
+		}
+		snapshot.ResolverQuorum = successful
+		// Agreement is the fraction of successful resolvers sharing the most
+		// common address. It is intentionally conservative for CDN steering.
+		maxCount := 0
+		for _, count := range addressResolvers {
+			if count > maxCount {
+				maxCount = count
+			}
+		}
+		if successful > 0 {
+			snapshot.ResolverAgreement = float64(maxCount) / float64(successful)
+		}
+	}
+	sort.Strings(snapshot.PublicIPs)
+	sort.Strings(snapshot.ConsensusIPs)
+	sort.Strings(snapshot.CNAMEChain)
+	canonical, _ := json.Marshal(struct {
+		IPs       []string `json:"ips"`
+		Consensus []string `json:"consensus"`
+		CNAME     []string `json:"cname"`
+	}{snapshot.PublicIPs, snapshot.ConsensusIPs, snapshot.CNAMEChain})
+	digest := sha256.Sum256(canonical)
+	snapshot.TopologyHash = hex.EncodeToString(digest[:])
+	return snapshot
+}
+
+func containsString(values []string, value string) bool {
+	for _, current := range values {
+		if current == value {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveIPsViaDoH remains as a small compatibility helper for tests and
+// callers that expect a single resolver-style query.
+func (s *Scanner) resolveIPsViaDoH(ctx context.Context, domain, recordType string) ([]net.IP, error) {
+	resolvers := s.config.DNSResolvers
+	if len(resolvers) == 0 {
+		resolvers = []string{"https://cloudflare-dns.com/dns-query", "https://dns.google/resolve", "https://dns.quad9.net/dns-query"}
+	}
+	answers, err := s.queryDoH(ctx, resolvers[0], domain, recordType)
+	if err != nil {
+		return nil, err
+	}
+	values := make([]net.IP, 0, len(answers))
+	for _, answer := range answers {
+		ip := net.ParseIP(strings.TrimSpace(answer.Data))
+		if ip == nil || (recordType == "A" && answer.Type != 1) || (recordType == "AAAA" && answer.Type != 28) {
+			continue
+		}
+		values = append(values, ip)
+	}
+	return values, nil
 }
 
 func addUniqueIP(values []string, value string) []string {
@@ -261,9 +442,12 @@ func addUniqueIP(values []string, value string) []string {
 
 // ProbeEndpoints performs a bounded, direct-IP TLS sweep. It is intentionally
 // separate from ScanBaseline: the scheduler invokes it only after a candidate
-// certificate/topology event, keeping routine Top-1000 monitoring lightweight.
+// certificate/topology event, keeping routine Top-N monitoring lightweight.
 func (s *Scanner) ProbeEndpoints(ctx context.Context, domain string, ips []string) []models.EndpointProbe {
-	const maxEndpoints = 16
+	maxEndpoints := s.config.MaxEndpointSamples
+	if maxEndpoints <= 0 {
+		maxEndpoints = 16
+	}
 	unique := make([]string, 0, len(ips))
 	for _, value := range ips {
 		ip := strings.TrimSpace(value)
@@ -276,27 +460,59 @@ func (s *Scanner) ProbeEndpoints(ctx context.Context, domain string, ips []strin
 	if len(unique) > maxEndpoints {
 		unique = unique[:maxEndpoints]
 	}
-	probes := make([]models.EndpointProbe, 0, len(unique))
-	for _, ip := range unique {
-		probe := models.EndpointProbe{IPAddress: ip}
-		probeCtx, cancel := context.WithTimeout(ctx, s.config.Timeout)
-		chain, _, _, err := s.handshakeTLSAt(probeCtx, domain, ip)
-		cancel()
-		if err != nil {
-			probe.Error = err.Error()
-			probes = append(probes, probe)
-			continue
-		}
-		if len(chain) == 0 {
-			probe.Error = "no peer certificate found"
-			probes = append(probes, probe)
-			continue
-		}
-		probe.Success = true
-		probe.Fingerprint = models.Fingerprint(chain[0])
-		probe.SPKIFingerprint = models.SPKIFingerprint(chain[0])
-		probes = append(probes, probe)
+	probes := make([]models.EndpointProbe, len(unique))
+	var wg sync.WaitGroup
+	concurrency := s.config.EndpointProbeConcurrency
+	if concurrency <= 0 {
+		concurrency = 4
 	}
+	slots := make(chan struct{}, concurrency)
+	for index, ip := range unique {
+		wg.Add(1)
+		go func(index int, ip string) {
+			defer wg.Done()
+			probe := models.EndpointProbe{IPAddress: ip}
+			defer func() { probes[index] = probe }()
+			select {
+			case slots <- struct{}{}:
+				defer func() { <-slots }()
+			case <-ctx.Done():
+				probe.Error = ctx.Err().Error()
+				return
+			}
+			select {
+			case <-s.rateLimit:
+				defer func() { s.rateLimit <- struct{}{} }()
+			case <-ctx.Done():
+				probe.Error = ctx.Err().Error()
+				return
+			}
+			probeCtx, cancel := context.WithTimeout(ctx, s.config.Timeout)
+			chain, _, info, err := s.handshakeTLSAt(probeCtx, domain, ip)
+			cancel()
+			if err != nil {
+				probe.Error = err.Error()
+				return
+			}
+			if len(chain) == 0 {
+				probe.Error = "no peer certificate found"
+				return
+			}
+			probe.Success = true
+			probe.Fingerprint = models.Fingerprint(chain[0])
+			probe.SPKIFingerprint = models.SPKIFingerprint(chain[0])
+			probe.IssuerCN = chain[0].Issuer.CommonName
+			probe.CommonName = chain[0].Subject.CommonName
+			na := chain[0].NotAfter.UTC()
+			probe.NotAfter = &na
+			if info != nil {
+				probe.TLSVersion = info.TLSVersion
+				probe.CipherSuite = info.CipherSuite
+			}
+			probe.Findings = validateChain(domain, ip, chain, time.Now())
+		}(index, ip)
+	}
+	wg.Wait()
 	return probes
 }
 
@@ -332,6 +548,34 @@ func (s *Scanner) enrichResult(ctx context.Context, result *models.ScanResult) {
 	leaf := result.RawChain[0]
 	attempted := false
 	var pending []string
+	deep := &models.DeepEvidence{CollectedAt: time.Now().UTC(), Topology: result.Topology, EndpointProbes: result.EndpointProbes, Status: models.EvidenceStatusPending}
+	if s.config.CheckCAA {
+		attempted = true
+		if records, err := s.fetchCAA(ctx, result.Domain); err != nil {
+			deep.Errors = append(deep.Errors, "CAA: "+err.Error())
+			pending = append(pending, "CAA lookup failed")
+		} else {
+			deep.CAA = records
+		}
+	}
+	if s.config.CheckCT {
+		attempted = true
+		if entries, err := s.fetchCT(ctx, result.Domain); err != nil {
+			deep.Errors = append(deep.Errors, "CT: "+err.Error())
+			pending = append(pending, "certificate-transparency lookup failed")
+		} else {
+			deep.CT = entries
+		}
+	}
+	if s.config.CheckHTTPFingerprint {
+		attempted = true
+		if fp, err := s.fetchHTTPFingerprint(ctx, result.Domain, result.ConnectionInfo); err != nil {
+			deep.Errors = append(deep.Errors, "HTTP: "+err.Error())
+			pending = append(pending, "HTTP/CDN fingerprint lookup failed")
+		} else {
+			deep.HTTP = fp
+		}
+	}
 
 	if s.config.CheckRevocation && !leaf.IsCA {
 		hasRevocationSource := len(result.StapledOCSP) > 0 || len(leaf.OCSPServer) > 0 || (s.config.CheckCRL && len(leaf.CRLDistributionPoints) > 0)
@@ -374,6 +618,145 @@ func (s *Scanner) enrichResult(ctx context.Context, result *models.ScanResult) {
 		result.EvidenceStatus = models.EvidenceStatusNotApplicable
 		result.EvidencePendingReason = "No configured deep evidence source applies to this certificate."
 	}
+	if result.EvidenceStatus == models.EvidenceStatusComplete {
+		deep.Status = models.EvidenceStatusComplete
+	} else if result.EvidenceStatus == models.EvidenceStatusNotApplicable {
+		deep.Status = models.EvidenceStatusNotApplicable
+	}
+	result.DeepEvidence = deep
+}
+
+func (s *Scanner) fetchCAA(ctx context.Context, domain string) ([]models.CAARecord, error) {
+	resolvers := s.config.DNSResolvers
+	if len(resolvers) == 0 {
+		resolvers = []string{"https://cloudflare-dns.com/dns-query", "https://dns.google/resolve"}
+	}
+	var firstErr error
+	for _, resolver := range resolvers {
+		answers, err := s.queryDoH(ctx, resolver, domain, "CAA")
+		if err != nil {
+			firstErr = err
+			continue
+		}
+		records := make([]models.CAARecord, 0, len(answers))
+		for _, answer := range answers {
+			if answer.Type != 257 {
+				continue
+			}
+			parts := strings.Fields(answer.Data)
+			if len(parts) < 3 {
+				continue
+			}
+			flag, _ := strconv.Atoi(parts[0])
+			tag := strings.Trim(parts[1], `"`)
+			value := strings.Trim(strings.Join(parts[2:], " "), `"`)
+			records = append(records, models.CAARecord{Flag: uint8(flag), Tag: tag, Value: value})
+		}
+		return records, nil
+	}
+	if firstErr == nil {
+		firstErr = fmt.Errorf("no configured resolver returned CAA")
+	}
+	return nil, firstErr
+}
+
+func (s *Scanner) fetchCT(ctx context.Context, domain string) ([]models.CTObservation, error) {
+	endpoint := strings.TrimRight(strings.TrimSpace(s.config.CTEndpoint), "/")
+	if endpoint == "" {
+		return nil, fmt.Errorf("CT endpoint is empty")
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, s.config.CTTimeout)
+	defer cancel()
+	query := endpoint + "/?q=" + url.QueryEscape(domain) + "&output=json"
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, query, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	client := &http.Client{Timeout: s.config.CTTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("CT endpoint returned HTTP %d", resp.StatusCode)
+	}
+	var raw []struct {
+		ID             int64  `json:"id"`
+		IssuerName     string `json:"issuer_name"`
+		SerialNumber   string `json:"serial_number"`
+		NotBefore      string `json:"not_before"`
+		NotAfter       string `json:"not_after"`
+		EntryTimestamp string `json:"entry_timestamp"`
+		NameValue      string `json:"name_value"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&raw); err != nil {
+		return nil, err
+	}
+	entries := make([]models.CTObservation, 0, len(raw))
+	for _, item := range raw {
+		entry := models.CTObservation{ID: item.ID, IssuerName: item.IssuerName, SerialNumber: item.SerialNumber, Names: strings.Fields(strings.ReplaceAll(item.NameValue, "\n", " "))}
+		for rawValue, target := range map[string]**time.Time{item.NotBefore: &entry.NotBefore, item.NotAfter: &entry.NotAfter, item.EntryTimestamp: &entry.EntryTimestamp} {
+			if strings.TrimSpace(rawValue) == "" {
+				continue
+			}
+			if parsed, parseErr := time.Parse(time.RFC3339, rawValue); parseErr == nil {
+				value := parsed.UTC()
+				*target = &value
+			}
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+func (s *Scanner) fetchHTTPFingerprint(ctx context.Context, domain string, info *models.ConnectionInfo) (*models.HTTPFingerprint, error) {
+	requestCtx, cancel := context.WithTimeout(ctx, s.config.Timeout)
+	defer cancel()
+	address := ""
+	if info != nil {
+		address = info.IPAddress
+	}
+	if address == "" {
+		// Resolve once. The previous implementation performed two full
+		// multi-resolver snapshots here, multiplying latency and external DNS
+		// traffic during every deep round.
+		resolved := s.resolveIPs(requestCtx, domain)
+		if len(resolved) > 0 {
+			address = resolved[0]
+		}
+	}
+	if address == "" {
+		return nil, fmt.Errorf("no public address available")
+	}
+	transport := s.client.Transport.(*http.Transport).Clone()
+	dialer := &net.Dialer{Timeout: s.config.Timeout}
+	transport.DialContext = func(dialCtx context.Context, network, _ string) (net.Conn, error) {
+		return dialer.DialContext(dialCtx, network, net.JoinHostPort(address, strconv.Itoa(s.config.TLSPort)))
+	}
+	client := &http.Client{Transport: transport, Timeout: s.config.Timeout, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
+	defer transport.CloseIdleConnections()
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, "https://"+domain+"/", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", s.config.UserAgent)
+	req.Header.Set("Accept", "*/*")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	fp := &models.HTTPFingerprint{IPAddress: address, StatusCode: resp.StatusCode, Server: resp.Header.Get("Server"), Via: resp.Header.Get("Via"), Cache: resp.Header.Get("Age")}
+	fp.Redirect = resp.Header.Get("Location")
+	for _, name := range []string{"cf-ray", "x-cache", "x-served-by", "x-amz-cf-id", "x-akamai-transformed", "x-fastly-request-id", "x-cdn"} {
+		if value := resp.Header.Get(name); value != "" {
+			fp.ProviderSignals = append(fp.ProviderSignals, name+"="+value)
+		}
+	}
+	return fp, nil
 }
 
 // handshakeHTTPS performs an HTTPS GET and extracts the TLS state. It is kept
@@ -397,7 +780,7 @@ func (s *Scanner) handshakeHTTPS(ctx context.Context, domain string, addresses [
 	transport.DialContext = func(dialCtx context.Context, network, _ string) (net.Conn, error) {
 		return dialer.DialContext(dialCtx, network, net.JoinHostPort(address, strconv.Itoa(s.config.TLSPort)))
 	}
-	client := &http.Client{Transport: transport, Timeout: s.config.Timeout}
+	client := &http.Client{Transport: transport, Timeout: s.config.Timeout, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
 	defer transport.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
@@ -441,6 +824,8 @@ func (s *Scanner) handshakeTLS(ctx context.Context, domain string, addresses []s
 // address directly. It is used only with a public DNS address so the TLS
 // endpoint and persisted topology evidence refer to the same network path.
 func (s *Scanner) handshakeTLSAt(ctx context.Context, domain, address string) ([]*x509.Certificate, []byte, *models.ConnectionInfo, error) {
+	ctx, cancel := context.WithTimeout(ctx, s.config.Timeout)
+	defer cancel()
 	tlsConfig := &tls.Config{
 		ServerName:         domain,
 		InsecureSkipVerify: true, //nolint:gosec // scanner captures untrusted certs by design
@@ -472,11 +857,13 @@ func (s *Scanner) handshakeTLSAt(ctx context.Context, domain, address string) ([
 	}
 
 	connInfo := &models.ConnectionInfo{
-		Protocol:       "TLS",
-		TLSVersion:     models.GetTLSVersionName(state.Version),
-		CipherSuite:    models.GetCipherSuiteName(state.CipherSuite),
-		ConnectionTime: time.Since(start).Milliseconds(),
-		IPAddress:      remoteIP,
+		Protocol:           "TLS",
+		TLSVersion:         models.GetTLSVersionName(state.Version),
+		CipherSuite:        models.GetCipherSuiteName(state.CipherSuite),
+		NegotiatedProtocol: state.NegotiatedProtocol,
+		ALPN:               state.NegotiatedProtocol,
+		ConnectionTime:     time.Since(start).Milliseconds(),
+		IPAddress:          remoteIP,
 	}
 	return state.PeerCertificates, state.OCSPResponse, connInfo, nil
 }

@@ -30,9 +30,10 @@ const navigation = [
 export default function Layout() {
   const location = useLocation();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const isAnomalyRoute = location.pathname === '/anomalies';
 
   return (
-    <div className="min-h-screen bg-slate-900">
+    <div className={`min-h-screen app-shell ${isAnomalyRoute ? 'anomaly-route' : ''}`}>
       {/* Mobile menu button */}
       <div className="lg:hidden fixed top-0 left-0 right-0 z-50 bg-slate-900 border-b border-slate-700 px-4 py-3 flex items-center justify-between">
         <div className="flex items-center gap-3">

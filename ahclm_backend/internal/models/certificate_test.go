@@ -45,14 +45,28 @@ func TestExpirationStatus(t *testing.T) {
 
 func TestGetDomain(t *testing.T) {
 	cases := map[string]string{
-		"https://www.Example.com/path": "example.com",
-		"http://foo.bar":               "foo.bar",
-		"WWW.TEST.ORG":                 "test.org",
-		"plain.com":                    "plain.com",
+		"https://www.Example.com/path":   "example.com",
+		"http://foo.bar":                 "foo.bar",
+		"https://edge.example.test/path": "edge.example.test",
+		"WWW.TEST.ORG":                   "test.org",
+		"plain.com":                      "plain.com",
 	}
 	for in, want := range cases {
 		if got := GetDomain(in); got != want {
 			t.Fatalf("GetDomain(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestGetDomainPreservesSubdomainLabels(t *testing.T) {
+	cases := map[string]string{
+		"edge.example.test":                         "edge.example.test",
+		"api.eu.example.co.uk":                      "api.eu.example.co.uk",
+		"https://edge.api.eu.example.co.uk/healthz": "edge.api.eu.example.co.uk",
+	}
+	for input, want := range cases {
+		if got := GetDomain(input); got != want {
+			t.Fatalf("GetDomain(%q) = %q, want %q; subdomain labels must be preserved", input, got, want)
 		}
 	}
 }

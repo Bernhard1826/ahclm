@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query';
-import { Database, Scan, CalendarClock, ShieldCheck, Info } from 'lucide-react';
+import { Database, Scan, CalendarClock, ShieldCheck, Calculator, Info } from 'lucide-react';
 import { getSystemStats, getSchedulerStatus, getRuntimeConfig } from '@/api';
 
 function Field({ label, value }: { label: string; value: React.ReactNode }) {
@@ -56,6 +56,27 @@ export default function Settings() {
           <Field label="Near-expiry cadence" value={config?.scheduler.near_expiry_interval ?? '—'} />
           <Field label="Revocation evidence cadence" value={config?.scheduler.revocation_poll_interval ?? '—'} />
           <Field label="Due now" value={sched?.queue_status?.pending ?? '—'} />
+        </div>
+
+        <div className="card">
+          <h2 className="text-lg font-semibold mb-3 flex items-center gap-2"><Calculator className="h-5 w-5 text-primary-500" /> Cost basis</h2>
+          <Field label="Unit" value={config?.cost.currency ?? '—'} />
+          <Field label="Issuance" value={config ? config.cost.issuance_cost : '—'} />
+          <Field label="CT per certificate" value={config ? config.cost.ct_per_certificate_cost : '—'} />
+          <Field label="Deployment" value={config ? config.cost.deployment_cost : '—'} />
+          <Field label="Verification" value={config ? config.cost.verification_cost : '—'} />
+          <Field label="Active measurement" value={config ? config.cost.active_measurement_cost : '—'} />
+          <Field label="Manual review" value={config ? config.cost.manual_review_cost : '—'} />
+          <Field label="Deployment retry" value={config ? config.cost.retry_cost : '—'} />
+          <Field label="Deployment rollback" value={config ? config.cost.rollback_cost : '—'} />
+          <Field label="Revoked exposure / hour" value={config ? config.cost.revoked_service_per_hour : '—'} />
+          <Field label="Residual exposure / hour" value={config ? config.cost.residual_exposure_per_hour : '—'} />
+          <Field label="Expired exposure / hour" value={config ? config.cost.expired_service_per_hour : '—'} />
+          <Field label="Partial deployment / hour" value={config ? config.cost.partial_deployment_per_hour : '—'} />
+          <Field label="Stale certificate / hour" value={config ? config.cost.stale_certificate_per_hour : '—'} />
+          <Field label="Unreachable service / hour" value={config ? config.cost.unreachable_service_per_hour : '—'} />
+          <Field label="Expiry incident" value={config ? config.cost.expiry_incident_cost : '—'} />
+          <p className="mt-2 text-xs leading-5 text-slate-500">Displayed totals use these configured deterministic units. Replace the normalized defaults with measured internal costs before treating them as money.</p>
         </div>
 
         <div className="card">

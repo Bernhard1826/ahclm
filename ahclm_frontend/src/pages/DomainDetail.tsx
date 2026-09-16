@@ -18,8 +18,8 @@ import {
   GitBranch,
   ExternalLink,
 } from 'lucide-react';
-import { getDomain, getDomainObservations } from '@/api';
-import type { CertObservation, ChainEntry } from '@/types';
+import { getDomain, getDomainObservations, getDomainMeasurements, getDiagnosis } from '@/api';
+import type { CertObservation, ChainEntry, CauseDiagnosis, MeasurementSnapshot } from '@/types';
 import { fmtDate, fmtDateTime, fmtDays, timeUntil } from '@/lib/format';
 
 const obsMeta: Record<string, { icon: typeof Flag; color: string; label: string }> = {
@@ -120,6 +120,16 @@ export default function DomainDetail() {
     queryKey: ['observations', domain],
     queryFn: async () => (await getDomainObservations(domain)).data,
   });
+  const { data: diagnosisData } = useQuery({
+    queryKey: ['diagnosis', domain],
+    queryFn: async () => (await getDiagnosis(domain)).data,
+    enabled: Boolean(domain),
+  });
+  const { data: measurementsData } = useQuery({
+    queryKey: ['measurements', domain],
+    queryFn: async () => (await getDomainMeasurements(domain)).data,
+    enabled: Boolean(domain),
+  });
 
   if (isLoading) {
     return <div className="flex justify-center py-16"><div className="spinner" /></div>;
@@ -137,6 +147,8 @@ export default function DomainDetail() {
   const cert = detail.current_certificate;
   const view = detail.view;
   const observations = obs?.observations ?? [];
+  const diagnosis: CauseDiagnosis | undefined = diagnosisData?.diagnosis;
+  const measurements: MeasurementSnapshot[] = measurementsData?.measurements ?? [];
   const sans: string[] = cert?.sans ? (() => { try { return JSON.parse(cert.sans); } catch { return []; } })() : [];
   const chain: ChainEntry[] = cert?.chain ? (() => { try { return JSON.parse(cert.chain); } catch { return []; } })() : [];
 
@@ -220,6 +232,9 @@ export default function DomainDetail() {
               <Network className="h-5 w-5 text-amber-400" /> Lifecycle evidence
             </h2>
             <Row label="Resolved public IPs" value={dc.resolved_ips || 'Not captured'} />
+            <Row label="Resolver consensus" value={dc.consensus_ips || 'Not established'} />
+            <Row label="Resolver agreement" value={dc.topology_resolver_agreement !== undefined ? `${Math.round(dc.topology_resolver_agreement * 100)}% (${dc.topology_resolver_quorum ?? 0} resolvers)` : '—'} />
+            <Row label="Endpoint diversity" value={dc.endpoint_diversity_status || 'Not measured'} />
             <Row label="Last DNS snapshot" value={dc.last_dns_observed_at ? fmtDateTime(dc.last_dns_observed_at) : '—'} />
             {dc.residual_fingerprint ? (
               <>
@@ -232,6 +247,32 @@ export default function DomainDetail() {
               <Row label="Residual tracking" value="No open revocation-follow-up incident" />
             )}
           </div>
+
+          {diagnosis && (
+            <div className="card">
+              {(() => {
+                const hypotheses = Array.isArray(diagnosis.hypotheses) ? diagnosis.hypotheses : [];
+                return (
+                  <>
+              <h2 className="text-lg font-semibold mb-3 flex items-center gap-2"><Network className="h-5 w-5 text-cyan-400" /> Deep cause assessment</h2>
+              <p className="text-sm text-slate-200">{diagnosis.summary}</p>
+              <p className="text-xs text-slate-500 mt-2">{diagnosis.measured_rounds} measurement rounds · {diagnosis.transition_rounds} transitions · {Math.round(diagnosis.evidence_completeness * 100)}% evidence completeness</p>
+              <div className="mt-3 space-y-2">
+                {hypotheses.slice(0, 3).map((hypothesis) => <div key={hypothesis.code} className="text-xs"><div className="flex justify-between text-slate-400"><span>{hypothesis.label}</span><span>{Math.round(hypothesis.score * 100)}%</span></div><div className="h-1 bg-slate-700 mt-1"><div className="h-1 bg-cyan-500" style={{ width: `${Math.round(hypothesis.score * 100)}%` }} /></div></div>)}
+              </div>
+                  </>
+                );
+              })()}
+            </div>
+          )}
+
+          {measurements.length > 0 && (
+            <div className="card">
+              <h2 className="text-lg font-semibold mb-3 flex items-center gap-2"><RefreshCw className="h-5 w-5 text-emerald-400" /> Measurement ledger</h2>
+              <p className="text-xs text-slate-500 mb-3">Each row is a retained observation round; unchanged rounds are controls for causal inference.</p>
+              <div className="overflow-x-auto"><table className="w-full text-xs"><thead><tr className="text-slate-500 text-left"><th className="pb-2 pr-3">Time</th><th className="pb-2 pr-3">Trigger</th><th className="pb-2 pr-3">Resolvers</th><th className="pb-2 pr-3">Endpoints</th><th className="pb-2">Leaf diversity</th></tr></thead><tbody>{measurements.slice(0, 12).map((measurement) => <tr key={measurement.id} className="border-t border-slate-700/50"><td className="py-2 pr-3 whitespace-nowrap">{fmtDateTime(measurement.observed_at)}</td><td className="py-2 pr-3 text-cyan-400">{measurement.trigger}</td><td className="py-2 pr-3">{Math.round(measurement.resolver_agreement * 100)}% / {measurement.resolver_quorum}</td><td className="py-2 pr-3">{measurement.successful_endpoint_count}/{measurement.endpoint_count}</td><td className="py-2">{measurement.fingerprint_count}</td></tr>)}</tbody></table></div>
+            </div>
+          )}
 
           <div className="card">
             <h2 className="text-lg font-semibold mb-3 flex items-center gap-2">

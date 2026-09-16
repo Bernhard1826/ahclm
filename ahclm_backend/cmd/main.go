@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -74,6 +75,7 @@ func main() {
 	// Tranco fetcher + scheduler.
 	trancoFetcher := tranco.NewFetcher(&cfg.Tranco)
 	sched := scheduler.NewScheduler(&cfg.Scheduler, &cfg.Scanner, db, scan, trancoFetcher)
+	sched.SetLocalLists(&cfg.LocalLists)
 
 	notifier := alerts.NewNotifier(&cfg.Alerts, db)
 	sched.SetOnAlert(notifier.Handle)
@@ -89,27 +91,41 @@ func main() {
 		log.Printf("scan %s [%s] rev=%s %dms", r.Domain, status, r.RevocationStatus, r.ScanDuration.Milliseconds())
 	})
 
+	appCtx, appCancel := context.WithCancel(context.Background())
+	defer appCancel()
+
+	// Synchronize the population before the scheduler can dispatch anything.
+	// A failed initial fetch is fatal: running with an old or manually seeded
+	// ranked population would violate the configured monitoring contract.
+	if cfg.Tranco.Enabled && cfg.Tranco.FetchOnStart {
+		log.Printf("fetching Tranco top %d ...", cfg.Tranco.MaxDomains)
+		n, err := sched.ScheduleTrancoScans()
+		if err != nil {
+			log.Fatalf("initial Tranco fetch failed: %v", err)
+		}
+		log.Printf("Tranco: %d domains registered for scanning", n)
+	}
+	if cfg.LocalLists.Enabled && cfg.LocalLists.FetchOnStart {
+		log.Printf("loading %d local domain lists ...", len(cfg.LocalLists.Sources))
+		n, err := sched.RefreshLocalLists(appCtx)
+		if err != nil {
+			log.Fatalf("initial local list refresh failed: %v", err)
+		}
+		log.Printf("local lists: %d domains registered for scanning", n)
+	}
+
 	if err := sched.Start(); err != nil {
 		log.Fatalf("failed to start scheduler: %v", err)
 	}
 	log.Printf("Scheduler started (milestones=%v, baseline=%s)", cfg.Scheduler.Milestones, cfg.Scheduler.BaselineInterval)
 
-	appCtx, appCancel := context.WithCancel(context.Background())
-	defer appCancel()
-
-	// Fetch the Tranco list on startup and refresh it daily.
+	// Refresh the Tranco list daily. Each refresh quiesces scans while it
+	// removes domains that fell out of the current Top-N list.
 	if cfg.Tranco.Enabled {
-		if cfg.Tranco.FetchOnStart {
-			go func() {
-				log.Printf("fetching Tranco top %d ...", cfg.Tranco.MaxDomains)
-				if n, err := sched.ScheduleTrancoScans(); err != nil {
-					log.Printf("initial Tranco fetch failed: %v", err)
-				} else {
-					log.Printf("Tranco: %d domains registered for scanning", n)
-				}
-			}()
-		}
 		go trancoRefreshLoop(appCtx, sched, cfg.Tranco.RefreshInterval)
+	}
+	if cfg.LocalLists.Enabled {
+		go localListsRefreshLoop(appCtx, sched, cfg.LocalLists.RefreshInterval)
 	}
 
 	// HTTP server.
@@ -160,6 +176,21 @@ func trancoRefreshLoop(ctx context.Context, sched *scheduler.Scheduler, refreshI
 	}
 }
 
+func localListsRefreshLoop(ctx context.Context, sched *scheduler.Scheduler, refreshInterval time.Duration) {
+	ticker := time.NewTicker(refreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if _, err := sched.RefreshLocalLists(ctx); err != nil {
+				log.Printf("scheduled local list refresh failed: %v", err)
+			}
+		}
+	}
+}
+
 // loadConfig requires an explicit configuration file, then applies the small
 // set of documented deployment environment overrides. It never synthesizes a
 // runnable configuration from built-in values.
@@ -184,6 +215,12 @@ func loadConfig() (*models.Config, error) {
 	))
 	if err := v.Unmarshal(cfg, hook); err != nil {
 		return nil, fmt.Errorf("parse config %q: %w", v.ConfigFileUsed(), err)
+	}
+	configDir := filepath.Dir(v.ConfigFileUsed())
+	for i := range cfg.LocalLists.Sources {
+		if path := strings.TrimSpace(cfg.LocalLists.Sources[i].Path); path != "" && !filepath.IsAbs(path) {
+			cfg.LocalLists.Sources[i].Path = filepath.Clean(filepath.Join(configDir, path))
+		}
 	}
 	log.Printf("loaded config from %s", v.ConfigFileUsed())
 
@@ -212,10 +249,6 @@ func loadConfig() (*models.Config, error) {
 	if err := setEnvInt(firstEnv("AHCLM_WORKERS"), "AHCLM_WORKERS", &cfg.Scanner.Workers); err != nil {
 		return nil, err
 	}
-	if err := setEnvInt(firstEnv("AHCLM_MAX_DOMAINS"), "AHCLM_MAX_DOMAINS", &cfg.Tranco.MaxDomains); err != nil {
-		return nil, err
-	}
-
 	return cfg, nil
 }
 

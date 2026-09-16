@@ -31,10 +31,56 @@ export interface ChainEntry {
   is_ca: boolean;
 }
 
+export interface CostLineItem {
+  lower?: number;
+  upper?: number;
+  interval_kind?: string;
+	method?: string;
+	probability?: number;
+	sample_count?: number;
+  code: string;
+  label: string;
+  amount: number;
+  basis: string;
+  evidence?: string[];
+}
+
+export interface CostBreakdown {
+  method_version?: string;
+  delta_lower?: number;
+  delta_upper?: number;
+  delta_basis?: string;
+  observation_runs?: {condition: string; first_observed: string; last_observed: string; first_clear?: string; left_truncated: boolean; right_censored: boolean; evidence_gap: boolean}[];
+  wait_lower?: number;
+  wait_upper?: number;
+  rotate_lower?: number;
+  rotate_upper?: number;
+  comparison?: string;
+  sensitivity?: string[];
+  validation?: { samples: number; brier_score: number; baseline_brier: number; persistence_brier: number; failure_count: number; basis: string };
+  applicable: boolean;
+  scope: string;
+  basis: string;
+  currency: string;
+  issue_types?: string[];
+  evidence_status: string;
+  confidence: string;
+  wait_horizon_hours: number;
+  next_measurement_at?: string;
+  wait_cost: number;
+  rotate_cost: number;
+  decision: 'wait' | 'issue' | 'remeasure' | 'not_applicable' | string;
+  hard_constraint: boolean;
+  unknowns?: string[];
+  wait_items?: CostLineItem[];
+  rotate_items?: CostLineItem[];
+}
+
 export interface DomainCertificate {
   id: number;
   domain: string;
   tranco_rank: number;
+  local_list_member?: boolean;
   current_certificate_id: number;
   current_fingerprint: string;
   status: string;
@@ -55,8 +101,18 @@ export interface DomainCertificate {
   last_error?: string;
   last_failure_class?: string;
   resolved_ips?: string;
+  consensus_ips?: string;
+  topology_cnames?: string;
+  topology_hash?: string;
+  topology_resolver_quorum?: number;
+  topology_resolver_agreement?: number;
   previous_resolved_ips?: string;
   last_dns_observed_at?: string;
+  endpoint_states?: string;
+  endpoint_diversity_status?: string;
+  endpoint_diversity_rounds?: number;
+  last_endpoint_probe_at?: string;
+  last_deep_measurement_at?: string;
   residual_fingerprint?: string;
   residual_revoked_at?: string;
   residual_first_seen_at?: string;
@@ -79,6 +135,7 @@ export interface DomainCertificate {
 export interface DomainView {
   domain: string;
   tranco_rank: number;
+  local_list_member?: boolean;
   status: string;
   revocation_status: string;
   current_fingerprint: string;
@@ -115,6 +172,7 @@ export interface CertObservation {
   resolved_ips?: string;
   previous_resolved_ips?: string;
   endpoint_probes?: string;
+  deep_evidence?: string;
   residual_duration_seconds?: number;
   tls_version?: string;
   cipher_suite?: string;
@@ -124,6 +182,27 @@ export interface CertObservation {
   notes?: string;
   evidence_status?: string;
   evidence_pending_reason?: string;
+}
+
+export interface MeasurementSnapshot {
+  id: number;
+  domain: string;
+  observed_at: string;
+  trigger: string;
+  certificate_fingerprint?: string;
+  spki_fingerprint?: string;
+  topology_hash?: string;
+  resolver_quorum: number;
+  resolver_agreement: number;
+  endpoint_count: number;
+  successful_endpoint_count: number;
+  fingerprint_count: number;
+  topology_json?: string;
+  endpoint_fingerprints_json?: string;
+  caa_json?: string;
+  ct_json?: string;
+  http_json?: string;
+  errors_json?: string;
 }
 
 export interface ScheduleEntry {
@@ -159,6 +238,40 @@ export interface Anomaly {
   first_observed_at?: string;
   last_observed_at?: string;
   detected_at: string;
+  diagnosis?: CauseDiagnosis;
+  cost?: CostBreakdown;
+}
+
+export interface CauseHypothesis {
+  code: string;
+  label: string;
+  score: number;
+  confidence: string;
+  rationale: string;
+  evidence?: string[];
+  contradictions?: string[];
+}
+
+export interface CauseDiagnosis {
+  primary_code: string;
+  primary_label: string;
+  confidence: string;
+  summary: string;
+  evidence_completeness: number;
+  hypotheses?: CauseHypothesis[] | null;
+  measurement_plan?: string[];
+  measured_rounds: number;
+  transition_rounds: number;
+}
+
+export interface EndpointProbe {
+  ip_address: string;
+  success: boolean;
+  fingerprint?: string;
+  spki_fingerprint?: string;
+  issuer_cn?: string;
+  common_name?: string;
+  error?: string;
 }
 
 export interface LabelCount {
@@ -187,6 +300,8 @@ export interface ConnectionInfo {
   protocol: string;
   tls_version: string;
   cipher_suite: string;
+  negotiated_protocol?: string;
+  alpn?: string;
   connection_time_ms: number;
   ip_address?: string;
 }
@@ -207,6 +322,11 @@ export interface ScanResult {
   failure_class?: string;
   scan_duration: number;
   scanned_at: string;
+  resolved_ips?: string[];
+  endpoint_probes?: EndpointProbe[];
+  topology?: unknown;
+  deep_evidence?: unknown;
+  measurement_trigger?: string;
 }
 
 export interface CertificateAlert {
@@ -307,9 +427,11 @@ export interface SchedulerStatus {
 export interface RuntimeConfig {
   server: { host: string; port: number; cors: boolean; cors_origins: string[] };
   database: { host: string; port: number; database: string; sslmode: string; max_open_connections: number; max_idle_connections: number; conn_max_lifetime: string };
-  scanner: { tls_port: number; timeout: string; workers: number; rate_limit: number; check_revocation: boolean; check_crl: boolean; check_ari: boolean };
+  scanner: { tls_port: number; timeout: string; workers: number; rate_limit: number; check_revocation: boolean; check_crl: boolean; check_ari: boolean; dns_resolvers?: string[]; max_endpoint_samples?: number; endpoint_probe_concurrency?: number; check_caa?: boolean; check_ct?: boolean; ct_endpoint?: string; check_http_fingerprint?: boolean };
   scheduler: { enabled: boolean; milestones: number[]; post_expiry_checks: number[]; baseline_interval: string; near_expiry_interval: string; min_gap: string; ari_poll_interval: string; revocation_poll_interval: string; max_daily_scans: number };
+  cost: { currency: string; issuance_cost: number; ct_per_certificate_cost: number; deployment_cost: number; verification_cost: number; active_measurement_cost: number; manual_review_cost: number; retry_cost: number; rollback_cost: number; revoked_service_per_hour: number; residual_exposure_per_hour: number; expired_service_per_hour: number; partial_deployment_per_hour: number; stale_certificate_per_hour: number; unreachable_service_per_hour: number; expiry_incident_cost: number };
   tranco: { enabled: boolean; source_url: string; max_domains: number; refresh_interval: string; fetch_on_start: boolean };
+  local_lists: { enabled: boolean; refresh_interval: string; fetch_on_start: boolean; sources: { name: string; path: string; format: string; max_domains: number }[] };
 }
 
 // ---- API envelopes ----

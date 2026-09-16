@@ -43,10 +43,7 @@ func NewFetcher(cfg *models.TrancoConfig) *Fetcher {
 }
 
 func (f *Fetcher) maxDomains() int {
-	if f.config != nil && f.config.MaxDomains > 0 {
-		return f.config.MaxDomains
-	}
-	return 0
+	return models.TrancoTopLimit
 }
 
 // FetchRanked returns a domain→rank map (1-based), the configured downloaded
@@ -68,8 +65,8 @@ func (f *Fetcher) FetchRanked() (map[string]int, string, string, error) {
 	if err != nil {
 		return nil, "", "", err
 	}
-	if len(ranked) == 0 {
-		return nil, "", "", fmt.Errorf("tranco source returned no valid domains")
+	if len(ranked) != models.TrancoTopLimit {
+		return nil, "", "", fmt.Errorf("tranco source returned %d domains, want exactly %d", len(ranked), models.TrancoTopLimit)
 	}
 
 	f.mu.Lock()
@@ -150,7 +147,7 @@ func parseRankedCSV(r io.Reader, max int) map[string]int {
 			continue
 		}
 		rank, err := strconv.Atoi(strings.TrimSpace(rec[0]))
-		if err != nil {
+		if err != nil || rank < 1 || (max > 0 && rank > max) {
 			continue // header or malformed row
 		}
 		domain := strings.ToLower(strings.TrimSpace(rec[1]))

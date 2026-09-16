@@ -215,7 +215,7 @@ export default function Dashboard() {
                     <Link to={`/domains/${encodeURIComponent(a.domain)}`} className="text-primary-400 hover:underline text-sm">
                       {a.domain}
                     </Link>
-                    <p className="text-xs text-slate-400 mt-0.5">{a.description}</p>
+                    <p className="text-xs text-slate-300 mt-0.5"><span className="font-semibold uppercase tracking-wide text-slate-500">Observed phenomenon: </span>{a.description}</p>
                   </div>
                   <span className={`status-badge ${a.severity}`}>{a.severity}</span>
                 </div>

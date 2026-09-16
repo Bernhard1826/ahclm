@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"ahclm/internal/database"
+	"ahclm/internal/domainlist"
 	"ahclm/internal/models"
 	"ahclm/internal/scanner"
 	"ahclm/internal/tranco"
@@ -22,24 +23,34 @@ import (
 // works off each domain's persisted NextScanAt, which is recomputed after every
 // scan to cluster around certificate-expiry milestones.
 type Scheduler struct {
-	config  *models.SchedulerConfig
-	scanCfg *models.ScannerConfig
-	db      *database.Database
-	scanner *scanner.Scanner
-	tranco  *tranco.Fetcher
+	config     *models.SchedulerConfig
+	scanCfg    *models.ScannerConfig
+	db         *database.Database
+	scanner    *scanner.Scanner
+	tranco     *tranco.Fetcher
+	localLists *models.LocalListsConfig
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	running  sync.Map // domain -> struct{} currently in flight
-	runningN int64
-	paused   atomic.Bool
+	running    sync.Map // domain -> struct{} currently in flight
+	runningN   int64
+	paused     atomic.Bool
+	trancoMu   sync.Mutex // serializes refreshes and population pruning
+	dispatchMu sync.Mutex // closes the pause/dispatch race during refresh
 
 	nowFn func() time.Time
 
 	onScanComplete func(*models.ScanResult)
 	onAlert        func(*models.WebhookPayload)
+}
+
+// SetLocalLists supplies the optional file-backed population. It is set by
+// main after configuration has been loaded, keeping the scheduler constructor
+// compatible with existing callers and tests.
+func (s *Scheduler) SetLocalLists(cfg *models.LocalListsConfig) {
+	s.localLists = cfg
 }
 
 const (
@@ -128,6 +139,9 @@ func (s *Scheduler) loop() {
 // dispatchDue selects due domains (respecting the daily budget) and scans them
 // through a bounded worker pool.
 func (s *Scheduler) dispatchDue(sem chan struct{}) {
+	s.dispatchMu.Lock()
+	defer s.dispatchMu.Unlock()
+
 	remaining := s.dailyBudgetRemaining()
 	if remaining <= 0 {
 		return
@@ -228,6 +242,9 @@ func (s *Scheduler) processResult(dc *models.DomainCertificate, result *models.S
 			})
 		}
 		dc.NextScanAt = now.Add(s.failureBackoff(dc.ConsecutiveFailures))
+		if dc.ConsecutiveFailures < 3 && s.config.MinGap > 0 {
+			dc.NextScanAt = now.Add(s.config.MinGap)
+		}
 		dc.Priority = unreachablePriority
 		s.save(dc)
 		_ = s.db.BumpDailyStat(stat)
@@ -260,6 +277,15 @@ func (s *Scheduler) processResult(dc *models.DomainCertificate, result *models.S
 	}
 
 	curDays := models.DaysUntil(cert.NotAfter, now)
+	findingsJSON, _ := json.Marshal(result.TLSFindings)
+	if string(findingsJSON) != dc.TLSFindings && (len(result.TLSFindings) > 0 || (dc.TLSFindings != "" && dc.TLSFindings != "null" && dc.TLSFindings != "[]")) {
+		obs := s.newObs(dc.Domain, cert, "tls_validation_change", "", curDays, result)
+		obs.Notes = string(findingsJSON)
+		s.appendObs(obs)
+	}
+	dc.TLSFindings = string(findingsJSON)
+	checked := result.ScannedAt
+	dc.TLSCheckedAt = &checked
 	hasPrev := dc.ScanCount > 0 && dc.CurrentFingerprint != ""
 	prevFP := dc.CurrentFingerprint
 	prevDays := dc.LastDaysUntilExpiry
@@ -271,7 +297,23 @@ func (s *Scheduler) processResult(dc *models.DomainCertificate, result *models.S
 		currentIPs = []string{result.ConnectionInfo.IPAddress}
 	}
 	sort.Strings(currentIPs)
-	topologyChanged := result.ResolvedIPsKnown && len(previousIPs) > 0 && len(dnsIPs) > 0 && !sameIPs(previousIPs, dnsIPs)
+	topologyChanged := topologyTransition(dc, result, previousIPs, dnsIPs)
+	if result.DeepEvidence != nil {
+		result.DeepEvidence.EndpointProbes = append([]models.EndpointProbe(nil), result.EndpointProbes...)
+		result.DeepEvidence.Topology = result.Topology
+	}
+	// Persist the measurement before mutating the domain row. The previous row
+	// is then available as a control when classifying stable CDN diversity versus
+	// a live rollout.
+	previousSnapshots := s.recordMeasurement(dc, result, measurementTrigger(result, certificateChanged, topologyChanged))
+	result.MeasurementTrigger = measurementTrigger(result, certificateChanged, topologyChanged)
+	if result.Topology != nil {
+		dc.ConsensusIPs = marshalString(result.Topology.ConsensusIPs)
+		dc.TopologyCNAMEs = strings.Join(result.Topology.CNAMEChain, ",")
+		dc.TopologyHash = result.Topology.TopologyHash
+		dc.TopologyResolverQuorum = result.Topology.ResolverQuorum
+		dc.TopologyResolverAgreement = result.Topology.ResolverAgreement
+	}
 
 	switch {
 	case !hasPrev:
@@ -299,11 +341,10 @@ func (s *Scheduler) processResult(dc *models.DomainCertificate, result *models.S
 		s.fireAlert("certificate_changed", dc.Domain, cert, "",
 			fmt.Sprintf("Certificate for %s changed", dc.Domain))
 	}
-	// A valid predecessor still served after a resolved public IP-set change is
-	// the observable stale-after-change proxy used by the lifecycle literature.
-	// The event is explicitly scoped to this resolver and does not claim a global
-	// hosting or control-plane transition.
-	if hasPrev && !certificateChanged && topologyChanged && cert.NotAfter.After(now) {
+	// A stale event requires a quorum-confirmed DNS transition *and* direct
+	// evidence that an old edge is still serving the predecessor while a new edge
+	// serves the successor. A changed RRset by itself is not a stale certificate.
+	if hasPrev && topologyChanged && cert.NotAfter.After(now) && staleEndpointEvidence(dc, result, prevFP, previousIPs, dnsIPs) {
 		obs := s.newObs(dc.Domain, cert, models.ObsStaleAfterChange, "", curDays, result)
 		obs.PreviousResolvedIPs = dc.ResolvedIPs
 		obs.Notes = "A still-valid leaf remained observable after the resolver's public A/AAAA set changed; this is a DNS/IP-set proxy, not proof of global control-plane change."
@@ -313,13 +354,13 @@ func (s *Scheduler) processResult(dc *models.DomainCertificate, result *models.S
 		}
 		s.appendObs(obs)
 	}
-	if certificateChanged || topologyChanged {
-		if hasMixedDeployment(result.EndpointProbes) {
+	if len(result.EndpointProbes) > 0 {
+		if deploymentFailureEvidence(dc, result, previousSnapshots, prevFP, certificateChanged) {
 			obs := s.newObs(dc.Domain, cert, models.ObsDeploymentFailure, "", curDays, result)
 			encoded, _ := json.Marshal(result.EndpointProbes)
 			obs.EndpointProbes = string(encoded)
 			obs.PreviousFingerprint = prevFP
-			obs.Notes = "Multiple currently resolved endpoints served different leaf fingerprints during a candidate follow-up; this confirms an observed partial deployment, not global deployment failure."
+			obs.Notes = "Sampled current DNS endpoints served different leaf fingerprints. This proves certificate diversity, not deployment failure; intentional CDN or dual-certificate configurations may explain it."
 			s.appendObs(obs)
 		}
 	}
@@ -533,6 +574,12 @@ func (s *Scheduler) processResult(dc *models.DomainCertificate, result *models.S
 		ariNextPoll = dc.ARINextPollAt
 	}
 	dc.NextScanAt = computeNextScanWithEvidence(s.config, now, cert.NotAfter, dc.ARIWindowStart, ariNextPoll, dc.RevocationNextCheckAt, dc.ARIEmergency)
+	if len(result.TLSFindings) > 0 || (hasMixedDeployment(result.EndpointProbes) && dc.EndpointDiversityStatus == "transitioning") {
+		recheck := now.Add(s.config.MinGap)
+		if recheck.Before(dc.NextScanAt) {
+			dc.NextScanAt = recheck
+		}
+	}
 	if dc.ResidualNextCheckAt != nil && dc.ResidualNextCheckAt.Before(dc.NextScanAt) {
 		dc.NextScanAt = *dc.ResidualNextCheckAt
 	}
@@ -548,6 +595,352 @@ func (s *Scheduler) processResult(dc *models.DomainCertificate, result *models.S
 	if s.onScanComplete != nil {
 		s.onScanComplete(result)
 	}
+}
+
+func measurementTrigger(result *models.ScanResult, certificateChanged, topologyChanged bool) string {
+	if result == nil {
+		return "unknown"
+	}
+	if result.MeasurementTrigger != "" {
+		return result.MeasurementTrigger
+	}
+	if len(result.EndpointProbes) > 0 {
+		return "endpoint_survey"
+	}
+	if certificateChanged {
+		return "certificate_change"
+	}
+	if topologyChanged {
+		return "topology_change"
+	}
+	if result.DeepEvidence != nil {
+		return "deep_poll"
+	}
+	return "baseline"
+}
+
+func topologyTransition(dc *models.DomainCertificate, result *models.ScanResult, previousIPs, currentIPs []string) bool {
+	if dc == nil || result == nil || !result.ResolvedIPsKnown || len(previousIPs) == 0 || len(currentIPs) == 0 {
+		return false
+	}
+	if result.Topology == nil {
+		return !sameIPs(previousIPs, currentIPs)
+	}
+	oldConsensus := parseIPs(dc.ConsensusIPs)
+	newConsensus := append([]string(nil), result.Topology.ConsensusIPs...)
+	if len(oldConsensus) > 0 && len(newConsensus) > 0 {
+		if sameIPs(oldConsensus, newConsensus) {
+			// A CNAME control-plane change with a stable address set is still a
+			// meaningful transition, but only when multiple resolvers agree.
+			return dc.TopologyResolverQuorum >= 2 && result.Topology.ResolverQuorum >= 2 &&
+				dc.TopologyCNAMEs != strings.Join(result.Topology.CNAMEChain, ",")
+		}
+		return dc.TopologyResolverQuorum >= 2 && result.Topology.ResolverQuorum >= 2 &&
+			dc.TopologyResolverAgreement >= 0.5 && result.Topology.ResolverAgreement >= 0.5
+	}
+	// Backward-compatible fallback for rows written before resolver quorum was
+	// persisted. Do not call a one-resolver RRset change a global transition.
+	return !sameIPs(previousIPs, currentIPs) && result.Topology.ResolverQuorum >= 2 && result.Topology.ResolverAgreement >= 0.5
+}
+
+func staleEndpointEvidence(dc *models.DomainCertificate, result *models.ScanResult, previousFingerprint string, previousIPs, currentIPs []string) bool {
+	if dc == nil || result == nil || previousFingerprint == "" || result.Cert == nil {
+		return false
+	}
+	oldSet := make(map[string]struct{}, len(previousIPs))
+	for _, ip := range previousIPs {
+		oldSet[ip] = struct{}{}
+	}
+	newSet := make(map[string]struct{}, len(currentIPs))
+	for _, ip := range currentIPs {
+		newSet[ip] = struct{}{}
+	}
+	oldPredecessor := false
+	newSuccessor := false
+	for _, probe := range result.EndpointProbes {
+		if !probe.Success || probe.Fingerprint == "" {
+			continue
+		}
+		_, wasOld := oldSet[probe.IPAddress]
+		_, isNew := newSet[probe.IPAddress]
+		if wasOld && probe.Fingerprint == previousFingerprint {
+			oldPredecessor = true
+		}
+		// The successor must be the leaf captured by the main SNI handshake.
+		// Any arbitrary different certificate on a new IP is not enough to
+		// establish that the topology change moved the current deployment.
+		if isNew && probe.Fingerprint == result.Cert.Fingerprint && probe.Fingerprint != previousFingerprint {
+			newSuccessor = true
+		}
+	}
+	return oldPredecessor && newSuccessor
+}
+
+func deploymentFailureEvidence(dc *models.DomainCertificate, result *models.ScanResult, previous []models.MeasurementSnapshot, previousFingerprint string, certificateChanged bool) bool {
+	if result == nil || !hasMixedDeployment(result.EndpointProbes) {
+		return false
+	}
+	current := endpointFingerprintSet(result.EndpointProbes)
+	if len(current) < 2 {
+		return false
+	}
+	// Stable heterogeneity is the expected shape of many CDNs and dual-cert
+	// deployments. Require at least two earlier rounds with the same per-IP map
+	// before suppressing an event; this also handles a newly introduced edge.
+	if stableEndpointDiversity(previous, current, 2) {
+		return false
+	}
+	if len(previous) == 0 {
+		return false
+	}
+	priorMixed := 0
+	for _, snapshot := range previous {
+		if snapshot.FingerprintCount >= 2 {
+			priorMixed++
+		}
+	}
+	if priorMixed == 0 {
+		// A first multi-edge survey establishes a CDN baseline, not a failed
+		// rollout. Upgrade only when the same round also contains the known
+		// predecessor and a certificate replacement was observed.
+		if !certificateChanged || previousFingerprint == "" {
+			return false
+		}
+		containsPredecessor := false
+		for _, fingerprint := range current {
+			if fingerprint == previousFingerprint {
+				containsPredecessor = true
+				break
+			}
+		}
+		if !containsPredecessor {
+			return false
+		}
+	}
+	for _, prior := range previous {
+		before := endpointFingerprintSetFromSnapshot(prior)
+		if endpointMapChanged(before, current) {
+			return true
+		}
+	}
+	// A cert replacement that leaves the predecessor on one sampled edge is a
+	// rollout signal even if the map was not present in the immediately previous
+	// deep row (for example after a baseline-only interval).
+	if certificateChanged && previousFingerprint != "" {
+		for _, fp := range current {
+			if fp == previousFingerprint {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func endpointFingerprintSet(probes []models.EndpointProbe) map[string]string {
+	result := make(map[string]string)
+	for _, probe := range probes {
+		if probe.Success && probe.IPAddress != "" && probe.Fingerprint != "" {
+			result[probe.IPAddress] = probe.Fingerprint
+		}
+	}
+	return result
+}
+
+func endpointFingerprintSetFromSnapshot(snapshot models.MeasurementSnapshot) map[string]string {
+	result := make(map[string]string)
+	if strings.TrimSpace(snapshot.EndpointFingerprintsJSON) == "" {
+		return result
+	}
+	_ = json.Unmarshal([]byte(snapshot.EndpointFingerprintsJSON), &result)
+	return result
+}
+
+func endpointMapChanged(before, after map[string]string) bool {
+	// A newly sampled or retired address is itself a deployment/topology
+	// transition. Certificate equality on the intersection must not hide an
+	// edge being added or removed from the observable set.
+	if len(before) != len(after) {
+		return true
+	}
+	for ip, fp := range before {
+		if _, ok := after[ip]; !ok {
+			return true
+		}
+		if current, ok := after[ip]; ok && current != fp {
+			return true
+		}
+	}
+	for ip, fp := range after {
+		if _, ok := before[ip]; !ok {
+			return true
+		}
+		if beforeFP, ok := before[ip]; ok && beforeFP != fp {
+			return true
+		}
+	}
+	return false
+}
+
+func stableEndpointDiversity(previous []models.MeasurementSnapshot, current map[string]string, needed int) bool {
+	if len(current) < 2 || needed <= 0 {
+		return false
+	}
+	matched := 0
+	for _, snapshot := range previous {
+		before := endpointFingerprintSetFromSnapshot(snapshot)
+		if len(before) < 2 || len(before) != len(current) {
+			continue
+		}
+		equal := true
+		for ip, fp := range current {
+			if before[ip] != fp {
+				equal = false
+				break
+			}
+		}
+		if equal {
+			matched++
+			if matched >= needed {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *Scheduler) recordMeasurement(dc *models.DomainCertificate, result *models.ScanResult, trigger string) []models.MeasurementSnapshot {
+	if s.db == nil || dc == nil || result == nil {
+		return nil
+	}
+	previous, err := s.db.GetMeasurementSnapshots(dc.Domain, 24)
+	if err != nil {
+		log.Printf("scheduler: load measurement history for %s: %v", dc.Domain, err)
+	}
+	observedAt := result.ScannedAt
+	if observedAt.IsZero() {
+		observedAt = s.now()
+	}
+	endpoints := make([]models.EndpointProbe, 0, len(result.EndpointProbes)+1)
+	seenIPs := make(map[string]struct{})
+	for _, probe := range result.EndpointProbes {
+		endpoints = append(endpoints, probe)
+		seenIPs[probe.IPAddress] = struct{}{}
+	}
+	if result.Cert != nil && result.ConnectionInfo != nil && result.ConnectionInfo.IPAddress != "" {
+		if _, exists := seenIPs[result.ConnectionInfo.IPAddress]; !exists {
+			endpoints = append(endpoints, models.EndpointProbe{IPAddress: result.ConnectionInfo.IPAddress, Success: true, Fingerprint: result.Cert.Fingerprint, SPKIFingerprint: result.Cert.SPKIFingerprint, IssuerCN: result.Cert.IssuerCN, CommonName: result.Cert.CommonName})
+		}
+	}
+	fingerprintMap := endpointFingerprintSet(endpoints)
+	allFingerprints := make(map[string]struct{})
+	for _, fp := range fingerprintMap {
+		allFingerprints[fp] = struct{}{}
+	}
+	snapshot := models.MeasurementSnapshot{
+		Domain: dc.Domain, ObservedAt: observedAt, Trigger: trigger,
+		ResolverQuorum: topologyQuorum(result), ResolverAgreement: topologyAgreement(result),
+		EndpointCount: len(endpoints), SuccessfulEndpointCount: len(fingerprintMap), FingerprintCount: len(allFingerprints),
+	}
+	if result.Cert != nil {
+		snapshot.CertificateFingerprint = result.Cert.Fingerprint
+		snapshot.SPKIFingerprint = result.Cert.SPKIFingerprint
+	}
+	if result.Topology != nil {
+		snapshot.TopologyHash = result.Topology.TopologyHash
+		snapshot.TopologyJSON = marshalString(result.Topology)
+	}
+	snapshot.EndpointFingerprintsJSON = marshalString(fingerprintMap)
+	if result.DeepEvidence != nil {
+		snapshot.CAAJSON = marshalString(result.DeepEvidence.CAA)
+		snapshot.CTJSON = marshalString(result.DeepEvidence.CT)
+		snapshot.HTTPJSON = marshalString(result.DeepEvidence.HTTP)
+		snapshot.ErrorsJSON = marshalString(result.DeepEvidence.Errors)
+	}
+	if err := s.db.SaveMeasurementSnapshot(&snapshot); err != nil {
+		log.Printf("scheduler: save measurement snapshot for %s: %v", dc.Domain, err)
+	}
+	// Maintain a compact per-address state on the domain row for fast API reads.
+	updateEndpointStates(dc, endpoints, observedAt)
+	if len(result.EndpointProbes) > 0 {
+		at := observedAt
+		dc.LastEndpointProbeAt = &at
+	}
+	if result.DeepEvidence != nil {
+		at := observedAt
+		dc.LastDeepMeasurementAt = &at
+	}
+	if len(fingerprintMap) == 0 {
+		dc.EndpointDiversityStatus = "unknown"
+	} else if len(allFingerprints) < 2 {
+		dc.EndpointDiversityStatus = "uniform"
+		dc.EndpointDiversityRounds = 0
+	} else if stableEndpointDiversity(previous, fingerprintMap, 2) {
+		dc.EndpointDiversityStatus = "stable_cdn_diversity"
+		dc.EndpointDiversityRounds++
+	} else {
+		dc.EndpointDiversityStatus = "transitioning"
+		dc.EndpointDiversityRounds = 1
+	}
+	return previous
+}
+
+func topologyQuorum(result *models.ScanResult) int {
+	if result != nil && result.Topology != nil {
+		return result.Topology.ResolverQuorum
+	}
+	return 0
+}
+
+func topologyAgreement(result *models.ScanResult) float64 {
+	if result != nil && result.Topology != nil {
+		return result.Topology.ResolverAgreement
+	}
+	return 0
+}
+
+func marshalString(value interface{}) string {
+	if value == nil {
+		return ""
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	return string(encoded)
+}
+
+func updateEndpointStates(dc *models.DomainCertificate, endpoints []models.EndpointProbe, observedAt time.Time) {
+	if dc == nil {
+		return
+	}
+	states := make(map[string]models.EndpointState)
+	if strings.TrimSpace(dc.EndpointStates) != "" {
+		_ = json.Unmarshal([]byte(dc.EndpointStates), &states)
+	}
+	for _, probe := range endpoints {
+		ip := strings.TrimSpace(probe.IPAddress)
+		if ip == "" {
+			continue
+		}
+		state := states[ip]
+		if state.IPAddress == "" {
+			state.IPAddress = ip
+			state.FirstSeenAt = observedAt
+		}
+		state.LastSeenAt = observedAt
+		state.Observations++
+		state.LastSuccess = probe.Success
+		if probe.Success {
+			state.Fingerprint = probe.Fingerprint
+			state.SPKIFingerprint = probe.SPKIFingerprint
+			state.IssuerCN = probe.IssuerCN
+			state.CommonName = probe.CommonName
+		} else {
+			state.Failures++
+		}
+		states[ip] = state
+	}
+	dc.EndpointStates = marshalString(states)
 }
 
 func (s *Scheduler) newObs(domain string, cert *models.Certificate, obsType, milestone string, days int, r *models.ScanResult) *models.CertObservation {
@@ -577,6 +970,12 @@ func (s *Scheduler) newObs(domain string, cert *models.Certificate, obsType, mil
 	if len(r.ResolvedIPs) > 0 {
 		encoded, _ := json.Marshal(r.ResolvedIPs)
 		obs.ResolvedIPs = string(encoded)
+	}
+	if len(r.EndpointProbes) > 0 {
+		obs.EndpointProbes = marshalString(r.EndpointProbes)
+	}
+	if r.DeepEvidence != nil {
+		obs.DeepEvidence = marshalString(r.DeepEvidence)
 	}
 	return obs
 }
@@ -686,6 +1085,10 @@ func (s *Scheduler) finishJob(job *models.ScanJob, result *models.ScanResult) {
 func (s *Scheduler) scanForScheduler(ctx context.Context, dc *models.DomainCertificate) (*models.ScanResult, error) {
 	now := s.now()
 	due := s.evidenceDueBefore(dc, now)
+	if due {
+		// The scheduler's low-frequency evidence poll is a deliberate deep round,
+		// even when the leaf happens not to change.
+	}
 	result, err := s.scanner.ScanBaselineWithRetry(ctx, dc.Domain)
 	if err != nil {
 		return result, err
@@ -697,10 +1100,35 @@ func (s *Scheduler) scanForScheduler(ctx context.Context, dc *models.DomainCerti
 		return result, nil
 	}
 	if due || evidenceCandidateAfter(dc, result, now) {
+		result.MeasurementTrigger = "candidate"
 		s.scanner.Enrich(ctx, result)
 	}
 	if endpointProbeCandidate(dc, result) {
+		// Probe both sides of a topology transition. Retired addresses are not
+		// part of the current DNS answer, but they are exactly where stale edge
+		// configuration can be proven or falsified.
 		result.EndpointProbes = s.scanner.ProbeEndpoints(ctx, dc.Domain, appendUniqueIPs(parseIPs(dc.ResolvedIPs), result.ResolvedIPs...))
+		result.MeasurementTrigger = "endpoint_survey"
+		for _, probe := range result.EndpointProbes {
+			if !probe.Success {
+				result.TLSFindings = append(result.TLSFindings, models.TLSFinding{Code: "endpoint_probe_inconclusive", Detail: "Additional endpoint probe did not obtain a certificate: " + probe.Error, IPAddress: probe.IPAddress})
+			}
+			for _, finding := range probe.Findings {
+				duplicate := false
+				for _, existing := range result.TLSFindings {
+					if existing.Code == finding.Code && existing.IPAddress == finding.IPAddress && existing.Fingerprint == finding.Fingerprint {
+						duplicate = true
+						break
+					}
+				}
+				if !duplicate {
+					result.TLSFindings = append(result.TLSFindings, finding)
+				}
+			}
+		}
+		if len(appendUniqueIPs(parseIPs(dc.ResolvedIPs), result.ResolvedIPs...)) > len(result.EndpointProbes) {
+			result.TLSFindings = append(result.TLSFindings, models.TLSFinding{Code: "endpoint_probe_inconclusive", Detail: "Endpoint sampling cap reached; untested addresses remain unknown"})
+		}
 	}
 	return result, nil
 }
@@ -708,6 +1136,9 @@ func (s *Scheduler) scanForScheduler(ctx context.Context, dc *models.DomainCerti
 func endpointProbeCandidate(dc *models.DomainCertificate, result *models.ScanResult) bool {
 	if dc == nil || result == nil || !result.Success || result.Cert == nil {
 		return false
+	}
+	if len(result.TLSFindings) > 0 || len(result.ResolvedIPs) > 1 {
+		return true
 	}
 	if dc.CurrentFingerprint != "" && dc.CurrentFingerprint != result.Cert.Fingerprint {
 		return true
@@ -794,6 +1225,9 @@ func (s *Scheduler) failureBackoff(failures int) time.Duration {
 // background scheduling uses scanForScheduler's baseline-first path; a manual
 // request is an intentional operator action and includes deep evidence.
 func (s *Scheduler) ScanNow(domain string) (*models.ScanResult, error) {
+	s.trancoMu.Lock()
+	defer s.trancoMu.Unlock()
+
 	domain = models.GetDomain(domain)
 	dc, err := s.db.GetOrInitDomain(domain)
 	if err != nil {
@@ -830,6 +1264,9 @@ func (s *Scheduler) ScanBatchNow(domains []string, workers int) ([]*models.ScanR
 	if workers <= 0 {
 		return nil, []error{fmt.Errorf("batch workers must be positive")}
 	}
+	s.trancoMu.Lock()
+	defer s.trancoMu.Unlock()
+
 	var (
 		mu      sync.Mutex
 		results []*models.ScanResult
@@ -855,7 +1292,6 @@ func (s *Scheduler) ScanBatchNow(domains []string, workers int) ([]*models.ScanR
 			job := s.startJob(d, "manual_batch_scan", s.now())
 			ctx, cancel := context.WithTimeout(context.Background(), s.config.ScanTimeout)
 			result, err := s.scanner.ScanWithRetry(ctx, d)
-			cancel()
 			if err != nil {
 				result = &models.ScanResult{
 					Domain:                d,
@@ -875,6 +1311,7 @@ func (s *Scheduler) ScanBatchNow(domains []string, workers int) ([]*models.ScanR
 			if result != nil && result.Success && (dc.CurrentFingerprint == "" || dc.CurrentFingerprint != result.Cert.Fingerprint || endpointProbeCandidate(dc, result)) {
 				result.EndpointProbes = s.scanner.ProbeEndpoints(ctx, d, appendUniqueIPs(parseIPs(dc.ResolvedIPs), result.ResolvedIPs...))
 			}
+			cancel()
 			s.processResult(dc, result)
 			s.finishJob(job, result)
 			mu.Lock()
@@ -886,11 +1323,29 @@ func (s *Scheduler) ScanBatchNow(domains []string, workers int) ([]*models.ScanR
 	return results, errs
 }
 
-// ScheduleTrancoScans fetches the Tranco list and registers its domains.
+// ScheduleTrancoScans refreshes the ranked Tranco portion of the monitoring
+// population. Refreshes are serialized and quiesce in-flight scans before
+// pruning stale non-local rows.
 func (s *Scheduler) ScheduleTrancoScans() (int, error) {
+	s.trancoMu.Lock()
+	defer s.trancoMu.Unlock()
+
 	if s.tranco == nil {
 		return 0, fmt.Errorf("tranco fetcher not configured")
 	}
+	wasPaused := s.IsPaused()
+	s.Pause()
+	defer func() {
+		if !wasPaused {
+			s.Resume()
+		}
+	}()
+	s.dispatchMu.Lock()
+	defer s.dispatchMu.Unlock()
+	if err := s.waitForIdle(); err != nil {
+		return 0, fmt.Errorf("wait for active scans before Tranco refresh: %w", err)
+	}
+
 	ranked, source, listID, err := s.tranco.FetchRanked()
 	if err != nil {
 		return 0, fmt.Errorf("failed to fetch Tranco list: %w", err)
@@ -906,6 +1361,58 @@ func (s *Scheduler) ScheduleTrancoScans() (int, error) {
 	})
 	log.Printf("scheduler: registered %d Tranco domains (source=%s, list=%s)", n, source, listID)
 	return n, nil
+}
+
+// RefreshLocalLists reloads every configured local source and atomically
+// replaces their combined membership. Parsing happens before scans are paused,
+// so an unreadable or malformed source cannot interrupt existing monitoring.
+func (s *Scheduler) RefreshLocalLists(ctx context.Context) (int, error) {
+	if s.localLists == nil || !s.localLists.Enabled {
+		return 0, fmt.Errorf("local list sources are not enabled")
+	}
+	domains, err := domainlist.LoadSources(ctx, s.localLists.Sources)
+	if err != nil {
+		return 0, err
+	}
+
+	s.trancoMu.Lock()
+	defer s.trancoMu.Unlock()
+	wasPaused := s.IsPaused()
+	s.Pause()
+	defer func() {
+		if !wasPaused {
+			s.Resume()
+		}
+	}()
+	s.dispatchMu.Lock()
+	defer s.dispatchMu.Unlock()
+	if err := s.waitForIdle(); err != nil {
+		return 0, fmt.Errorf("wait for active scans before local-list refresh: %w", err)
+	}
+	n, err := s.db.RegisterLocalDomains(domains)
+	if err != nil {
+		return 0, err
+	}
+	log.Printf("scheduler: registered %d domains from local lists", n)
+	return n, nil
+}
+
+func (s *Scheduler) waitForIdle() error {
+	if atomic.LoadInt64(&s.runningN) == 0 {
+		return nil
+	}
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if atomic.LoadInt64(&s.runningN) == 0 {
+			return nil
+		}
+		select {
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -990,7 +1497,7 @@ func computeNextScanWithEvidence(cfg *models.SchedulerConfig, now, notAfter time
 		consider(*ariWindowStart)
 	}
 	// ARI clients are expected to poll renewalInfo periodically. For the MVP we
-	// use the normal scan path for that poll, which is acceptable at Top-1000
+	// use the normal scan path for that poll, which is acceptable at Top-N
 	// scale and keeps certificate/ARI state consistent.
 	if ariNextPollAt != nil {
 		consider(*ariNextPollAt)

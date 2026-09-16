@@ -22,6 +22,10 @@ import (
 // Constants
 // ---------------------------------------------------------------------------
 
+// TrancoTopLimit is the fixed production population size for the ranked
+// Tranco source. Local lists may add domains on top of this population.
+const TrancoTopLimit = 10000
+
 // Observation types recorded in the cert_observations time-series.
 const (
 	ObsInitial           = "initial"            // first time we ever recorded a cert for this domain
@@ -64,8 +68,8 @@ const (
 	CheckedViaNone        = "none"
 )
 
-// Scan job status values. In the MVP the persisted job log is an audit trail
-// for due/manual scans; NextScanAt remains the scheduling source of truth.
+// Scan job status values. The persisted job log is an audit trail for
+// scheduled/manual scans; NextScanAt remains the scheduling source of truth.
 const (
 	ScanJobRunning   = "running"
 	ScanJobSucceeded = "succeeded"
@@ -141,41 +145,54 @@ type Certificate struct {
 // lifecycle & scheduling metadata. One small row per domain; NextScanAt is the
 // heart of the adaptive scheduler.
 type DomainCertificate struct {
-	ID                       uint       `json:"id" gorm:"primaryKey"`
-	Domain                   string     `json:"domain" gorm:"uniqueIndex;size:255"`
-	TrancoRank               int        `json:"tranco_rank" gorm:"index"`
-	CurrentCertificateID     uint       `json:"current_certificate_id" gorm:"index"`
-	CurrentFingerprint       string     `json:"current_fingerprint" gorm:"index;size:64"`
-	Status                   string     `json:"status" gorm:"index"`            // active, unreachable; dormant is legacy only
-	RevocationStatus         string     `json:"revocation_status" gorm:"index"` // good, revoked, unknown, not_checked
-	RevocationCheckedVia     string     `json:"revocation_checked_via"`
-	RevokedAt                *time.Time `json:"revoked_at,omitempty"`
-	RevocationReason         string     `json:"revocation_reason,omitempty"`
-	RevocationCheckedAt      *time.Time `json:"revocation_checked_at,omitempty"`
-	RevocationNextCheckAt    *time.Time `json:"revocation_next_check_at,omitempty" gorm:"index"`
-	OCSPCheckedAt            *time.Time `json:"ocsp_checked_at,omitempty"`
-	EvidenceStatus           string     `json:"evidence_status" gorm:"index"`
-	EvidencePendingReason    string     `json:"evidence_pending_reason,omitempty" gorm:"type:text"`
-	EvidenceCheckedAt        *time.Time `json:"evidence_checked_at,omitempty"`
-	FirstSeenAt              time.Time  `json:"first_seen_at"`
-	LastScannedAt            time.Time  `json:"last_scanned_at" gorm:"index"`
-	LastChangedAt            *time.Time `json:"last_changed_at,omitempty"`
-	LastDaysUntilExpiry      int        `json:"last_days_until_expiry"`
-	NextScanAt               time.Time  `json:"next_scan_at" gorm:"index"`
-	Priority                 int        `json:"priority" gorm:"index"`
-	ScanCount                int        `json:"scan_count"`
-	ChangeCount              int        `json:"change_count"`
-	ConsecutiveFailures      int        `json:"consecutive_failures"`
-	LastError                string     `json:"last_error,omitempty"`
-	LastFailureClass         string     `json:"last_failure_class,omitempty"`
-	ResolvedIPs              string     `json:"resolved_ips,omitempty" gorm:"type:text"`
-	LastDNSObservedAt        *time.Time `json:"last_dns_observed_at,omitempty"`
-	ResidualFingerprint      string     `json:"residual_fingerprint,omitempty" gorm:"index;size:64"`
-	ResidualRevokedAt        *time.Time `json:"residual_revoked_at,omitempty"`
-	ResidualFirstSeenAt      *time.Time `json:"residual_first_seen_at,omitempty"`
-	ResidualLastSeenAt       *time.Time `json:"residual_last_seen_at,omitempty"`
-	ResidualNextCheckAt      *time.Time `json:"residual_next_check_at,omitempty" gorm:"index"`
-	ResidualObservationCount int        `json:"residual_observation_count"`
+	TLSFindings               string     `json:"tls_findings,omitempty" gorm:"type:text"`
+	TLSCheckedAt              *time.Time `json:"tls_checked_at,omitempty"`
+	ID                        uint       `json:"id" gorm:"primaryKey"`
+	Domain                    string     `json:"domain" gorm:"uniqueIndex;size:255"`
+	TrancoRank                int        `json:"tranco_rank" gorm:"index"`
+	LocalListMember           bool       `json:"local_list_member" gorm:"index;default:false"`
+	CurrentCertificateID      uint       `json:"current_certificate_id" gorm:"index"`
+	CurrentFingerprint        string     `json:"current_fingerprint" gorm:"index;size:64"`
+	Status                    string     `json:"status" gorm:"index"`            // active, unreachable; dormant is legacy only
+	RevocationStatus          string     `json:"revocation_status" gorm:"index"` // good, revoked, unknown, not_checked
+	RevocationCheckedVia      string     `json:"revocation_checked_via"`
+	RevokedAt                 *time.Time `json:"revoked_at,omitempty"`
+	RevocationReason          string     `json:"revocation_reason,omitempty"`
+	RevocationCheckedAt       *time.Time `json:"revocation_checked_at,omitempty"`
+	RevocationNextCheckAt     *time.Time `json:"revocation_next_check_at,omitempty" gorm:"index"`
+	OCSPCheckedAt             *time.Time `json:"ocsp_checked_at,omitempty"`
+	EvidenceStatus            string     `json:"evidence_status" gorm:"index"`
+	EvidencePendingReason     string     `json:"evidence_pending_reason,omitempty" gorm:"type:text"`
+	EvidenceCheckedAt         *time.Time `json:"evidence_checked_at,omitempty"`
+	FirstSeenAt               time.Time  `json:"first_seen_at"`
+	LastScannedAt             time.Time  `json:"last_scanned_at" gorm:"index"`
+	LastChangedAt             *time.Time `json:"last_changed_at,omitempty"`
+	LastDaysUntilExpiry       int        `json:"last_days_until_expiry"`
+	NextScanAt                time.Time  `json:"next_scan_at" gorm:"index"`
+	Priority                  int        `json:"priority" gorm:"index"`
+	ScanCount                 int        `json:"scan_count"`
+	ChangeCount               int        `json:"change_count"`
+	ConsecutiveFailures       int        `json:"consecutive_failures"`
+	LastError                 string     `json:"last_error,omitempty"`
+	LastFailureClass          string     `json:"last_failure_class,omitempty"`
+	ResolvedIPs               string     `json:"resolved_ips,omitempty" gorm:"type:text"`
+	ConsensusIPs              string     `json:"consensus_ips,omitempty" gorm:"type:text"`
+	TopologyCNAMEs            string     `json:"topology_cnames,omitempty" gorm:"type:text"`
+	TopologyHash              string     `json:"topology_hash,omitempty" gorm:"index;size:64"`
+	TopologyResolverQuorum    int        `json:"topology_resolver_quorum"`
+	TopologyResolverAgreement float64    `json:"topology_resolver_agreement"`
+	LastDNSObservedAt         *time.Time `json:"last_dns_observed_at,omitempty"`
+	EndpointStates            string     `json:"endpoint_states,omitempty" gorm:"type:text"`
+	EndpointDiversityStatus   string     `json:"endpoint_diversity_status,omitempty" gorm:"index;size:32"`
+	EndpointDiversityRounds   int        `json:"endpoint_diversity_rounds"`
+	LastEndpointProbeAt       *time.Time `json:"last_endpoint_probe_at,omitempty"`
+	LastDeepMeasurementAt     *time.Time `json:"last_deep_measurement_at,omitempty"`
+	ResidualFingerprint       string     `json:"residual_fingerprint,omitempty" gorm:"index;size:64"`
+	ResidualRevokedAt         *time.Time `json:"residual_revoked_at,omitempty"`
+	ResidualFirstSeenAt       *time.Time `json:"residual_first_seen_at,omitempty"`
+	ResidualLastSeenAt        *time.Time `json:"residual_last_seen_at,omitempty"`
+	ResidualNextCheckAt       *time.Time `json:"residual_next_check_at,omitempty" gorm:"index"`
+	ResidualObservationCount  int        `json:"residual_observation_count"`
 
 	// ARI (ACME Renewal Information) — the CA-side recommended renewal window.
 	ARISupported      bool       `json:"ari_supported"`
@@ -219,6 +236,7 @@ type CertObservation struct {
 	ResolvedIPs             string     `json:"resolved_ips,omitempty" gorm:"type:text"`
 	PreviousResolvedIPs     string     `json:"previous_resolved_ips,omitempty" gorm:"type:text"`
 	EndpointProbes          string     `json:"endpoint_probes,omitempty" gorm:"type:text"`
+	DeepEvidence            string     `json:"deep_evidence,omitempty" gorm:"type:text"`
 	ResidualDurationSeconds int64      `json:"residual_duration_seconds,omitempty"`
 	TLSVersion              string     `json:"tls_version,omitempty"`
 	CipherSuite             string     `json:"cipher_suite,omitempty"`
@@ -258,8 +276,8 @@ type TrancoList struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// ScanJob is a persisted audit record for one scan attempt. For the Top-1000
-// MVP this gives enough traceability to answer "why did we scan this domain,
+// ScanJob is a persisted audit record for one scan attempt. For the Tranco
+// Top-N population this gives enough traceability to answer "why did we scan this domain,
 // when did it run, and what did it observe" without introducing a distributed
 // queue prematurely.
 type ScanJob struct {
@@ -331,6 +349,7 @@ type CertificateAlert struct {
 
 // ScanResult is what the scanner returns for a single domain scan.
 type ScanResult struct {
+	TLSFindings           []TLSFinding        `json:"tls_findings,omitempty"`
 	Domain                string              `json:"domain"`
 	Success               bool                `json:"success"`
 	Error                 string              `json:"error,omitempty"`
@@ -353,6 +372,9 @@ type ScanResult struct {
 	ResolvedIPs           []string            `json:"resolved_ips,omitempty"`
 	ResolvedIPsKnown      bool                `json:"resolved_ips_known"`
 	EndpointProbes        []EndpointProbe     `json:"endpoint_probes,omitempty"`
+	Topology              *TopologySnapshot   `json:"topology,omitempty"`
+	DeepEvidence          *DeepEvidence       `json:"deep_evidence,omitempty"`
+	MeasurementTrigger    string              `json:"measurement_trigger,omitempty"`
 }
 
 // ARIInfo is the CA-side ACME Renewal Information for the leaf certificate,
@@ -369,23 +391,140 @@ type ARIInfo struct {
 
 // ConnectionInfo holds TCP/TLS connection metadata.
 type ConnectionInfo struct {
-	Protocol       string   `json:"protocol"`
-	TLSVersion     string   `json:"tls_version"`
-	CipherSuite    string   `json:"cipher_suite"`
-	ConnectionTime int64    `json:"connection_time_ms"`
-	IPAddress      string   `json:"ip_address,omitempty"`
-	ResolvedIPs    []string `json:"resolved_ips,omitempty"`
+	Protocol           string   `json:"protocol"`
+	TLSVersion         string   `json:"tls_version"`
+	CipherSuite        string   `json:"cipher_suite"`
+	NegotiatedProtocol string   `json:"negotiated_protocol,omitempty"`
+	ALPN               string   `json:"alpn,omitempty"`
+	ConnectionTime     int64    `json:"connection_time_ms"`
+	IPAddress          string   `json:"ip_address,omitempty"`
+	ResolvedIPs        []string `json:"resolved_ips,omitempty"`
 }
 
 // EndpointProbe is a candidate-only direct TLS check against one previously
 // resolved address. It distinguishes an observed mixed rollout from a single
 // vantage certificate change and does not imply complete global edge coverage.
 type EndpointProbe struct {
-	IPAddress       string `json:"ip_address"`
-	Success         bool   `json:"success"`
-	Fingerprint     string `json:"fingerprint,omitempty"`
-	SPKIFingerprint string `json:"spki_fingerprint,omitempty"`
-	Error           string `json:"error,omitempty"`
+	Findings        []TLSFinding `json:"findings,omitempty"`
+	IPAddress       string       `json:"ip_address"`
+	Success         bool         `json:"success"`
+	Fingerprint     string       `json:"fingerprint,omitempty"`
+	SPKIFingerprint string       `json:"spki_fingerprint,omitempty"`
+	Error           string       `json:"error,omitempty"`
+	TLSVersion      string       `json:"tls_version,omitempty"`
+	CipherSuite     string       `json:"cipher_suite,omitempty"`
+	IssuerCN        string       `json:"issuer_cn,omitempty"`
+	CommonName      string       `json:"common_name,omitempty"`
+	NotAfter        *time.Time   `json:"not_after,omitempty"`
+}
+
+// EndpointState is the per-address longitudinal state used to tell a stable
+// CDN fan-out from a rollout. FirstSeen/LastSeen are observation bounds; they
+// do not imply that the address was continuously reachable between probes.
+type EndpointState struct {
+	IPAddress       string    `json:"ip_address"`
+	Fingerprint     string    `json:"fingerprint,omitempty"`
+	SPKIFingerprint string    `json:"spki_fingerprint,omitempty"`
+	IssuerCN        string    `json:"issuer_cn,omitempty"`
+	CommonName      string    `json:"common_name,omitempty"`
+	FirstSeenAt     time.Time `json:"first_seen_at"`
+	LastSeenAt      time.Time `json:"last_seen_at"`
+	LastSuccess     bool      `json:"last_success"`
+	Observations    int       `json:"observations"`
+	Failures        int       `json:"failures"`
+}
+
+type TLSFinding struct {
+	Code        string `json:"code"`
+	Detail      string `json:"detail"`
+	IPAddress   string `json:"ip_address"`
+	Fingerprint string `json:"fingerprint"`
+}
+
+// DNSResolverObservation is one public-recursive-resolver view of a domain.
+// Resolver identity and TTL are retained so a topology transition is a
+// reproducible quorum event rather than a single changing answer.
+type DNSResolverObservation struct {
+	Resolver string   `json:"resolver"`
+	A        []string `json:"a,omitempty"`
+	AAAA     []string `json:"aaaa,omitempty"`
+	CNAME    []string `json:"cname,omitempty"`
+	TTL      int      `json:"ttl,omitempty"`
+	Success  bool     `json:"success"`
+	Error    string   `json:"error,omitempty"`
+}
+
+type TopologySnapshot struct {
+	Resolvers         []DNSResolverObservation `json:"resolvers,omitempty"`
+	PublicIPs         []string                 `json:"public_ips,omitempty"`
+	ConsensusIPs      []string                 `json:"consensus_ips,omitempty"`
+	CNAMEChain        []string                 `json:"cname_chain,omitempty"`
+	ResolverQuorum    int                      `json:"resolver_quorum"`
+	ResolverAgreement float64                  `json:"resolver_agreement"`
+	TopologyHash      string                   `json:"topology_hash,omitempty"`
+}
+
+type CAARecord struct {
+	Flag  uint8  `json:"flag"`
+	Tag   string `json:"tag"`
+	Value string `json:"value"`
+}
+
+// CTObservation retains certificate-transparency timing and issuer clues
+// needed to distinguish an automated renewal cadence from an ad-hoc change.
+type CTObservation struct {
+	ID             int64      `json:"id,omitempty"`
+	IssuerName     string     `json:"issuer_name,omitempty"`
+	SerialNumber   string     `json:"serial_number,omitempty"`
+	NotBefore      *time.Time `json:"not_before,omitempty"`
+	NotAfter       *time.Time `json:"not_after,omitempty"`
+	EntryTimestamp *time.Time `json:"entry_timestamp,omitempty"`
+	Names          []string   `json:"names,omitempty"`
+}
+
+type HTTPFingerprint struct {
+	IPAddress       string   `json:"ip_address,omitempty"`
+	StatusCode      int      `json:"status_code,omitempty"`
+	Server          string   `json:"server,omitempty"`
+	Via             string   `json:"via,omitempty"`
+	Cache           string   `json:"cache,omitempty"`
+	ProviderSignals []string `json:"provider_signals,omitempty"`
+	Redirect        string   `json:"redirect,omitempty"`
+}
+
+type DeepEvidence struct {
+	CollectedAt    time.Time         `json:"collected_at"`
+	Topology       *TopologySnapshot `json:"topology,omitempty"`
+	CAA            []CAARecord       `json:"caa,omitempty"`
+	CT             []CTObservation   `json:"ct,omitempty"`
+	HTTP           *HTTPFingerprint  `json:"http,omitempty"`
+	EndpointProbes []EndpointProbe   `json:"endpoint_probes,omitempty"`
+	Errors         []string          `json:"errors,omitempty"`
+	Status         string            `json:"status"`
+}
+
+// MeasurementSnapshot deliberately retains unchanged deep rounds. This makes
+// stability, persistence and edge-specific transitions measurable over time.
+type MeasurementSnapshot struct {
+	ID                       uint      `json:"id" gorm:"primaryKey"`
+	Domain                   string    `json:"domain" gorm:"index;size:255"`
+	ObservedAt               time.Time `json:"observed_at" gorm:"index"`
+	Trigger                  string    `json:"trigger" gorm:"index;size:64"`
+	CertificateFingerprint   string    `json:"certificate_fingerprint,omitempty" gorm:"index;size:64"`
+	SPKIFingerprint          string    `json:"spki_fingerprint,omitempty" gorm:"size:64"`
+	TopologyHash             string    `json:"topology_hash,omitempty" gorm:"index;size:64"`
+	ResolverQuorum           int       `json:"resolver_quorum"`
+	ResolverAgreement        float64   `json:"resolver_agreement"`
+	EndpointCount            int       `json:"endpoint_count"`
+	SuccessfulEndpointCount  int       `json:"successful_endpoint_count"`
+	FingerprintCount         int       `json:"fingerprint_count"`
+	TopologyJSON             string    `json:"topology_json,omitempty" gorm:"type:text"`
+	EndpointFingerprintsJSON string    `json:"endpoint_fingerprints_json,omitempty" gorm:"type:text"`
+	CAAJSON                  string    `json:"caa_json,omitempty" gorm:"type:text"`
+	CTJSON                   string    `json:"ct_json,omitempty" gorm:"type:text"`
+	HTTPJSON                 string    `json:"http_json,omitempty" gorm:"type:text"`
+	ErrorsJSON               string    `json:"errors_json,omitempty" gorm:"type:text"`
+	CreatedAt                time.Time `json:"created_at"`
 }
 
 // WebhookPayload is sent to configured webhooks / used for alert callbacks.
@@ -402,6 +541,7 @@ type WebhookPayload struct {
 type DomainView struct {
 	Domain                string     `json:"domain"`
 	TrancoRank            int        `json:"tranco_rank"`
+	LocalListMember       bool       `json:"local_list_member"`
 	Status                string     `json:"status"`
 	RevocationStatus      string     `json:"revocation_status"`
 	CurrentFingerprint    string     `json:"current_fingerprint"`
@@ -435,28 +575,134 @@ type ScheduleEntry struct {
 
 // Anomaly is a flagged irregularity found during analysis.
 type Anomaly struct {
-	Domain                    string     `json:"domain"`
-	Type                      string     `json:"type"` // revoked, expired_served, expired_observed, early_renewal, frequent_change, same_key, stale_after_change, residual, deployment_failure, unreachable, expiring_soon, ari_emergency
-	Severity                  string     `json:"severity"`
-	Description               string     `json:"description"`
-	Reason                    string     `json:"reason"`
-	Evidence                  []string   `json:"evidence,omitempty"`
-	CauseClassification       string     `json:"cause_classification"` // confirmed, inferred, unknown (mutually exclusive)
-	ConfirmedReason           string     `json:"confirmed_reason"`
-	InferredReason            string     `json:"inferred_reason"`
-	ConfirmedEvidence         []string   `json:"confirmed_evidence"`
-	InferredEvidence          []string   `json:"inferred_evidence"`
-	EvidenceScope             string     `json:"evidence_scope"`
-	EvidenceStatus            string     `json:"evidence_status"`
-	EvidencePendingReason     string     `json:"evidence_pending_reason,omitempty"`
-	Fingerprint               string     `json:"fingerprint,omitempty"`
-	OccurrenceCount           int        `json:"occurrence_count"`
-	MonitoringCount           int        `json:"monitoring_count"`
-	SuccessfulMonitoringCount int        `json:"successful_monitoring_count"`
-	FailedMonitoringCount     int        `json:"failed_monitoring_count"`
-	FirstObservedAt           *time.Time `json:"first_observed_at,omitempty"`
-	LastObservedAt            *time.Time `json:"last_observed_at,omitempty"`
-	DetectedAt                time.Time  `json:"detected_at"`
+	Domain                    string          `json:"domain"`
+	Type                      string          `json:"type"` // revoked, expired_served, expired_observed, early_renewal, frequent_change, same_key, stale_after_change, residual, deployment_failure, unreachable, expiring_soon, ari_emergency
+	Severity                  string          `json:"severity"`
+	Description               string          `json:"description"`
+	Reason                    string          `json:"reason"`
+	Evidence                  []string        `json:"evidence,omitempty"`
+	CauseClassification       string          `json:"cause_classification"` // confirmed, inferred, unknown (mutually exclusive)
+	ConfirmedReason           string          `json:"confirmed_reason"`
+	InferredReason            string          `json:"inferred_reason"`
+	ConfirmedEvidence         []string        `json:"confirmed_evidence"`
+	InferredEvidence          []string        `json:"inferred_evidence"`
+	EvidenceScope             string          `json:"evidence_scope"`
+	EvidenceStatus            string          `json:"evidence_status"`
+	EvidencePendingReason     string          `json:"evidence_pending_reason,omitempty"`
+	Fingerprint               string          `json:"fingerprint,omitempty"`
+	OccurrenceCount           int             `json:"occurrence_count"`
+	MonitoringCount           int             `json:"monitoring_count"`
+	SuccessfulMonitoringCount int             `json:"successful_monitoring_count"`
+	FailedMonitoringCount     int             `json:"failed_monitoring_count"`
+	FirstObservedAt           *time.Time      `json:"first_observed_at,omitempty"`
+	LastObservedAt            *time.Time      `json:"last_observed_at,omitempty"`
+	DetectedAt                time.Time       `json:"detected_at"`
+	Diagnosis                 *CauseDiagnosis `json:"diagnosis,omitempty"`
+	Cost                      *CostBreakdown  `json:"cost,omitempty"`
+}
+
+// CauseHypothesis is a ranked mechanism explanation. Scores are comparative
+// support from retained measurements, not a claim that private operator intent
+// was directly observed.
+type CauseHypothesis struct {
+	Code           string   `json:"code"`
+	Label          string   `json:"label"`
+	Score          float64  `json:"score"`
+	Confidence     string   `json:"confidence"`
+	Rationale      string   `json:"rationale"`
+	Evidence       []string `json:"evidence,omitempty"`
+	Contradictions []string `json:"contradictions,omitempty"`
+}
+
+type CauseDiagnosis struct {
+	PrimaryCode          string            `json:"primary_code"`
+	PrimaryLabel         string            `json:"primary_label"`
+	Confidence           string            `json:"confidence"`
+	Summary              string            `json:"summary"`
+	EvidenceCompleteness float64           `json:"evidence_completeness"`
+	Hypotheses           []CauseHypothesis `json:"hypotheses"`
+	MeasurementPlan      []string          `json:"measurement_plan,omitempty"`
+	MeasuredRounds       int               `json:"measured_rounds"`
+	TransitionRounds     int               `json:"transition_rounds"`
+}
+
+// CostEvidence is the measured input used by the cost
+// comparison. It is deliberately not serialized: the API exposes only the
+// resulting breakdown, while the source rows stay behind the database layer.
+type CostEvidence struct {
+	ScanJobs     []ScanJob
+	Domain       *DomainCertificate
+	Certificate  *Certificate
+	Observations []CertObservation
+}
+
+// CostLineItem explains one additive component of a cost total.
+type CostLineItem struct {
+	Lower        float64  `json:"lower"`
+	Upper        float64  `json:"upper"`
+	IntervalKind string   `json:"interval_kind"`
+	Method       string   `json:"method"`
+	Probability  *float64 `json:"probability,omitempty"`
+	SampleCount  int      `json:"sample_count,omitempty"`
+	Code         string   `json:"code"`
+	Label        string   `json:"label"`
+	Amount       float64  `json:"amount"`
+	Basis        string   `json:"basis"`
+	Evidence     []string `json:"evidence,omitempty"`
+}
+
+// CostBreakdown compares waiting for the next active measurement with issuing
+// and deploying a replacement certificate. Conditional exposure costs and
+// probability-weighted additional measurement costs retain their provenance.
+type CostBreakdown struct {
+	MethodVersion     string               `json:"method_version"`
+	DeltaLower        float64              `json:"delta_lower"`
+	DeltaUpper        float64              `json:"delta_upper"`
+	DeltaBasis        string               `json:"delta_basis"`
+	ObservationRuns   []CostObservationRun `json:"observation_runs,omitempty"`
+	WaitLower         float64              `json:"wait_lower"`
+	WaitUpper         float64              `json:"wait_upper"`
+	RotateLower       float64              `json:"rotate_lower"`
+	RotateUpper       float64              `json:"rotate_upper"`
+	Comparison        string               `json:"comparison"`
+	Sensitivity       []string             `json:"sensitivity"`
+	Validation        *CostValidation      `json:"validation,omitempty"`
+	Applicable        bool                 `json:"applicable"`
+	Scope             string               `json:"scope"`
+	Basis             string               `json:"basis"`
+	Currency          string               `json:"currency"`
+	IssueTypes        []string             `json:"issue_types,omitempty"`
+	EvidenceStatus    string               `json:"evidence_status"`
+	Confidence        string               `json:"confidence"`
+	WaitHorizonHours  float64              `json:"wait_horizon_hours"`
+	NextMeasurementAt *time.Time           `json:"next_measurement_at,omitempty"`
+	WaitCost          float64              `json:"wait_cost"`
+	RotateCost        float64              `json:"rotate_cost"`
+	Decision          string               `json:"decision"`
+	HardConstraint    bool                 `json:"hard_constraint"`
+	Unknowns          []string             `json:"unknowns,omitempty"`
+	WaitItems         []CostLineItem       `json:"wait_items,omitempty"`
+	RotateItems       []CostLineItem       `json:"rotate_items,omitempty"`
+}
+
+type CostValidation struct {
+	FailureCount     int     `json:"failure_count"`
+	PersistenceBrier float64 `json:"persistence_brier"`
+	Samples          int     `json:"samples"`
+	BrierScore       float64 `json:"brier_score"`
+	BaselineBrier    float64 `json:"baseline_brier"`
+	Basis            string  `json:"basis"`
+}
+
+// These are sampled condition runs, not continuously observed outages.
+type CostObservationRun struct {
+	Condition     string     `json:"condition"`
+	FirstObserved time.Time  `json:"first_observed"`
+	LastObserved  time.Time  `json:"last_observed"`
+	FirstClear    *time.Time `json:"first_clear,omitempty"`
+	LeftTruncated bool       `json:"left_truncated"`
+	RightCensored bool       `json:"right_censored"`
+	EvidenceGap   bool       `json:"evidence_gap"`
 }
 
 // ScanQueue represents the current scanning queue state.
@@ -567,12 +813,14 @@ type CertificateFilter struct {
 // ---------------------------------------------------------------------------
 
 type Config struct {
-	Server    ServerConfig    `mapstructure:"server"`
-	Database  DatabaseConfig  `mapstructure:"database"`
-	Scanner   ScannerConfig   `mapstructure:"scanner"`
-	Scheduler SchedulerConfig `mapstructure:"scheduler"`
-	Tranco    TrancoConfig    `mapstructure:"tranco"`
-	Alerts    AlertsConfig    `mapstructure:"alerts"`
+	Server     ServerConfig     `mapstructure:"server"`
+	Database   DatabaseConfig   `mapstructure:"database"`
+	Scanner    ScannerConfig    `mapstructure:"scanner"`
+	Scheduler  SchedulerConfig  `mapstructure:"scheduler"`
+	Cost       CostConfig       `mapstructure:"cost"`
+	Tranco     TrancoConfig     `mapstructure:"tranco"`
+	LocalLists LocalListsConfig `mapstructure:"local_lists"`
+	Alerts     AlertsConfig     `mapstructure:"alerts"`
 }
 
 type ServerConfig struct {
@@ -618,6 +866,14 @@ type ScannerConfig struct {
 	ARICacheDefaultTTL        time.Duration       `mapstructure:"ari_cache_default_ttl"`
 	ARICacheMinimumTTL        time.Duration       `mapstructure:"ari_cache_minimum_ttl"`
 	ARIProviders              []ARIProviderConfig `mapstructure:"ari_providers"`
+	DNSResolvers              []string            `mapstructure:"dns_resolvers"`
+	MaxEndpointSamples        int                 `mapstructure:"max_endpoint_samples"`
+	EndpointProbeConcurrency  int                 `mapstructure:"endpoint_probe_concurrency"`
+	CheckCAA                  bool                `mapstructure:"check_caa"`
+	CheckCT                   bool                `mapstructure:"check_ct"`
+	CTTimeout                 time.Duration       `mapstructure:"ct_timeout"`
+	CTEndpoint                string              `mapstructure:"ct_endpoint"`
+	CheckHTTPFingerprint      bool                `mapstructure:"check_http_fingerprint"`
 }
 
 // ARIProviderConfig identifies a CA's ACME directory using configured issuer
@@ -648,16 +904,56 @@ type SchedulerConfig struct {
 	ARIPollDueTolerance    time.Duration `mapstructure:"ari_poll_due_tolerance"`
 }
 
+// CostConfig contains operator-supplied unit costs. The default configuration
+// uses normalized units until an operator replaces them with measured values.
+type CostConfig struct {
+	WeightLowerMultiplier     float64 `mapstructure:"weight_lower_multiplier"`
+	WeightUpperMultiplier     float64 `mapstructure:"weight_upper_multiplier"`
+	Currency                  string  `mapstructure:"currency"`
+	IssuanceCost              float64 `mapstructure:"issuance_cost"`
+	CTPerCertificateCost      float64 `mapstructure:"ct_per_certificate_cost"`
+	DeploymentCost            float64 `mapstructure:"deployment_cost"`
+	VerificationCost          float64 `mapstructure:"verification_cost"`
+	ActiveMeasurementCost     float64 `mapstructure:"active_measurement_cost"`
+	ManualReviewCost          float64 `mapstructure:"manual_review_cost"`
+	RetryCost                 float64 `mapstructure:"retry_cost"`
+	RollbackCost              float64 `mapstructure:"rollback_cost"`
+	RevokedServicePerHour     float64 `mapstructure:"revoked_service_per_hour"`
+	ResidualExposurePerHour   float64 `mapstructure:"residual_exposure_per_hour"`
+	ExpiredServicePerHour     float64 `mapstructure:"expired_service_per_hour"`
+	PartialDeploymentPerHour  float64 `mapstructure:"partial_deployment_per_hour"`
+	StaleCertificatePerHour   float64 `mapstructure:"stale_certificate_per_hour"`
+	UnreachableServicePerHour float64 `mapstructure:"unreachable_service_per_hour"`
+	ExpiryIncidentCost        float64 `mapstructure:"expiry_incident_cost"`
+}
+
 type TrancoConfig struct {
 	Enabled          bool          `mapstructure:"enabled"`
 	SourceURL        string        `mapstructure:"source_url"`
-	MaxDomains       int           `mapstructure:"max_domains"`
+	MaxDomains       int           `mapstructure:"max_domains"` // must equal TrancoTopLimit
 	FetchOnStart     bool          `mapstructure:"fetch_on_start"`
 	RefreshInterval  time.Duration `mapstructure:"refresh_interval"`
 	RequestTimeout   time.Duration `mapstructure:"request_timeout"`
 	CacheTTL         time.Duration `mapstructure:"cache_ttl"`
 	MaxResponseBytes int           `mapstructure:"max_response_bytes"`
 	UserAgent        string        `mapstructure:"user_agent"`
+}
+
+// LocalListsConfig describes additional domain populations loaded from files.
+// All configured sources are combined as a set; a successful refresh replaces
+// the previous local-list membership atomically while preserving Tranco ranks.
+type LocalListsConfig struct {
+	Enabled         bool                    `mapstructure:"enabled"`
+	FetchOnStart    bool                    `mapstructure:"fetch_on_start"`
+	RefreshInterval time.Duration           `mapstructure:"refresh_interval"`
+	Sources         []LocalListSourceConfig `mapstructure:"sources"`
+}
+
+type LocalListSourceConfig struct {
+	Name       string `mapstructure:"name"`
+	Path       string `mapstructure:"path"`
+	Format     string `mapstructure:"format"`
+	MaxDomains int    `mapstructure:"max_domains"`
 }
 
 type AlertsConfig struct {
@@ -736,6 +1032,24 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	if c.Scanner.MaxEndpointSamples < 0 || c.Scanner.EndpointProbeConcurrency < 0 {
+		return fmt.Errorf("scanner endpoint sampling values must not be negative")
+	}
+	if c.Scanner.CheckCT && c.Scanner.CTTimeout <= 0 {
+		return fmt.Errorf("scanner.ct_timeout is required when CT checking is enabled")
+	}
+	if c.Scanner.CTEndpoint != "" {
+		parsed, err := url.Parse(strings.TrimSpace(c.Scanner.CTEndpoint))
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+			return fmt.Errorf("scanner.ct_endpoint must be an absolute HTTPS URL")
+		}
+	}
+	for _, resolver := range c.Scanner.DNSResolvers {
+		parsed, err := url.Parse(strings.TrimSpace(resolver))
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+			return fmt.Errorf("scanner.dns_resolvers contains invalid HTTPS URL %q", resolver)
+		}
+	}
 
 	if c.Scheduler.TickInterval <= 0 || len(c.Scheduler.Milestones) == 0 || len(c.Scheduler.PostExpiryChecks) == 0 || c.Scheduler.BaselineInterval <= 0 || c.Scheduler.NearExpiryInterval <= 0 || c.Scheduler.NearExpiryWindow <= 0 || c.Scheduler.MinGap <= 0 || c.Scheduler.ARIPollInterval <= 0 || c.Scheduler.RevocationPollInterval <= 0 || c.Scheduler.MaxDailyScans < 1 || c.Scheduler.ScanTimeout <= 0 || c.Scheduler.FailureBackoffUnit <= 0 || c.Scheduler.FailureBackoffMax < c.Scheduler.FailureBackoffUnit || c.Scheduler.ARIChangeThreshold <= 0 || c.Scheduler.ARIPollDueTolerance <= 0 {
 		return fmt.Errorf("scheduler configuration is incomplete or invalid")
@@ -755,13 +1069,64 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if strings.TrimSpace(c.Cost.Currency) == "" {
+		return fmt.Errorf("cost.currency is required")
+	}
+	for name, value := range map[string]float64{
+		"issuance_cost":                c.Cost.IssuanceCost,
+		"ct_per_certificate_cost":      c.Cost.CTPerCertificateCost,
+		"deployment_cost":              c.Cost.DeploymentCost,
+		"verification_cost":            c.Cost.VerificationCost,
+		"active_measurement_cost":      c.Cost.ActiveMeasurementCost,
+		"manual_review_cost":           c.Cost.ManualReviewCost,
+		"retry_cost":                   c.Cost.RetryCost,
+		"rollback_cost":                c.Cost.RollbackCost,
+		"revoked_service_per_hour":     c.Cost.RevokedServicePerHour,
+		"residual_exposure_per_hour":   c.Cost.ResidualExposurePerHour,
+		"expired_service_per_hour":     c.Cost.ExpiredServicePerHour,
+		"partial_deployment_per_hour":  c.Cost.PartialDeploymentPerHour,
+		"stale_certificate_per_hour":   c.Cost.StaleCertificatePerHour,
+		"unreachable_service_per_hour": c.Cost.UnreachableServicePerHour,
+		"expiry_incident_cost":         c.Cost.ExpiryIncidentCost,
+	} {
+		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+			return fmt.Errorf("cost.%s must be a finite non-negative number", name)
+		}
+	}
+
 	if c.Tranco.Enabled {
-		if strings.TrimSpace(c.Tranco.SourceURL) == "" || c.Tranco.MaxDomains < 1 || c.Tranco.RefreshInterval <= 0 || c.Tranco.RequestTimeout <= 0 || c.Tranco.CacheTTL <= 0 || c.Tranco.MaxResponseBytes < 1 || strings.TrimSpace(c.Tranco.UserAgent) == "" {
+		if strings.TrimSpace(c.Tranco.SourceURL) == "" || c.Tranco.MaxDomains != TrancoTopLimit || c.Tranco.RefreshInterval <= 0 || c.Tranco.RequestTimeout <= 0 || c.Tranco.CacheTTL <= 0 || c.Tranco.MaxResponseBytes < 1 || strings.TrimSpace(c.Tranco.UserAgent) == "" {
 			return fmt.Errorf("tranco configuration is incomplete")
 		}
 		parsed, err := url.Parse(strings.TrimSpace(c.Tranco.SourceURL))
 		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
 			return fmt.Errorf("tranco.source_url must be an absolute HTTPS URL")
+		}
+	}
+	if c.LocalLists.Enabled {
+		if len(c.LocalLists.Sources) == 0 || c.LocalLists.RefreshInterval <= 0 {
+			return fmt.Errorf("local_lists configuration is incomplete")
+		}
+		seenNames := make(map[string]struct{}, len(c.LocalLists.Sources))
+		for i, source := range c.LocalLists.Sources {
+			name := strings.TrimSpace(source.Name)
+			if name == "" {
+				return fmt.Errorf("local_lists.sources[%d].name is required", i)
+			}
+			if _, exists := seenNames[strings.ToLower(name)]; exists {
+				return fmt.Errorf("local_lists source name %q is duplicated", name)
+			}
+			seenNames[strings.ToLower(name)] = struct{}{}
+			if strings.TrimSpace(source.Path) == "" {
+				return fmt.Errorf("local_lists source %q path is required", name)
+			}
+			format := strings.ToLower(strings.TrimSpace(source.Format))
+			if format != "" && format != "auto" && format != "lines" && format != "jsonl" {
+				return fmt.Errorf("local_lists source %q has unsupported format %q", name, source.Format)
+			}
+			if source.MaxDomains < 0 {
+				return fmt.Errorf("local_lists source %q max_domains must not be negative", name)
+			}
 		}
 	}
 	return nil
