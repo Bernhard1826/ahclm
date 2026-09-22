@@ -9,6 +9,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"ahclm/internal/models"
@@ -23,7 +24,17 @@ import (
 type Database struct {
 	db  *gorm.DB
 	cfg *models.DatabaseConfig
+
+	// Anomaly diagnosis joins several longitudinal tables and is intentionally
+	// bounded, but still expensive on the full monitoring population. A short
+	// cache makes concurrent page requests share one coherent snapshot instead
+	// of recalculating the same diagnosis once per page.
+	anomalyCacheMu sync.Mutex
+	anomalyCache   []models.Anomaly
+	anomalyCacheAt time.Time
 }
+
+const anomalyCacheTTL = 20 * time.Second
 
 // ErrDomainNotMonitored is returned when an operation targets a host outside
 // the current combined monitoring population (Tranco plus local lists). The
@@ -105,6 +116,7 @@ func New(cfg *models.DatabaseConfig) (*Database, error) {
 	} else if repaired > 0 {
 		log.Printf("normalized %d historical evidence status rows", repaired)
 	}
+	logBackfill(backfillObservationProvenance(db))
 
 	return &Database{db: db, cfg: cfg}, nil
 }
@@ -623,7 +635,15 @@ func (d *Database) GetMeasurementSnapshots(domain string, limit int) ([]models.M
 // GetDomainDiagnosis returns the same evidence-backed assessment used by the
 // anomaly index, allowing a domain detail page or an operator API call to
 // inspect the full hypothesis ranking without waiting for a new scan.
+//
+// anomalyType selects which finding the case file is built for. Without it the
+// function used to prefer a topology row whenever one existed, so a frequent-
+// change inspector received the wrong evidence chain.
 func (d *Database) GetDomainDiagnosis(domain string) (*models.CauseDiagnosis, error) {
+	return d.GetDomainDiagnosisFor(domain, "")
+}
+
+func (d *Database) GetDomainDiagnosisFor(domain, anomalyType string) (*models.CauseDiagnosis, error) {
 	dc, err := d.GetDomainCertificate(domain)
 	if err != nil {
 		return nil, err
@@ -645,6 +665,14 @@ func (d *Database) GetDomainDiagnosis(domain string) (*models.CauseDiagnosis, er
 			fingerprints[observation.PreviousFingerprint] = struct{}{}
 		}
 	}
+	if dc != nil {
+		for _, fingerprint := range collectTLSFindingFingerprints([]models.DomainCertificate{*dc}) {
+			fingerprints[fingerprint] = struct{}{}
+		}
+		if dc.ResidualFingerprint != "" {
+			fingerprints[dc.ResidualFingerprint] = struct{}{}
+		}
+	}
 	certs := make(map[string]models.Certificate)
 	if len(fingerprints) > 0 {
 		values := make([]string, 0, len(fingerprints))
@@ -659,46 +687,65 @@ func (d *Database) GetDomainDiagnosis(domain string) (*models.CauseDiagnosis, er
 			certs[row.Fingerprint] = row
 		}
 	}
-	item := models.Anomaly{Domain: domain, Type: "frequent_change", Reason: "No certificate-change anomaly has been recorded."}
+	item := models.Anomaly{Domain: domain, Type: diagnosisTypeFor(anomalyType, observations), Reason: "No certificate-change anomaly has been recorded."}
+	if isTLSValidationType(anomalyType) {
+		item.Type = anomalyType
+		if dc != nil && dc.TLSCheckedAt != nil {
+			item.DetectedAt = *dc.TLSCheckedAt
+		}
+		if dc != nil {
+			item.Fingerprint = dc.CurrentFingerprint
+		}
+	}
+	if isCertificateConditionType(anomalyType) {
+		item.Type = anomalyType
+		seedCertificateConditionAnomaly(&item, dc)
+	}
 	for _, observation := range observations {
-		if observation.ObservationType == models.ObsStaleAfterChange || observation.ObservationType == models.ObsDeploymentFailure {
-			item.Type = observation.ObservationType
+		if observation.ObservationType == item.Type {
 			item.Reason = observation.Notes
+			item.Fingerprint = observation.Fingerprint
+			item.DetectedAt = observation.ObservedAt
 			break
 		}
 	}
-	diagnosis := inferDiagnosis(item, diagnosisContext{state: dc, snapshots: snapshots, observations: observations, certificates: certs})
+	if item.Type == "frequent_change" {
+		changes := 0
+		for _, observation := range observations {
+			if observation.ObservationType != models.ObsChange {
+				continue
+			}
+			if observation.ChangeClass == "" || observation.ChangeClass == models.ChangeClassReplacement {
+				changes++
+			}
+		}
+		item.OccurrenceCount = changes
+		if dc != nil && dc.ChangeCount > item.OccurrenceCount {
+			item.OccurrenceCount = dc.ChangeCount
+		}
+	}
+	context := diagnosisContext{state: dc, snapshots: snapshots, observations: observations, certificates: certs}
+	diagnosis := inferDiagnosis(item, context)
+	diagnosis.EvidenceCase = buildEvidenceCase(item, context, diagnosis)
+	diagnosis.Investigation = buildInvestigation(item, context, diagnosis)
 	return &diagnosis, nil
 }
 
-// GetCostEvidence loads only the AHCLM evidence needed for the deterministic
-// wait-versus-rotation comparison. The caller decides which active findings
-// are cost-applicable; historical rows remain available for auditability.
-func (d *Database) GetCostEvidence(domain string) (*models.CostEvidence, error) {
-	dc, err := d.GetDomainCertificate(domain)
-	if err != nil {
-		return nil, err
+func diagnosisTypeFor(requested string, observations []models.CertObservation) string {
+	requested = strings.TrimSpace(requested)
+	switch requested {
+	case "frequent_change", "early_renewal", "same_key", models.ObsStaleAfterChange, models.ObsDeploymentFailure:
+		return requested
 	}
-
-	query := d.db.Where("domain = ?", domain)
-	if dc.CurrentFingerprint != "" {
-		query = query.Where("fingerprint = ?", dc.CurrentFingerprint)
+	if isTLSValidationType(requested) || isCertificateConditionType(requested) {
+		return requested
 	}
-	var observations []models.CertObservation
-	if err := query.Order("observed_at ASC, id ASC").Find(&observations).Error; err != nil {
-		return nil, err
+	for _, observation := range observations {
+		if observation.ObservationType == models.ObsDeploymentFailure || observation.ObservationType == models.ObsStaleAfterChange {
+			return observation.ObservationType
+		}
 	}
-	var jobs []models.ScanJob
-	asOf := time.Now()
-	if err := d.db.Where("domain = ? AND finished_at >= started_at AND finished_at <= ? AND started_at >= ?", domain, asOf, asOf.Add(-30*24*time.Hour)).Order("started_at DESC, id DESC").Limit(500).Find(&jobs).Error; err != nil {
-		return nil, err
-	}
-	return &models.CostEvidence{
-		ScanJobs:     jobs,
-		Domain:       dc,
-		Certificate:  dc.CurrentCertificate,
-		Observations: observations,
-	}, nil
+	return "frequent_change"
 }
 
 // ---------------------------------------------------------------------------
@@ -1230,9 +1277,14 @@ func uniqueAnomalyEvidence(values []string) []string {
 	return result
 }
 
-// GetAnomalies surfaces one explainable finding per domain and type. Counts are
-// derived from durable ScanJob records (one scheduled/manual monitoring
-// operation; scanner retries are not counted as separate monitoring rounds).
+// GetAnomalies surfaces one explainable finding per domain and type for the
+// issue register. Counts are derived from durable ScanJob records (one
+// scheduled/manual monitoring operation; scanner retries are not counted as
+// separate monitoring rounds). Expected properties and measurement artifacts
+// (intentional multi-CDN, settled historical mixed fingerprints, DNS
+// address-pool rotation, change counters without a same-endpoint replacement)
+// are omitted after diagnosis; they remain available on the domain diagnosis
+// APIs.
 func (d *Database) GetAnomalies(limit int) ([]models.Anomaly, error) {
 	out := make([]models.Anomaly, 0)
 	now := time.Now()
@@ -1247,7 +1299,7 @@ func (d *Database) GetAnomalies(limit int) ([]models.Anomaly, error) {
 		return nil
 	}
 	var validated []models.DomainCertificate
-	if err := d.db.Where(monitoredPredicate+" AND status = ? AND tls_checked_at IS NOT NULL AND tls_findings NOT IN ('', 'null', '[]')", models.StatusActive).Find(&validated).Error; err != nil {
+	if err := d.db.Preload("CurrentCertificate").Where(monitoredPredicate+" AND status = ? AND tls_checked_at IS NOT NULL AND tls_findings NOT IN ('', 'null', '[]')", models.StatusActive).Find(&validated).Error; err != nil {
 		return nil, err
 	}
 	for _, dc := range validated {
@@ -1260,18 +1312,7 @@ func (d *Database) GetAnomalies(limit int) ([]models.Anomaly, error) {
 			grouped[finding.Code] = append(grouped[finding.Code], finding)
 		}
 		for code, rows := range grouped {
-			facts := []string{"scope=sampled_endpoints_and_local_trust_store", "checked_at=" + dc.TLSCheckedAt.Format(time.RFC3339)}
-			for _, row := range rows {
-				facts = append(facts, fmt.Sprintf("ip=%s fingerprint=%s detail=%s", row.IPAddress, row.Fingerprint, row.Detail))
-			}
-			a := models.Anomaly{Domain: dc.Domain, Type: code, Severity: "warning", Description: "Active TLS validation: " + code, Fingerprint: dc.CurrentFingerprint, DetectedAt: *dc.TLSCheckedAt, OccurrenceCount: 1}
-			state := models.EvidenceStatusComplete
-			reason := "The captured TLS certificate failed the named check at the sampled endpoint. Local trust failures do not establish global browser rejection."
-			if code == "endpoint_probe_inconclusive" {
-				state = models.EvidenceStatusPending
-				reason = "An additional endpoint check failed or was not attempted within the sampling cap; certificate status at that endpoint remains unknown."
-			}
-			out = append(out, withAnomalyCause(a, anomalyCause{confirmedReason: reason, confirmedEvidence: facts, evidenceStatus: state}))
+			out = append(out, seedTLSValidationAnomaly(dc, code, rows))
 		}
 	}
 
@@ -1331,7 +1372,7 @@ func (d *Database) GetAnomalies(limit int) ([]models.Anomaly, error) {
 		if err := appendFinding(withAnomalyCause(models.Anomaly{
 			Domain: dc.Domain, Type: "expired_served", Severity: "critical",
 			Description: description,
-			Fingerprint: dc.CurrentFingerprint, OccurrenceCount: 1, DetectedAt: now,
+			Fingerprint: dc.CurrentFingerprint, OccurrenceCount: 1, DetectedAt: firstTimePtr(dc.LastScannedAt, now),
 		}, withDomainEvidence(cause, dc)), 1); err != nil {
 			return nil, err
 		}
@@ -1372,7 +1413,7 @@ func (d *Database) GetAnomalies(limit int) ([]models.Anomaly, error) {
 		if err := appendFinding(withAnomalyCause(models.Anomaly{
 			Domain: dc.Domain, Type: "expiring_soon", Severity: "warning",
 			Description: fmt.Sprintf("The certificate expires within %d days", days),
-			Fingerprint: dc.CurrentFingerprint, OccurrenceCount: 1, DetectedAt: now,
+			Fingerprint: dc.CurrentFingerprint, OccurrenceCount: 1, DetectedAt: firstTimePtr(dc.LastScannedAt, now),
 		}, withDomainEvidence(anomalyCause{
 			confirmedReason:   "The currently deployed certificate is inside the seven-day expiry window.",
 			confirmedEvidence: []string{fmt.Sprintf("not_after=%s", cert.NotAfter.Format(time.RFC3339)), fmt.Sprintf("days_until_expiry=%d", days)},
@@ -1409,11 +1450,14 @@ func (d *Database) GetAnomalies(limit int) ([]models.Anomaly, error) {
 		}
 	}
 
-	// Lifecycle-specific findings are derived from append-only event rows. They
-	// remain visible after the current certificate has changed, which is
-	// necessary for residual and stale-after-change history.
+	// Lifecycle-specific findings are derived from append-only event rows.
+	// Revoked residual-service observations are the same finding as a
+	// currently revoked leaf, so they are not listed as a second issue type.
+	// Mixed-endpoint and stale-after-change rows are still loaded here so
+	// diagnosis can inspect them; GetAnomalies then drops the ones that are
+	// no longer a live problem.
 	var lifecycleRows []models.CertObservation
-	if err := d.db.Where(monitoredDomainSubquery+" AND observation_type IN ?", []string{models.ObsSameKey, models.ObsStaleAfterChange, models.ObsResidual, models.ObsDeploymentFailure}).
+	if err := d.db.Where(monitoredDomainSubquery+" AND observation_type IN ?", []string{models.ObsSameKey, models.ObsStaleAfterChange, models.ObsDeploymentFailure}).
 		Order("observed_at DESC").Find(&lifecycleRows).Error; err != nil {
 		return nil, err
 	}
@@ -1437,7 +1481,7 @@ func (d *Database) GetAnomalies(limit int) ([]models.Anomaly, error) {
 		cause := lifecycleCause(latest, count)
 		severity := "info"
 		switch latest.ObservationType {
-		case models.ObsStaleAfterChange, models.ObsResidual, models.ObsDeploymentFailure:
+		case models.ObsStaleAfterChange, models.ObsDeploymentFailure:
 			severity = "warning"
 		}
 		description := lifecycleDescription(latest.ObservationType, count)
@@ -1455,17 +1499,26 @@ func (d *Database) GetAnomalies(limit int) ([]models.Anomaly, error) {
 		return nil, err
 	}
 	for _, dc := range churny {
+		var replacementCount int64
+		if err := d.db.Model(&models.CertObservation{}).
+			Where("domain = ? AND observation_type = ? AND change_class = ?", dc.Domain, models.ObsChange, models.ChangeClassReplacement).
+			Count(&replacementCount).Error; err != nil {
+			return nil, err
+		}
+		if replacementCount < 3 {
+			continue
+		}
 		var latest models.CertObservation
-		_ = d.db.Where("domain = ? AND observation_type = ?", dc.Domain, models.ObsChange).Order("observed_at DESC").First(&latest).Error
+		_ = d.db.Where("domain = ? AND observation_type = ? AND change_class = ?", dc.Domain, models.ObsChange, models.ChangeClassReplacement).Order("observed_at DESC").First(&latest).Error
 		cause := d.certificateChangeCause(dc.Domain, latest)
-		certificateChanges := fmt.Sprintf("certificate_changes=%d", dc.ChangeCount)
+		certificateChanges := fmt.Sprintf("same_ip_replacements=%d", replacementCount)
 		cause.confirmedEvidence = append([]string{certificateChanges}, cause.confirmedEvidence...)
 		cause.inferredEvidence = append([]string{certificateChanges}, cause.inferredEvidence...)
 		if err := appendFinding(withAnomalyCause(models.Anomaly{
 			Domain: dc.Domain, Type: "frequent_change", Severity: "warning",
-			Description: fmt.Sprintf("The certificate changed %d times during the monitoring period", dc.ChangeCount),
-			Fingerprint: dc.CurrentFingerprint, OccurrenceCount: dc.ChangeCount, DetectedAt: firstTimePtr(latest.ObservedAt, now),
-		}, withObservationEvidence(cause, latest)), dc.ChangeCount); err != nil {
+			Description: fmt.Sprintf("The same endpoint replaced its leaf %d times during the monitoring period", replacementCount),
+			Fingerprint: dc.CurrentFingerprint, OccurrenceCount: int(replacementCount), DetectedAt: firstTimePtr(latest.ObservedAt, now),
+		}, withObservationEvidence(cause, latest)), int(replacementCount)); err != nil {
 			return nil, err
 		}
 	}
@@ -1536,6 +1589,14 @@ func (d *Database) GetAnomalies(limit int) ([]models.Anomaly, error) {
 	if err := d.decorateDiagnoses(out); err != nil {
 		return nil, err
 	}
+	kept := out[:0]
+	for _, item := range out {
+		if isIssueRegisterFinding(item) {
+			kept = append(kept, item)
+		}
+	}
+	out = kept
+	sanitizeAnomalyJSONTimes(out)
 	sort.SliceStable(out, func(i, j int) bool {
 		rank := map[string]int{"critical": 0, "warning": 1, "info": 2}
 		if rank[out[i].Severity] != rank[out[j].Severity] {
@@ -1550,6 +1611,59 @@ func (d *Database) GetAnomalies(limit int) ([]models.Anomaly, error) {
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+// GetAnomaliesPage keeps the issue-register set behind the database boundary
+// and applies type/domain filtering and pagination after diagnosis. Expected
+// properties and measurement artifacts are already omitted by GetAnomalies.
+// The old limit-only API silently discarded everything after its cap, which
+// made the UI unable to distinguish "no more findings" from "not returned".
+func (d *Database) GetAnomaliesPage(page, perPage int, typeFilter, domainFilter string) ([]models.Anomaly, int, error) {
+	all, err := d.cachedAnomalies()
+	if err != nil {
+		return nil, 0, err
+	}
+	filtered := make([]models.Anomaly, 0, len(all))
+	for _, item := range all {
+		if typeFilter != "" && item.Type != typeFilter {
+			continue
+		}
+		if domainFilter != "" && item.Domain != domainFilter {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	total := len(filtered)
+	if page < 1 {
+		page = 1
+	}
+	if perPage < 1 {
+		perPage = 100
+	}
+	start := (page - 1) * perPage
+	if start >= total {
+		return []models.Anomaly{}, total, nil
+	}
+	end := start + perPage
+	if end > total {
+		end = total
+	}
+	return append([]models.Anomaly(nil), filtered[start:end]...), total, nil
+}
+
+func (d *Database) cachedAnomalies() ([]models.Anomaly, error) {
+	d.anomalyCacheMu.Lock()
+	defer d.anomalyCacheMu.Unlock()
+	if d.anomalyCache != nil && time.Since(d.anomalyCacheAt) < anomalyCacheTTL {
+		return d.anomalyCache, nil
+	}
+	all, err := d.GetAnomalies(0)
+	if err != nil {
+		return nil, err
+	}
+	d.anomalyCache = append([]models.Anomaly(nil), all...)
+	d.anomalyCacheAt = time.Now()
+	return d.anomalyCache, nil
 }
 
 type monitoringEvidence struct {
@@ -1768,6 +1882,14 @@ func (d *Database) decorateDiagnoses(items []models.Anomaly) error {
 			fingerprints[observation.PreviousFingerprint] = struct{}{}
 		}
 	}
+	for _, fingerprint := range collectTLSFindingFingerprints(states) {
+		fingerprints[fingerprint] = struct{}{}
+	}
+	for _, state := range states {
+		if state.ResidualFingerprint != "" {
+			fingerprints[state.ResidualFingerprint] = struct{}{}
+		}
+	}
 	certByFingerprint := make(map[string]models.Certificate)
 	if len(fingerprints) > 0 {
 		values := make([]string, 0, len(fingerprints))
@@ -1794,9 +1916,66 @@ func (d *Database) decorateDiagnoses(items []models.Anomaly) error {
 			context.state = &state
 		}
 		diagnosis := inferDiagnosis(items[index], context)
+		attachInvestigation(items[index], context, &diagnosis)
 		items[index].Diagnosis = &diagnosis
+		applyDiagnosisToFinding(&items[index], &diagnosis)
 	}
 	return nil
+}
+
+// applyDiagnosisToFinding lets the discriminating analysis change the finding it
+// explains. Leaving the two decoupled is what allowed a finding to be presented
+// as a warning while its own diagnosis said the arrangement was deliberate and
+// working as designed; a reader then has to overrule the severity by hand, and a
+// count of warnings means nothing.
+func applyDiagnosisToFinding(item *models.Anomaly, diagnosis *models.CauseDiagnosis) {
+	if item == nil || diagnosis == nil {
+		return
+	}
+	item.FindingClass = findingClassOf(*diagnosis)
+	if diagnosis.Investigation != nil && diagnosis.Investigation.FindingClass != "" {
+		item.FindingClass = diagnosis.Investigation.FindingClass
+	}
+	if diagnosis.Investigation != nil {
+		if diagnosis.Investigation.Problem != "" {
+			item.Description = diagnosis.Investigation.Problem
+		}
+		if diagnosis.Investigation.Cause != "" {
+			item.Reason = diagnosis.Investigation.Cause
+			if item.CauseClassification == "confirmed" {
+				item.ConfirmedReason = diagnosis.Investigation.Cause
+			} else {
+				item.InferredReason = diagnosis.Investigation.Cause
+			}
+		}
+		if len(diagnosis.Investigation.Facts) > 0 {
+			item.Evidence = append([]string{}, diagnosis.Investigation.Facts...)
+			if item.CauseClassification == "confirmed" {
+				item.ConfirmedEvidence = append([]string{}, diagnosis.Investigation.Facts...)
+			} else {
+				item.InferredEvidence = append([]string{}, diagnosis.Investigation.Facts...)
+			}
+		}
+	}
+	if diagnosis.BenignExplanation == "" {
+		return
+	}
+	// Withdraw the problem claim. GetAnomalies then drops expected rows from
+	// the issue register; domain diagnosis APIs still expose the write-up.
+	item.Severity = "info"
+	item.Reason = diagnosis.BenignExplanation + " " + item.Reason
+	if item.CauseClassification == "confirmed" {
+		item.ConfirmedReason = diagnosis.BenignExplanation + " " + item.ConfirmedReason
+	} else {
+		item.InferredReason = diagnosis.BenignExplanation + " " + item.InferredReason
+	}
+	marker := "diagnosis=" + diagnosis.PrimaryCode
+	item.Evidence = append(item.Evidence, marker, "expected_deployment_property=true")
+	if item.CauseClassification == "confirmed" {
+		item.ConfirmedEvidence = append(item.ConfirmedEvidence, marker, "expected_deployment_property=true")
+	} else {
+		item.InferredEvidence = append(item.InferredEvidence, marker, "expected_deployment_property=true")
+	}
 }
 
 type diagnosisContext struct {
@@ -1806,13 +1985,169 @@ type diagnosisContext struct {
 	certificates map[string]models.Certificate
 }
 
+// buildEvidenceCase materializes the retained rounds behind a diagnosis. It
+// deliberately preserves what was unknown: an address absent from the DNS
+// consensus is not promoted to an active endpoint merely because it answered a
+// direct probe, and missing topology JSON remains a missing-evidence condition.
+func buildEvidenceCase(item models.Anomaly, context diagnosisContext, diagnosis models.CauseDiagnosis) *models.EvidenceCase {
+	return buildEvidenceCaseWithLimit(item, context, diagnosis, 24)
+}
+
+func buildCompactEvidenceCase(item models.Anomaly, context diagnosisContext, diagnosis models.CauseDiagnosis) *models.EvidenceCase {
+	return buildEvidenceCaseWithLimit(item, context, diagnosis, 0)
+}
+
+func buildEvidenceCaseWithLimit(item models.Anomaly, context diagnosisContext, diagnosis models.CauseDiagnosis, maxRounds int) *models.EvidenceCase {
+	caseFile := &models.EvidenceCase{
+		Domain:             item.Domain,
+		AnomalyType:        item.Type,
+		Status:             "insufficient",
+		GeneratedAt:        time.Now().UTC(),
+		ConfidenceCeiling:  "low",
+		Rounds:             make([]models.EvidenceRound, 0, minInt(len(context.snapshots), maxRounds)),
+		SupportingEvidence: []string{},
+		Contradictions:     []string{},
+		MissingEvidence:    []string{},
+		ReversalConditions: []string{},
+	}
+	if diagnosis.Corroboration != nil {
+		caseFile.ConfidenceCeiling = diagnosis.Corroboration.ConfidenceCeiling
+	}
+
+	latestProbes, _, _ := latestEndpointSurvey(context.observations)
+	probeByIP := make(map[string]models.EndpointProbe, len(latestProbes))
+	for _, probe := range latestProbes {
+		if probe.IPAddress != "" {
+			probeByIP[probe.IPAddress] = probe
+		}
+	}
+	for index, snapshot := range context.snapshots {
+		if index >= maxRounds {
+			break
+		}
+		assignment := snapshotEndpointMap(snapshot)
+		active, activeKnown := snapshotActiveIPsFor(snapshot)
+		round := models.EvidenceRound{
+			ObservedAt:        snapshot.ObservedAt,
+			Trigger:           snapshot.Trigger,
+			ResolverQuorum:    snapshot.ResolverQuorum,
+			ResolverAgreement: snapshot.ResolverAgreement,
+			ConsensusIPs:      sortedEvidenceSet(active),
+			Endpoints:         make([]models.EvidenceEndpoint, 0, len(assignment)),
+		}
+		if activeKnown && len(active) > 0 {
+			answered := 0
+			for address := range active {
+				if _, ok := assignment[address]; ok {
+					answered++
+				}
+			}
+			round.EndpointCoverage = roundEvidence(float64(answered) / float64(len(active)))
+		} else if snapshot.EndpointCount > 0 {
+			round.EndpointCoverage = roundEvidence(float64(snapshot.SuccessfulEndpointCount) / float64(snapshot.EndpointCount))
+		}
+		if index > 0 {
+			previous := context.snapshots[index-1]
+			round.TopologyChanged = snapshot.TopologyHash != "" && previous.TopologyHash != "" && snapshot.TopologyHash != previous.TopologyHash
+		}
+		for address, fingerprint := range assignment {
+			endpoint := models.EvidenceEndpoint{
+				IPAddress:     address,
+				ProviderGroup: providerGroup(address),
+				Fingerprint:   fingerprint,
+				Success:       fingerprint != "",
+				ActiveDNS:     activeKnown && hasEvidenceAddress(active, address),
+			}
+			// EndpointProbe metadata is retained for the latest lifecycle survey;
+			// never copy it into older rounds or overwrite their historical leaf.
+			if index == 0 {
+				if probe, ok := probeByIP[address]; ok {
+					endpoint.Success = probe.Success
+					endpoint.Fingerprint = fingerprint
+					endpoint.SPKIFingerprint = probe.SPKIFingerprint
+					endpoint.IssuerCN = probe.IssuerCN
+					endpoint.KeyAlgorithm = probe.KeyAlgorithm
+					endpoint.SANsHash = probe.SANsHash
+					endpoint.Error = probe.Error
+				}
+			}
+			round.Endpoints = append(round.Endpoints, endpoint)
+		}
+		sort.Slice(round.Endpoints, func(left, right int) bool { return round.Endpoints[left].IPAddress < round.Endpoints[right].IPAddress })
+		caseFile.Rounds = append(caseFile.Rounds, round)
+	}
+	if maxRounds > 0 && len(caseFile.Rounds) == 0 && len(latestProbes) > 0 {
+		round := models.EvidenceRound{ObservedAt: latestObservedAt(context.observations, nil), Trigger: "endpoint_survey", EndpointCoverage: 1}
+		for _, probe := range latestProbes {
+			round.Endpoints = append(round.Endpoints, models.EvidenceEndpoint{
+				IPAddress: probe.IPAddress, ProviderGroup: providerGroup(probe.IPAddress), Fingerprint: probe.Fingerprint,
+				SPKIFingerprint: probe.SPKIFingerprint, IssuerCN: probe.IssuerCN, KeyAlgorithm: probe.KeyAlgorithm,
+				SANsHash: probe.SANsHash, Success: probe.Success, ActiveDNS: false, Error: probe.Error,
+			})
+		}
+		caseFile.Rounds = append(caseFile.Rounds, round)
+	}
+
+	caseFile.SupportingEvidence = append(caseFile.SupportingEvidence, investigationFacts(item, context, diagnosis)...)
+	if diagnosis.Divergence != nil {
+		caseFile.MissingEvidence = append(caseFile.MissingEvidence, diagnosis.Divergence.MissingEvidence...)
+		caseFile.ReversalConditions = append(caseFile.ReversalConditions, diagnosis.Divergence.ReversalConditions...)
+	}
+	if len(diagnosis.Hypotheses) > 1 {
+		for _, hypothesis := range diagnosis.Hypotheses[1:] {
+			if len(caseFile.Contradictions) >= 3 {
+				break
+			}
+			reason := ruledOutReason(hypothesis)
+			if reason == "" {
+				continue
+			}
+			caseFile.Contradictions = append(caseFile.Contradictions, "Not "+strings.ToLower(hypothesis.Label)+": "+reason)
+		}
+	}
+	caseFile.MissingEvidence = append(caseFile.MissingEvidence, diagnosis.MeasurementPlan...)
+	if len(caseFile.Rounds) == 0 {
+		caseFile.MissingEvidence = append(caseFile.MissingEvidence, "no retained measurement round contains endpoint and DNS evidence")
+	}
+	if len(caseFile.ReversalConditions) == 0 {
+		caseFile.ReversalConditions = append(caseFile.ReversalConditions, "a later independent round that changes the endpoint-to-certificate assignment")
+	}
+	caseFile.SupportingEvidence = uniqueEvidenceStrings(caseFile.SupportingEvidence)
+	caseFile.Contradictions = uniqueEvidenceStrings(caseFile.Contradictions)
+	caseFile.MissingEvidence = uniqueEvidenceStrings(caseFile.MissingEvidence)
+	caseFile.ReversalConditions = uniqueEvidenceStrings(caseFile.ReversalConditions)
+	if diagnosis.BenignExplanation != "" {
+		caseFile.Status = "benign"
+	} else if diagnosis.Divergence != nil && diagnosis.Divergence.StrongEvidence {
+		caseFile.Status = "strong"
+	} else if len(caseFile.Rounds) > 0 {
+		caseFile.Status = "observed"
+	}
+	return caseFile
+}
+
+func hasEvidenceAddress(values map[string]struct{}, address string) bool {
+	_, ok := values[address]
+	return ok
+}
+
 func inferDiagnosis(item models.Anomaly, context diagnosisContext) models.CauseDiagnosis {
 	switch item.Type {
-	case "frequent_change", "early_renewal", "same_key":
+	case "same_key":
+		return inferSameKeyDiagnosis(item, context)
+	case "early_renewal":
+		return inferEarlyRenewalDiagnosis(item, context)
+	case "frequent_change":
 		return inferChurnDiagnosis(item, context)
 	case models.ObsStaleAfterChange, models.ObsDeploymentFailure:
 		return inferTopologyDiagnosis(item, context)
 	default:
+		if isTLSValidationType(item.Type) {
+			return inferTLSValidationDiagnosis(item, context)
+		}
+		if isCertificateConditionType(item.Type) {
+			return inferCertificateConditionDiagnosis(item, context)
+		}
 		return inferBasicDiagnosis(item, context)
 	}
 }
@@ -1830,6 +2165,7 @@ func inferBasicDiagnosis(item models.Anomaly, context diagnosisContext) models.C
 	return models.CauseDiagnosis{
 		PrimaryCode:          "insufficient_longitudinal_evidence",
 		PrimaryLabel:         "Insufficient longitudinal evidence",
+		CauseStatus:          "unestablished",
 		Confidence:           confidence,
 		Summary:              summary,
 		EvidenceCompleteness: completenessScore(rounds, len(context.observations), context.state != nil),
@@ -1837,6 +2173,597 @@ func inferBasicDiagnosis(item models.Anomaly, context diagnosisContext) models.C
 		MeasuredRounds:       rounds,
 		TransitionRounds:     len(context.observations),
 		MeasurementPlan:      []string{"Collect at least three additional independent resolver and endpoint rounds before attributing an operational cause."},
+	}
+}
+
+const earlyRenewalLeadDays = 30
+
+func inferEarlyRenewalDiagnosis(item models.Anomaly, context diagnosisContext) models.CauseDiagnosis {
+	pairs := collectEarlyRenewalPairs(context)
+	earlySame := make([]earlyRenewalPair, 0, len(pairs))
+	concurrent, unknown, shortLived := 0, 0, 0
+	predRemaining := make([]int, 0, len(pairs))
+	predValidity := make([]int, 0, len(pairs))
+	succAge := make([]int, 0, len(pairs))
+	leaves := map[string]struct{}{}
+	evidence := make([]string, 0, len(pairs))
+	for _, pair := range pairs {
+		leaves[pair.previousLeaf] = struct{}{}
+		leaves[pair.leaf] = struct{}{}
+		if pair.predecessorValidityDays > 0 {
+			predValidity = append(predValidity, pair.predecessorValidityDays)
+		}
+		if pair.predecessorValidityDays > 0 && pair.predecessorValidityDays <= earlyRenewalLeadDays {
+			shortLived++
+			continue
+		}
+		if pair.predecessorRemainingDays <= earlyRenewalLeadDays {
+			continue
+		}
+		evidence = append(evidence, pair.evidenceLine())
+		predRemaining = append(predRemaining, pair.predecessorRemainingDays)
+		if pair.successorAgeKnown {
+			succAge = append(succAge, pair.successorIssuanceAgeDays)
+		}
+		switch {
+		case pair.coexisting || pair.relation == "different_endpoint":
+			concurrent++
+		case pair.relation != "same_endpoint":
+			unknown++
+		default:
+			earlySame = append(earlySame, pair)
+		}
+	}
+
+	medianPredRemaining := medianInt(predRemaining)
+	medianPredValidity := medianInt(predValidity)
+	medianSuccAge := medianInt(succAge)
+	shape := models.ChurnShape{
+		ChangeEvents:           len(pairs),
+		DistinctLeaves:         len(leaves),
+		SameEndpointChanges:    len(earlySame),
+		CrossEndpointChanges:   concurrent,
+		UnknownEndpointChanges: unknown,
+		CoexistenceProofs:      concurrent,
+		EffectiveReplacements:  len(earlySame),
+		MedianRemainingDays:    medianPredRemaining,
+		MedianValidityDays:     medianPredValidity,
+		MedianIssuanceAgeDays:  medianSuccAge,
+	}
+
+	switch {
+	case len(earlySame) > 0:
+		shape.MedianRemainingDays = medianInt(predecessorRemaining(earlySame))
+		shape.MedianValidityDays = medianInt(predecessorValidity(earlySame))
+		summary := fmt.Sprintf("%d same-address replacement(s) retired a predecessor that still had %d day(s) remaining of a %d-day lifetime.", len(earlySame), shape.MedianRemainingDays, maxInt(shape.MedianValidityDays, 0))
+		if medianSuccAge >= 0 && len(succAge) > 0 {
+			summary += fmt.Sprintf(" The successor's issuance age at observation was %d day(s).", medianSuccAge)
+		}
+		return models.CauseDiagnosis{
+			PrimaryCode:          "early_renewal_replacement",
+			PrimaryLabel:         "Predecessor replaced more than 30 days before expiry",
+			CauseStatus:          "established",
+			Confidence:           "high",
+			Summary:              summary,
+			EvidenceCompleteness: completenessScore(len(context.snapshots), len(earlySame), context.state != nil),
+			Hypotheses: []models.CauseHypothesis{{
+				Code:      "early_renewal_replacement",
+				Label:     "Predecessor replaced more than 30 days before expiry",
+				Score:     1,
+				Evidence:  evidenceForPairs(earlySame),
+				Rationale: fmt.Sprintf("The predecessor NotAfter minus the observation time is %d day(s), which is more than %d, and consecutive scans shared the serving address.", shape.MedianRemainingDays, earlyRenewalLeadDays),
+			}},
+			MeasuredRounds:   len(context.snapshots),
+			TransitionRounds: len(earlySame),
+			ChurnShape:       &shape,
+			MeasurementPlan: []string{
+				"a later same-address replacement whose predecessor remaining life is 30 days or fewer overturns this as an early replacement",
+			},
+		}
+	case concurrent > 0 && len(earlySame) == 0 && unknown == 0:
+		benign := fmt.Sprintf("Leaf fingerprints differed while a predecessor still had %d day(s) remaining, but the two leaves were observed on different addresses or in the same round, so this is concurrent deployment, not a replacement in time.", medianPredRemaining)
+		return models.CauseDiagnosis{
+			PrimaryCode:          "concurrent_multi_certificate_pool",
+			PrimaryLabel:         "Concurrent certificates, not an early replacement",
+			CauseStatus:          "established",
+			Confidence:           "medium",
+			Summary:              benign,
+			BenignExplanation:    benign,
+			EvidenceCompleteness: completenessScore(len(context.snapshots), concurrent, context.state != nil),
+			MeasuredRounds:       len(context.snapshots),
+			ChurnShape:           &shape,
+		}
+	case shortLived > 0 && len(earlySame) == 0:
+		benign := fmt.Sprintf("The predecessor lifetime is %d day(s), so replacing it is the designed short-lived cadence, not an early renewal of a long-lived certificate.", medianPredValidity)
+		return models.CauseDiagnosis{
+			PrimaryCode:          "short_lived_certificate_automation",
+			PrimaryLabel:         "Short-lived certificate cadence",
+			CauseStatus:          "established",
+			Confidence:           "medium",
+			Summary:              benign,
+			BenignExplanation:    benign,
+			EvidenceCompleteness: completenessScore(len(context.snapshots), shortLived, context.state != nil),
+			MeasuredRounds:       len(context.snapshots),
+			ChurnShape:           &shape,
+		}
+	default:
+		summary := "No retained same-address replacement has a predecessor NotAfter more than 30 days after the observation."
+		if unknown > 0 {
+			summary = fmt.Sprintf("%d leaf change(s) have a predecessor with more than 30 days remaining, but the serving address was not retained, so replacement in time is not proven.", unknown)
+		}
+		if medianPredRemaining > 0 && medianPredRemaining <= earlyRenewalLeadDays {
+			summary = fmt.Sprintf("The predecessor remaining life at the observed leaf change is %d day(s), which is not more than 30.", medianPredRemaining)
+		}
+		return models.CauseDiagnosis{
+			PrimaryCode:          "early_renewal_unestablished",
+			PrimaryLabel:         "Early replacement not established",
+			CauseStatus:          "unestablished",
+			Confidence:           "low",
+			Summary:              summary,
+			EvidenceCompleteness: completenessScore(len(context.snapshots), len(pairs), context.state != nil),
+			MeasuredRounds:       len(context.snapshots),
+			ChurnShape:           &shape,
+			MeasurementPlan: []string{
+				"retain previous and current serving addresses on the replacement row",
+				"retain the predecessor NotAfter so remaining life can be computed at observation time",
+			},
+		}
+	}
+}
+
+type earlyRenewalPair struct {
+	observedAt               time.Time
+	previousLeaf             string
+	leaf                     string
+	ipAddress                string
+	previousIP               string
+	relation                 string
+	coexisting               bool
+	predecessorRemainingDays int
+	predecessorValidityDays  int
+	predecessorNotAfter      time.Time
+	successorIssuanceAgeDays int
+	successorAgeKnown        bool
+	successorRemainingDays   int
+}
+
+func (pair earlyRenewalPair) evidenceLine() string {
+	line := fmt.Sprintf("%s leaf %s → %s; predecessor remaining life %d day(s) (not_after=%s)",
+		pair.observedAt.UTC().Format(time.RFC3339),
+		shortProofFP(pair.previousLeaf),
+		shortProofFP(pair.leaf),
+		pair.predecessorRemainingDays,
+		pair.predecessorNotAfter.UTC().Format(time.RFC3339),
+	)
+	if pair.predecessorValidityDays > 0 {
+		line += fmt.Sprintf("; predecessor lifetime %d day(s)", pair.predecessorValidityDays)
+	}
+	switch {
+	case pair.ipAddress != "" && pair.relation == "same_endpoint":
+		line += "; same address " + pair.ipAddress
+	case pair.ipAddress != "" && pair.previousIP != "" && pair.relation == "different_endpoint":
+		line += "; addresses " + pair.previousIP + " → " + pair.ipAddress
+	case pair.ipAddress != "":
+		line += "; serving address " + pair.ipAddress + " (previous address not retained)"
+	default:
+		line += "; serving address not retained"
+	}
+	if pair.successorAgeKnown {
+		line += fmt.Sprintf("; successor issuance age %d day(s)", pair.successorIssuanceAgeDays)
+	}
+	if pair.successorRemainingDays > 0 {
+		line += fmt.Sprintf("; successor remaining life %d day(s)", pair.successorRemainingDays)
+	}
+	return line
+}
+
+func collectEarlyRenewalPairs(context diagnosisContext) []earlyRenewalPair {
+	changes := make([]models.CertObservation, 0)
+	for _, observation := range context.observations {
+		if observation.ObservationType == models.ObsChange {
+			changes = append(changes, observation)
+		}
+	}
+	sort.SliceStable(changes, func(left, right int) bool {
+		return changes[left].ObservedAt.Before(changes[right].ObservedAt)
+	})
+	recoverChangeEndpoints(changes, context.snapshots)
+	pairs := make([]earlyRenewalPair, 0, len(changes))
+	for index, change := range changes {
+		if change.Fingerprint == "" || change.PreviousFingerprint == "" || change.Fingerprint == change.PreviousFingerprint {
+			continue
+		}
+		previous, ok := context.certificates[change.PreviousFingerprint]
+		if !ok || previous.NotAfter.IsZero() || change.ObservedAt.IsZero() {
+			continue
+		}
+		if !jsonableTime(previous.NotAfter) || !jsonableTime(change.ObservedAt) {
+			continue
+		}
+		pair := earlyRenewalPair{
+			observedAt:               change.ObservedAt,
+			previousLeaf:             change.PreviousFingerprint,
+			leaf:                     change.Fingerprint,
+			ipAddress:                strings.TrimSpace(change.IPAddress),
+			previousIP:               strings.TrimSpace(change.PreviousIPAddress),
+			coexisting:               change.ChangeClass == models.ChangeClassCoexisting || coexistingLeaves(change),
+			predecessorRemainingDays: models.DaysUntil(previous.NotAfter, change.ObservedAt),
+			predecessorNotAfter:      previous.NotAfter,
+		}
+		if jsonableTime(previous.NotBefore) && !previous.NotBefore.IsZero() && previous.NotAfter.After(previous.NotBefore) {
+			pair.predecessorValidityDays = int(previous.NotAfter.Sub(previous.NotBefore).Hours() / 24)
+		}
+		if current, ok := context.certificates[change.Fingerprint]; ok {
+			if jsonableTime(current.NotBefore) && !current.NotBefore.IsZero() {
+				pair.successorAgeKnown = true
+				age := int(change.ObservedAt.Sub(current.NotBefore).Hours() / 24)
+				if age < 0 {
+					age = 0
+				}
+				pair.successorIssuanceAgeDays = age
+			}
+			if jsonableTime(current.NotAfter) && !current.NotAfter.IsZero() {
+				pair.successorRemainingDays = models.DaysUntil(current.NotAfter, change.ObservedAt)
+			}
+		}
+		if pair.successorRemainingDays == 0 && change.DaysUntilExpiry > 0 {
+			pair.successorRemainingDays = change.DaysUntilExpiry
+		}
+		switch endpointRelation(changes, index) {
+		case endpointSame:
+			pair.relation = "same_endpoint"
+			if pair.previousIP == "" && index > 0 {
+				pair.previousIP = strings.TrimSpace(changes[index-1].IPAddress)
+			}
+		case endpointDifferent:
+			pair.relation = "different_endpoint"
+		default:
+			pair.relation = sameKeyRelation(pair.previousIP, pair.ipAddress, change.ChangeClass)
+		}
+		if pair.coexisting && pair.relation == "same_endpoint" {
+			pair.relation = "different_endpoint"
+		}
+		pairs = append(pairs, pair)
+	}
+	return pairs
+}
+
+func predecessorRemaining(pairs []earlyRenewalPair) []int {
+	out := make([]int, 0, len(pairs))
+	for _, pair := range pairs {
+		out = append(out, pair.predecessorRemainingDays)
+	}
+	return out
+}
+
+func predecessorValidity(pairs []earlyRenewalPair) []int {
+	out := make([]int, 0, len(pairs))
+	for _, pair := range pairs {
+		if pair.predecessorValidityDays > 0 {
+			out = append(out, pair.predecessorValidityDays)
+		}
+	}
+	return out
+}
+
+func evidenceForPairs(pairs []earlyRenewalPair) []string {
+	out := make([]string, 0, len(pairs))
+	for _, pair := range pairs {
+		out = append(out, pair.evidenceLine())
+	}
+	return out
+}
+
+func inferSameKeyDiagnosis(item models.Anomaly, context diagnosisContext) models.CauseDiagnosis {
+	pairs := collectSameKeyPairs(context)
+	if len(pairs) == 0 {
+		return models.CauseDiagnosis{
+			PrimaryCode:          "same_key_unestablished",
+			PrimaryLabel:         "Same-key comparison not retained",
+			CauseStatus:          "unestablished",
+			Confidence:           "low",
+			Summary:              "A same-key finding was raised, but no retained pair has both a new leaf fingerprint and a previous SPKI fingerprint.",
+			EvidenceCompleteness: completenessScore(len(context.snapshots), 0, context.state != nil),
+			MeasuredRounds:       len(context.snapshots),
+			MeasurementPlan:      []string{"retain previous and current leaf fingerprints and SPKI fingerprints on the replacement row"},
+		}
+	}
+
+	sameEndpoint, unknownEndpoint, differentEndpoint, coexisting := 0, 0, 0, 0
+	remaining := make([]int, 0, len(pairs))
+	issuanceAge := make([]int, 0, len(pairs))
+	leaves := map[string]struct{}{}
+	spkis := map[string]struct{}{}
+	evidence := make([]string, 0, len(pairs)*2)
+	for _, pair := range pairs {
+		leaves[pair.previousLeaf] = struct{}{}
+		leaves[pair.leaf] = struct{}{}
+		if pair.spki != "" {
+			spkis[pair.spki] = struct{}{}
+		}
+		switch pair.relation {
+		case "same_endpoint":
+			sameEndpoint++
+		case "different_endpoint":
+			differentEndpoint++
+		default:
+			unknownEndpoint++
+		}
+		if pair.coexisting {
+			coexisting++
+		}
+		if pair.remainingDays > 0 {
+			remaining = append(remaining, pair.remainingDays)
+		}
+		if pair.issuanceAgeDays >= 0 && pair.leafNotBeforeKnown {
+			issuanceAge = append(issuanceAge, pair.issuanceAgeDays)
+		}
+		evidence = append(evidence, pair.evidenceLine())
+	}
+
+	medianRemaining := medianInt(remaining)
+	medianAge := medianInt(issuanceAge)
+	status := "inferred"
+	code := "same_key_reissue"
+	label := "Successor issued or deployed with the predecessor public key"
+	switch {
+	case coexisting > 0 && sameEndpoint == 0:
+		code = "concurrent_same_key"
+		label = "Same public key on concurrently observed leaves"
+		status = "inferred"
+	case sameEndpoint > 0:
+		status = "established"
+	}
+
+	summary := fmt.Sprintf("%d leaf change(s) kept the same public key across %d distinct leaf certificate(s) and %d distinct SPKI(s).", len(pairs), len(leaves), maxInt(len(spkis), 1))
+	if sameEndpoint > 0 {
+		summary += fmt.Sprintf(" %d comparison(s) were on the same serving address.", sameEndpoint)
+	}
+	if medianRemaining > 0 {
+		summary += fmt.Sprintf(" At those replacements the successor still had %d day(s) remaining.", medianRemaining)
+	}
+
+	shape := models.ChurnShape{
+		ChangeEvents:           len(pairs),
+		DistinctLeaves:         len(leaves),
+		DistinctSPKIs:          maxInt(len(spkis), 1),
+		SameEndpointChanges:    sameEndpoint,
+		CrossEndpointChanges:   differentEndpoint,
+		UnknownEndpointChanges: unknownEndpoint,
+		CoexistenceProofs:      coexisting,
+		EffectiveReplacements:  len(pairs),
+		MedianRemainingDays:    medianRemaining,
+		MedianIssuanceAgeDays:  medianAge,
+	}
+
+	return models.CauseDiagnosis{
+		PrimaryCode:          code,
+		PrimaryLabel:         label,
+		CauseStatus:          status,
+		Confidence:           sameKeyConfidence(sameEndpoint, len(pairs)),
+		Summary:              summary,
+		EvidenceCompleteness: completenessScore(len(context.snapshots), len(pairs), context.state != nil),
+		Hypotheses: []models.CauseHypothesis{{
+			Code:      code,
+			Label:     label,
+			Score:     1,
+			Evidence:  evidence,
+			Rationale: sameKeyRationale(code, sameEndpoint, medianRemaining, medianAge),
+		}},
+		MeasuredRounds:   len(context.snapshots),
+		TransitionRounds: len(pairs),
+		ChurnShape:       &shape,
+		MeasurementPlan: []string{
+			"a later same-address pair whose SPKI fingerprints differ overturns key reuse",
+			"predecessor and successor observed together on different addresses is concurrent deployment, not replacement in time",
+		},
+	}
+}
+
+type sameKeyPair struct {
+	observedAt         time.Time
+	previousLeaf       string
+	leaf               string
+	spki               string
+	previousSPKI       string
+	ipAddress          string
+	previousIP         string
+	relation           string
+	coexisting         bool
+	remainingDays      int
+	issuanceAgeDays    int
+	leafNotBeforeKnown bool
+}
+
+func (pair sameKeyPair) evidenceLine() string {
+	line := fmt.Sprintf("%s leaf %s → %s; SPKI %s → %s",
+		pair.observedAt.UTC().Format(time.RFC3339),
+		shortProofFP(pair.previousLeaf),
+		shortProofFP(pair.leaf),
+		shortProofFP(pair.previousSPKI),
+		shortProofFP(pair.spki),
+	)
+	switch {
+	case pair.ipAddress != "" && pair.relation == "same_endpoint":
+		line += "; same address " + pair.ipAddress
+	case pair.ipAddress != "" && pair.previousIP != "" && pair.relation == "different_endpoint":
+		line += "; addresses " + pair.previousIP + " → " + pair.ipAddress
+	case pair.ipAddress != "":
+		line += "; serving address " + pair.ipAddress + " (previous address not retained)"
+	default:
+		line += "; serving address not retained"
+	}
+	if pair.remainingDays > 0 {
+		line += fmt.Sprintf("; successor remaining life %d day(s)", pair.remainingDays)
+	}
+	if pair.leafNotBeforeKnown {
+		line += fmt.Sprintf("; successor issuance age %d day(s)", pair.issuanceAgeDays)
+	}
+	return line
+}
+
+func collectSameKeyPairs(context diagnosisContext) []sameKeyPair {
+	changes := make([]models.CertObservation, 0)
+	sameKeyRows := make([]models.CertObservation, 0)
+	for _, observation := range context.observations {
+		switch observation.ObservationType {
+		case models.ObsSameKey:
+			sameKeyRows = append(sameKeyRows, observation)
+		case models.ObsChange:
+			changes = append(changes, observation)
+		}
+	}
+	sort.SliceStable(changes, func(left, right int) bool {
+		return changes[left].ObservedAt.Before(changes[right].ObservedAt)
+	})
+	sort.SliceStable(sameKeyRows, func(left, right int) bool {
+		return sameKeyRows[left].ObservedAt.Before(sameKeyRows[right].ObservedAt)
+	})
+	recoverChangeEndpoints(changes, context.snapshots)
+
+	candidates := sameKeyRows
+	if len(candidates) == 0 {
+		for _, change := range changes {
+			if sameKeySPKI(change, context) {
+				candidates = append(candidates, change)
+			}
+		}
+	}
+	pairs := make([]sameKeyPair, 0, len(candidates))
+	for _, row := range candidates {
+		changeIndex := matchingChangeIndex(changes, row)
+		source := row
+		if changeIndex >= 0 {
+			source = changes[changeIndex]
+		}
+		previousSPKI, spki := pairSPKIs(source, context)
+		if previousSPKI == "" || spki == "" || previousSPKI != spki || source.Fingerprint == "" || source.PreviousFingerprint == "" || source.Fingerprint == source.PreviousFingerprint {
+			continue
+		}
+		pair := sameKeyPair{
+			observedAt:    source.ObservedAt,
+			previousLeaf:  source.PreviousFingerprint,
+			leaf:          source.Fingerprint,
+			previousSPKI:  previousSPKI,
+			spki:          spki,
+			ipAddress:     firstNonEmpty(source.IPAddress, row.IPAddress),
+			previousIP:    firstNonEmpty(source.PreviousIPAddress, row.PreviousIPAddress),
+			coexisting:    source.ChangeClass == models.ChangeClassCoexisting || row.ChangeClass == models.ChangeClassCoexisting,
+			remainingDays: source.DaysUntilExpiry,
+		}
+		if pair.remainingDays == 0 && row.DaysUntilExpiry > 0 {
+			pair.remainingDays = row.DaysUntilExpiry
+		}
+		if changeIndex >= 0 {
+			switch endpointRelation(changes, changeIndex) {
+			case endpointSame:
+				pair.relation = "same_endpoint"
+				if pair.previousIP == "" && changeIndex > 0 {
+					pair.previousIP = strings.TrimSpace(changes[changeIndex-1].IPAddress)
+				}
+			case endpointDifferent:
+				pair.relation = "different_endpoint"
+			default:
+				pair.relation = sameKeyRelation(pair.previousIP, pair.ipAddress, source.ChangeClass)
+			}
+		} else {
+			pair.relation = sameKeyRelation(pair.previousIP, pair.ipAddress, source.ChangeClass)
+		}
+		if cert, ok := context.certificates[pair.leaf]; ok && !cert.NotBefore.IsZero() && !source.ObservedAt.IsZero() {
+			pair.leafNotBeforeKnown = true
+			age := int(source.ObservedAt.Sub(cert.NotBefore).Hours() / 24)
+			if age < 0 {
+				age = 0
+			}
+			pair.issuanceAgeDays = age
+			if pair.remainingDays == 0 && !cert.NotAfter.IsZero() && cert.NotAfter.After(source.ObservedAt) {
+				pair.remainingDays = int(cert.NotAfter.Sub(source.ObservedAt).Hours() / 24)
+			}
+		}
+		pairs = append(pairs, pair)
+	}
+	return pairs
+}
+
+func matchingChangeIndex(changes []models.CertObservation, row models.CertObservation) int {
+	for index := range changes {
+		change := changes[index]
+		if change.Fingerprint == row.Fingerprint && change.PreviousFingerprint == row.PreviousFingerprint {
+			if change.ObservedAt.Equal(row.ObservedAt) || change.ObservedAt.Truncate(time.Second).Equal(row.ObservedAt.Truncate(time.Second)) {
+				return index
+			}
+		}
+	}
+	for index := range changes {
+		change := changes[index]
+		if change.Fingerprint == row.Fingerprint && change.PreviousFingerprint == row.PreviousFingerprint {
+			return index
+		}
+	}
+	return -1
+}
+
+func pairSPKIs(row models.CertObservation, context diagnosisContext) (previous, current string) {
+	previous = strings.TrimSpace(row.PreviousSPKIFingerprint)
+	current = strings.TrimSpace(row.SPKIFingerprint)
+	if previous == "" {
+		if cert, ok := context.certificates[row.PreviousFingerprint]; ok {
+			previous = certificateSPKI(&cert)
+		}
+	}
+	if current == "" {
+		if cert, ok := context.certificates[row.Fingerprint]; ok {
+			current = certificateSPKI(&cert)
+		}
+		if current == "" {
+			current = strings.TrimSpace(row.SPKIFingerprint)
+		}
+	}
+	return previous, current
+}
+
+func sameKeySPKI(row models.CertObservation, context diagnosisContext) bool {
+	previous, current := pairSPKIs(row, context)
+	return previous != "" && current != "" && previous == current && row.Fingerprint != "" && row.PreviousFingerprint != "" && row.Fingerprint != row.PreviousFingerprint
+}
+
+func sameKeyRelation(previousIP, ip, changeClass string) string {
+	if changeClass == models.ChangeClassCoexisting {
+		return "different_endpoint"
+	}
+	previousIP = strings.TrimSpace(previousIP)
+	ip = strings.TrimSpace(ip)
+	if previousIP != "" && ip != "" {
+		if previousIP == ip {
+			return "same_endpoint"
+		}
+		return "different_endpoint"
+	}
+	return "unknown"
+}
+
+func sameKeyConfidence(sameEndpoint, pairs int) string {
+	if sameEndpoint > 0 && pairs >= 2 {
+		return "high"
+	}
+	if sameEndpoint > 0 || pairs >= 2 {
+		return "medium"
+	}
+	return "low"
+}
+
+func sameKeyRationale(code string, sameEndpoint, remaining, issuanceAge int) string {
+	switch code {
+	case "concurrent_same_key":
+		return "Predecessor and successor were observed in the same round, so the shared SPKI is concurrent deployment of two leaves, not a replacement that kept the key."
+	default:
+		if sameEndpoint > 0 && remaining > 0 {
+			return fmt.Sprintf("The same address served a new leaf with the predecessor SPKI while that successor still had %d day(s) remaining and issuance age %d day(s).", remaining, issuanceAge)
+		}
+		if sameEndpoint > 0 {
+			return "The same address served a new leaf whose SPKI fingerprint equals the predecessor."
+		}
+		return "The new leaf fingerprint differs from the previous leaf while both certificates share one SPKI fingerprint. The serving address was not retained on every pair."
 	}
 }
 
@@ -1859,12 +2786,21 @@ func inferChurnDiagnosis(item models.Anomaly, context diagnosisContext) models.C
 	if len(changes) < 2 {
 		return insufficientChurnDiagnosis(len(changes), len(context.snapshots), context.state != nil)
 	}
+
+	// Establish what the change sequence actually demonstrates before deriving
+	// anything from consecutive pairs. Every pairwise signal below compares
+	// sample N with sample N-1, which only describes the deployment's history
+	// when consecutive samples came from the same endpoint.
+	shape := analyzeChurnShapeWithSnapshots(changes, context.certificates, context.snapshots)
+	artifact := shape.Interpretation == models.ChurnSpatialMultiplexing
+	window := changes[len(changes)-1].ObservedAt.Sub(changes[0].ObservedAt)
+	ctCoverage, ctEntries, ctIssuances, ctStatus, ctNote := analyzeCTCorroboration(context.snapshots, shape, window)
+
 	intervalHours, regularity := changeCadence(changes)
-	nearExpiry, leadSpread := renewalLeadSignal(changes)
-	sameKeyRatio, issuerChangeRatio, sanChangeRatio, validityChangeRatio := certificateTransitionSignals(changes, context.certificates)
+	nearExpiry, _ := renewalLeadSignal(changes)
+	_, issuerChangeRatio, sanChangeRatio, validityChangeRatio := certificateTransitionSignals(changes, context.certificates)
 	ariAlignment := ariAlignmentSignal(context.observations, changes, context.state)
 	topologyChanges, endpointChanges := topologySignals(context.snapshots)
-	ctCoverage, ctBurst := ctSignals(context.snapshots)
 	caaCoverage, caaChanges := caaSignals(context.snapshots)
 	httpCoverage, httpChanges := httpSignals(context.snapshots)
 	incidentSignal := 0.0
@@ -1877,41 +2813,342 @@ func inferChurnDiagnosis(item models.Anomaly, context diagnosisContext) models.C
 		}
 	}
 
-	automated := clampScore(0.08 + 0.32*regularity + 0.22*nearExpiry + 0.14*(1-issuerChangeRatio) + 0.14*ariAlignment + 0.10*ctBurst)
+	coexistScore := float64(minInt(shape.CoexistenceProofs, 3)) / 3
+	revisitScore := math.Min(shape.RevisitRatio/0.5, 1)
+	alternationScore := float64(minInt(shape.AlternationEvents, 5)) / 5
+	crossEndpointScore := 0.0
+	if shape.ChangeEvents > 0 {
+		crossEndpointScore = float64(shape.CrossEndpointChanges) / float64(shape.ChangeEvents)
+	}
+	monotone := boolScore(shape.RevisitEvents == 0)
+	shortValidity := 0.0
+	switch {
+	case shape.MedianValidityDays > 0 && shape.MedianValidityDays <= 14:
+		shortValidity = 1
+	case shape.MedianValidityDays > 0 && shape.MedianValidityDays <= 30:
+		shortValidity = 0.5
+	}
+	inventoryAge := 0.0
+	if shape.MedianValidityDays > 0 && shape.MedianIssuanceAgeDays > 0 {
+		inventoryAge = clampScore(float64(shape.MedianIssuanceAgeDays) / float64(shape.MedianValidityDays))
+	}
+	tightRemaining := 0.0
+	if shape.MedianRemainingDays > 0 && shape.MedianRemainingDays <= 14 && shape.RemainingSpreadDays <= 3 {
+		tightRemaining = 1
+	} else if shape.MedianRemainingDays > 0 && shape.MedianRemainingDays <= 21 && shape.RemainingSpreadDays <= 7 {
+		tightRemaining = 0.6
+	}
+	staggeredIssuance := 0.0
+	if shape.DistinctIssuanceDays >= 4 && shape.IssuanceCadenceDays > 0 && shape.IssuanceCadenceDays <= 3 {
+		staggeredIssuance = 1
+	} else if shape.DistinctIssuanceDays >= 3 && shape.IssuanceCadenceDays > 0 && shape.IssuanceCadenceDays <= 7 {
+		staggeredIssuance = 0.6
+	}
+	freshIssuance := 0.0
+	if shape.DistinctIssuanceDays > 0 {
+		switch {
+		case shape.MedianIssuanceAgeDays <= 7:
+			freshIssuance = 1
+		case shape.MedianIssuanceAgeDays <= 21:
+			freshIssuance = 0.5
+		}
+	}
+	stableIdentity := clampScore((shape.SameIssuerFraction + shape.SameNameFraction) / 2)
+	if shape.SameIssuerFraction == 0 && shape.SameNameFraction == 0 && issuerChangeRatio == 0 {
+		stableIdentity = 0.5
+	}
+
+	// Concurrent deployment is established by falsification, not by weighing
+	// preferences: a leaf that reappears after being "replaced", or a round that
+	// saw predecessor and successor together, is incompatible with renewal.
+	pool := clampScore(0.04 + 0.42*coexistScore + 0.28*revisitScore + 0.12*alternationScore + 0.08*crossEndpointScore + 0.12*boolScore(ctStatus == models.CTContradicted))
+	if artifact {
+		pool = clampScore(math.Max(pool, 0.50+0.25*coexistScore+0.15*revisitScore+0.10*alternationScore))
+	}
+	shortLived := clampScore(0.04 + 0.42*monotone*shortValidity + 0.24*shortValidity + 0.18*regularity + 0.12*monotone)
+	if shortValidity >= 0.5 && freshIssuance >= 0.5 && shape.MedianValidityDays <= 30 {
+		shortLived = clampScore(math.Max(shortLived, 0.72))
+	}
+	// A tight remaining-life window is evidence of a scheduled replacement, not
+	// a contradiction of automation. A different public key is not scored as a
+	// cause: it is the default output of new issuance.
+	automated := clampScore(0.08 + 0.28*regularity + 0.16*freshIssuance + 0.14*staggeredIssuance*freshIssuance + 0.12*(1-issuerChangeRatio) + 0.10*ariAlignment + 0.08*boolScore(ctStatus == models.CTCorroborated) + 0.08*tightRemaining*(1-inventoryAge) + 0.06*nearExpiry*freshIssuance)
+	// Pre-issued inventory is only named when the served leaf is already old
+	// and close to expiry. Daily issuance of a still-fresh 90-day certificate
+	// is replacement-time automation, not a rolling stockpile.
+	pipeline := 0.0
+	if inventoryAge >= 0.4 && tightRemaining >= 0.6 {
+		pipeline = clampScore(0.10 + 0.32*inventoryAge + 0.24*tightRemaining + 0.14*staggeredIssuance + 0.10*boolScore(shape.IssuanceMonotone) + 0.10*stableIdentity)
+	}
+	unresolved := shape.Interpretation == models.ChurnUndetermined ||
+		(shape.SameEndpointChanges == 0 && shape.CrossEndpointChanges == 0)
 	migration := clampScore(0.05 + 0.42*issuerChangeRatio + 0.18*validityChangeRatio + 0.14*sanChangeRatio + 0.11*float64(minInt(topologyChanges, 3))/3 + 0.10*caaChanges + 0.08*caaCoverage)
-	keyRotation := clampScore(0.05 + 0.72*(1-sameKeyRatio) + 0.18*(1-regularity))
 	deployment := clampScore(0.04 + 0.45*endpointChanges + 0.26*float64(minInt(topologyChanges, 3))/3 + 0.14*sanChangeRatio + 0.08*httpChanges + 0.05*httpCoverage)
+	if freshIssuance >= 0.5 && inventoryAge < 0.4 {
+		// Daily issuance of a still-fresh certificate is replacement-time
+		// automation. Endpoint-map churn is then the consequence of that
+		// replacement, not a separate rollout cause.
+		deployment = clampScore(deployment * 0.35)
+	}
+	if issuerChangeRatio < 0.5 {
+		migration = clampScore(migration * 0.35)
+	}
 	incident := clampScore(0.05 + 0.82*incidentSignal + 0.13*(1-nearExpiry))
 
+	artifactNote := "Not evaluable: the change sequence is spatially multiplexed, so consecutive samples come from different servers and this pairwise signal describes the sampling, not the deployment's history."
+	unattributedNote := "Not established: no serving address was retained for these comparisons, so it is unknown whether consecutive samples came from the same server."
+	automatedContradictions := []string{ftoaEvidence("issuer_change_fraction", issuerChangeRatio)}
+	if inventoryAge >= 0.5 && tightRemaining >= 0.6 {
+		automatedContradictions = append(automatedContradictions, "The served certificates were issued weeks earlier and only a few days remain, so this is inventory being rolled forward rather than a certificate issued at replacement time.")
+	}
+	pipelineContradictions := []string{itoaEvidence("median_issuance_age_days", shape.MedianIssuanceAgeDays), itoaEvidence("median_remaining_days", shape.MedianRemainingDays)}
+	if freshIssuance >= 0.5 && inventoryAge < 0.4 {
+		pipelineContradictions = append(pipelineContradictions, "A recently issued certificate being served near replacement is the signature of issuance at replacement time, not of a pre-issued inventory.")
+	}
+	migrationContradictions := []string{ftoaEvidence("issuer_change_fraction", issuerChangeRatio), ftoaEvidence("same_issuer_fraction", shape.SameIssuerFraction)}
+	switch {
+	case artifact:
+		automated = clampScore(automated * 0.40)
+		pipeline = clampScore(pipeline * 0.35)
+		migration = clampScore(migration * 0.60)
+		automatedContradictions = append([]string{artifactNote}, automatedContradictions...)
+		pipelineContradictions = append([]string{artifactNote}, pipelineContradictions...)
+		migrationContradictions = append([]string{artifactNote}, migrationContradictions...)
+	case unresolved:
+		// Endpoint identity is missing, but issuance dates and remaining life
+		// are still a shape that can be read as a best-supported inference.
+		// Topology/SAN churn cannot name a rollout or CA-migration process
+		// without a same-endpoint comparison.
+		automated = clampScore(automated * 0.90)
+		pipeline = clampScore(pipeline * 0.90)
+		migration = clampScore(migration * 0.35)
+		deployment = clampScore(deployment * 0.20)
+		automatedContradictions = append([]string{unattributedNote}, automatedContradictions...)
+		pipelineContradictions = append([]string{unattributedNote}, pipelineContradictions...)
+		migrationContradictions = append([]string{unattributedNote}, migrationContradictions...)
+	}
+	unknownFraction := 0.0
+	if shape.ChangeEvents > 0 {
+		unknownFraction = float64(shape.UnknownEndpointChanges) / float64(shape.ChangeEvents)
+	}
+	unattributed := clampScore(0.10 + 0.55*boolScore(unresolved) + 0.25*unknownFraction)
+	mechanismSupport := math.Max(math.Max(automated, pipeline), math.Max(migration, math.Max(deployment, incident)))
+	if unresolved && mechanismSupport >= 0.40 {
+		unattributed = clampScore(unattributed * 0.35)
+	}
+	unexplained := 0.0
+	if !artifact && shape.Interpretation == models.ChurnTemporalReplacement && mechanismSupport < 0.45 {
+		unexplained = clampScore(0.55 + 0.20*boolScore(shape.SameEndpointChanges > 0) + 0.10*monotone)
+	} else if unresolved && mechanismSupport < 0.40 {
+		unexplained = clampScore(0.40 + 0.15*monotone)
+	}
+
 	hypotheses := []models.CauseHypothesis{
-		{Code: "automated_renewal_policy", Label: "Automated renewal policy", Score: automated, Confidence: scoreConfidence(automated, len(changes), len(context.snapshots)), Rationale: "Replacement timing is regular and clustered around a repeatable validity/renewal window.", Evidence: []string{fmt.Sprintf("replacement_events=%d", len(changes)), fmt.Sprintf("mean_interval_hours=%.1f", intervalHours), fmt.Sprintf("cadence_cv_score=%.2f", regularity), fmt.Sprintf("near_expiry_fraction=%.2f", nearExpiry), fmt.Sprintf("ari_alignment=%.2f", ariAlignment), fmt.Sprintf("ct_burst_signal=%.2f", ctBurst)}, Contradictions: []string{fmt.Sprintf("issuer_change_fraction=%.2f", issuerChangeRatio), fmt.Sprintf("lead_time_spread=%.1f_days", leadSpread)}},
-		{Code: "ca_or_policy_migration", Label: "CA or certificate-policy migration", Score: migration, Confidence: scoreConfidence(migration, len(changes), len(context.snapshots)), Rationale: "Issuer, validity, SAN or DNS control-plane attributes changed with the certificate sequence.", Evidence: []string{fmt.Sprintf("issuer_change_fraction=%.2f", issuerChangeRatio), fmt.Sprintf("validity_change_fraction=%.2f", validityChangeRatio), fmt.Sprintf("san_change_fraction=%.2f", sanChangeRatio), fmt.Sprintf("topology_transition_rounds=%d", topologyChanges), fmt.Sprintf("caa_coverage=%.2f", caaCoverage), fmt.Sprintf("caa_policy_change_fraction=%.2f", caaChanges)}, Contradictions: []string{fmt.Sprintf("same_key_fraction=%.2f", sameKeyRatio)}},
-		{Code: "key_security_rotation", Label: "Public-key security rotation", Score: keyRotation, Confidence: scoreConfidence(keyRotation, len(changes), len(context.snapshots)), Rationale: "Successive leaves use different SPKIs, especially when changes are not cadence-regular.", Evidence: []string{fmt.Sprintf("same_key_fraction=%.2f", sameKeyRatio), fmt.Sprintf("cadence_cv_score=%.2f", regularity)}, Contradictions: []string{fmt.Sprintf("regularity_score=%.2f", regularity)}},
-		{Code: "edge_or_deployment_rollout", Label: "Edge deployment or rollout process", Score: deployment, Confidence: scoreConfidence(deployment, len(changes), len(context.snapshots)), Rationale: "Endpoint-specific certificates or topology changed across the same observation period.", Evidence: []string{fmt.Sprintf("endpoint_transition_score=%.2f", endpointChanges), fmt.Sprintf("topology_transition_rounds=%d", topologyChanges), fmt.Sprintf("ct_coverage=%.2f", ctCoverage), fmt.Sprintf("http_coverage=%.2f", httpCoverage), fmt.Sprintf("http_edge_change_fraction=%.2f", httpChanges)}, Contradictions: []string{"No endpoint transition is directly observed when the endpoint survey is incomplete."}},
-		{Code: "incident_driven_reissue", Label: "Incident-driven reissuance", Score: incident, Confidence: scoreConfidence(incident, len(changes), len(context.snapshots)), Rationale: "Revocation or an emergency renewal signal coincides with the replacement sequence.", Evidence: []string{fmt.Sprintf("incident_signal=%.2f", incidentSignal), fmt.Sprintf("ct_coverage=%.2f", ctCoverage)}, Contradictions: []string{"No retained revocation or emergency signal."}},
+		{Code: "concurrent_multi_certificate_pool", Label: "Concurrently deployed certificate pool", Score: pool, Confidence: scoreConfidence(pool, shape.EffectiveReplacements, len(context.snapshots)), Rationale: "Several certificates are deployed at the same time and each scan samples whichever server answered, so the change counter measures the sampling process rather than replacement in time.", Evidence: churnShapeEvidence(shape), Contradictions: []string{"A strictly monotone sequence measured from one endpoint would refute concurrent deployment."}},
+		{Code: "short_lived_certificate_automation", Label: "Short-lived certificate automation", Score: shortLived, Confidence: scoreConfidence(shortLived, shape.EffectiveReplacements, len(context.snapshots)), Rationale: "Every leaf is new, never recurs, and the certificates' own validity period is short, which is the expected output of short-lived certificate issuance.", Evidence: []string{itoaEvidence("median_validity_days", shape.MedianValidityDays), itoaEvidence("revisit_events", shape.RevisitEvents), ftoaEvidence("mean_interval_hours", intervalHours), ftoaEvidence("replacements_per_validity_period", shape.ReplacementsPerValidityPeriod)}, Contradictions: []string{"A long certificate validity period would make frequent replacement unexpected rather than routine."}},
+		{Code: "preissued_rolling_pipeline", Label: "Pre-issued rolling certificate pipeline", Score: pipeline, Confidence: scoreConfidence(pipeline, shape.EffectiveReplacements, len(context.snapshots)), Rationale: "Certificates are minted weeks before they are served and only pushed to the endpoint when a few days remain, so a different already-old leaf appears each day instead of one certificate finishing its lifetime.", Evidence: []string{itoaEvidence("median_issuance_age_days", shape.MedianIssuanceAgeDays), itoaEvidence("median_remaining_days", shape.MedianRemainingDays), ftoaEvidence("remaining_spread_days", shape.RemainingSpreadDays), itoaEvidence("distinct_issuance_days", shape.DistinctIssuanceDays), ftoaEvidence("issuance_cadence_days", shape.IssuanceCadenceDays), ftoaEvidence("same_issuer_fraction", shape.SameIssuerFraction), itoaEvidence("same_endpoint_changes", shape.SameEndpointChanges)}, Contradictions: pipelineContradictions},
+		{Code: "automated_renewal_policy", Label: "Automated renewal at replacement time", Score: automated, Confidence: scoreConfidence(automated, shape.EffectiveReplacements, len(context.snapshots)), Rationale: "A still-fresh 90-day certificate is being re-issued at replacement time instead of being used until near expiry, so issuance is running many times per lifetime.", Evidence: []string{itoaEvidence("effective_replacements", shape.EffectiveReplacements), ftoaEvidence("mean_interval_hours", intervalHours), ftoaEvidence("cadence_cv_score", regularity), itoaEvidence("median_remaining_days", shape.MedianRemainingDays), itoaEvidence("median_issuance_age_days", shape.MedianIssuanceAgeDays), ftoaEvidence("ari_alignment", ariAlignment), "ct_status=" + ctStatus}, Contradictions: automatedContradictions},
+		{Code: "ca_or_policy_migration", Label: "CA or certificate-policy migration", Score: migration, Confidence: scoreConfidence(migration, shape.EffectiveReplacements, len(context.snapshots)), Rationale: "The CA family or the certificate name changed with the replacements. On a CDN-fronted name this is usually the CDN failing over between Google Trust Services and Let's Encrypt, not the site switching vendors.", Evidence: []string{ftoaEvidence("issuer_change_fraction", issuerChangeRatio), ftoaEvidence("validity_change_fraction", validityChangeRatio), ftoaEvidence("san_change_fraction", sanChangeRatio), itoaEvidence("topology_transition_rounds", topologyChanges), ftoaEvidence("caa_coverage", caaCoverage), ftoaEvidence("caa_policy_change_fraction", caaChanges)}, Contradictions: migrationContradictions},
+		{Code: "edge_or_deployment_rollout", Label: "Edge deployment or rollout process", Score: deployment, Confidence: scoreConfidence(deployment, shape.EffectiveReplacements, len(context.snapshots)), Rationale: "A retained address kept answering after its leaf changed, or successive endpoint surveys show a certificate moving across the same IPs.", Evidence: []string{ftoaEvidence("endpoint_transition_score", endpointChanges), itoaEvidence("topology_transition_rounds", topologyChanges), ftoaEvidence("http_coverage", httpCoverage), ftoaEvidence("http_edge_change_fraction", httpChanges)}, Contradictions: []string{"An address set that rotates while every overlapping IP keeps the same leaf is VIP churn, not a certificate rollout."}},
+		{Code: "incident_driven_reissue", Label: "Incident-driven reissuance", Score: incident, Confidence: scoreConfidence(incident, shape.EffectiveReplacements, len(context.snapshots)), Rationale: "Revocation or an emergency renewal signal coincides with the replacement sequence.", Evidence: []string{ftoaEvidence("incident_signal", incidentSignal)}, Contradictions: []string{"No retained revocation or emergency signal."}},
+		{Code: "replacement_mechanism_unestablished", Label: "Replacement in time; mechanism not established", Score: unexplained, Confidence: "low", Rationale: "Same-endpoint samples served different certificates, so these are replacements in time, but issuance dates, remaining life, issuer change and incident signals do not identify the operational process.", Evidence: []string{itoaEvidence("same_endpoint_changes", shape.SameEndpointChanges), itoaEvidence("median_remaining_days", shape.MedianRemainingDays), itoaEvidence("median_issuance_age_days", shape.MedianIssuanceAgeDays), ftoaEvidence("issuer_change_fraction", issuerChangeRatio)}, Contradictions: []string{"A tight remaining-life window with staggered older issuance dates, or a recently issued certificate at replacement time, would name the process."}},
+		{Code: "endpoint_attribution_unavailable", Label: "Endpoint attribution unavailable", Score: unattributed, Confidence: "low", Rationale: "The changes are real differences between consecutive samples, but no serving address was retained for them, so whether they are replacements in time or different servers answering cannot be established.", Evidence: []string{itoaEvidence("unknown_endpoint_changes", shape.UnknownEndpointChanges), itoaEvidence("same_endpoint_changes", shape.SameEndpointChanges), itoaEvidence("cross_endpoint_changes", shape.CrossEndpointChanges), itoaEvidence("revisit_events", shape.RevisitEvents)}, Contradictions: []string{"A single same-endpoint comparison, or one round that observed two leaves at once, would resolve this."}},
 	}
-	sort.SliceStable(hypotheses, func(left, right int) bool { return hypotheses[left].Score > hypotheses[right].Score })
+	// As with the endpoint structure, the discriminating test decides the primary
+	// reading rather than competing with the weighted scores. A revisit or a
+	// concurrent observation falsifies the renewal reading outright, and a
+	// sequence with no endpoint attribution cannot name a mechanism at all.
+	forced := ""
+	if shape.Interpretation == models.ChurnSpatialMultiplexing {
+		forced = "concurrent_multi_certificate_pool"
+	}
+	sort.SliceStable(hypotheses, func(left, right int) bool {
+		if forced != "" {
+			leftForced := hypotheses[left].Code == forced
+			rightForced := hypotheses[right].Code == forced
+			if leftForced != rightForced {
+				return leftForced
+			}
+		}
+		return hypotheses[left].Score > hypotheses[right].Score
+	})
 	primary := hypotheses[0]
-	confidence := primary.Confidence
-	if len(changes) < 3 || len(context.snapshots) < 3 {
-		confidence = "low"
+	if forced == "" && (unresolved || shape.SameEndpointChanges == 0) {
+		primary = preferUnresolvedIssuanceCause(hypotheses, automated, pipeline, shortLived, freshIssuance)
+		sort.SliceStable(hypotheses, func(left, right int) bool {
+			if hypotheses[left].Code == primary.Code && hypotheses[right].Code != primary.Code {
+				return true
+			}
+			if hypotheses[right].Code == primary.Code && hypotheses[left].Code != primary.Code {
+				return false
+			}
+			return hypotheses[left].Score > hypotheses[right].Score
+		})
 	}
-	summary := fmt.Sprintf("Most consistent with %s: %s Evidence spans %d certificate replacements and %d retained measurement rounds; this is a mechanism inference, not a claim about private operator intent.", strings.ToLower(primary.Label), primary.Rationale, len(changes), len(context.snapshots))
+
+	corroboration := &models.EvidenceCorroboration{
+		CTCoverage: ctCoverage, CTEntries: ctEntries, CTIssuanceEvents: ctIssuances, CTStatus: ctStatus, CTNote: ctNote,
+		CAACoverage: caaCoverage, HTTPCoverage: httpCoverage,
+		EndpointCoverage:  endpointCoverage(context.snapshots),
+		ResolverAgreement: latestResolverAgreement(context.snapshots),
+	}
+	attachIndependentCorroboration(corroboration, context)
+	corroboration.ConfidenceCeiling = confidenceCeiling(corroboration,
+		shape.Interpretation != models.ChurnUndetermined,
+		// A certificate seen again after it was "replaced", or two leaves seen in
+		// one round, is a direct observation that settles the question. So is a
+		// comparison made against the same endpoint.
+		shape.CoexistenceProofs > 0 || shape.RevisitEvents > 0 || shape.SameEndpointChanges > 0)
+
+	provenance := evidenceProvenance(changes)
+	confidence := capConfidence(primary.Confidence, corroboration.ConfidenceCeiling)
+	if provenance.LegacyDominated {
+		confidence = capConfidence(confidence, "medium")
+	}
+	for index := range hypotheses {
+		hypotheses[index].Confidence = capConfidence(hypotheses[index].Confidence, corroboration.ConfidenceCeiling)
+	}
+
+	status := causeStatusOf(primary.Code, shape, unresolved)
+	if status == "inferred" {
+		confidence = capConfidence(confidence, "low")
+		primary.Confidence = confidence
+	}
+	summary := churnSummary(primary, shape, ctStatus, ctNote, len(context.snapshots), status)
+	benign := ""
+	switch primary.Code {
+	case "concurrent_multi_certificate_pool":
+		benign = "The certificate is not changing frequently. " + itoa(shape.DistinctLeaves) + " certificate(s) are deployed at the same time and monitoring sampled them in turn, which the raw change counter reports as " + itoa(shape.ChangeEvents) + " changes."
+	case "short_lived_certificate_automation":
+		benign = "Replacement at this cadence is the designed behaviour of short-lived certificates with a median validity of " + itoa(shape.MedianValidityDays) + " day(s), not an anomaly."
+	}
+	if item.Type == "frequent_change" && shape.SameEndpointChanges == 0 {
+		switch primary.Code {
+		case "concurrent_multi_certificate_pool", "short_lived_certificate_automation":
+		default:
+			benign = "The change counter moved, but consecutive samples were not shown to come from the same endpoint, so frequent change is not established."
+		}
+	}
+
 	return models.CauseDiagnosis{
 		PrimaryCode: primary.Code, PrimaryLabel: primary.Label, Confidence: confidence, Summary: summary,
-		EvidenceCompleteness: completenessScore(len(context.snapshots), len(changes), context.state != nil), Hypotheses: hypotheses,
-		MeasurementPlan: []string{
-			"Repeat a resolver-quorum topology snapshot before and after the next certificate change.",
-			"Probe the prior and current public addresses directly with the same SNI and retain per-IP fingerprints.",
-			"Correlate the next issuance with CT entry time, CAA policy and the CA's ARI window.",
-		}, MeasuredRounds: len(context.snapshots), TransitionRounds: len(changes),
+		EvidenceCompleteness: completenessScore(len(context.snapshots), shape.EffectiveReplacements, context.state != nil), Hypotheses: hypotheses,
+		MeasurementPlan: churnMeasurementPlan(shape, ctStatus, status),
+		MeasuredRounds:  len(context.snapshots), TransitionRounds: shape.EffectiveReplacements,
+		ChurnShape:        &shape,
+		Provenance:        provenance,
+		Corroboration:     corroboration,
+		BenignExplanation: benign,
+		CauseStatus:       status,
 	}
+}
+
+func preferUnresolvedIssuanceCause(hypotheses []models.CauseHypothesis, automated, pipeline, shortLived, freshIssuance float64) models.CauseHypothesis {
+	pick := func(code string) models.CauseHypothesis {
+		for _, hypothesis := range hypotheses {
+			if hypothesis.Code == code {
+				return hypothesis
+			}
+		}
+		return hypotheses[0]
+	}
+	switch {
+	case shortLived >= 0.55 && shortLived+0.05 >= automated:
+		return pick("short_lived_certificate_automation")
+	case pipeline >= 0.40 && pipeline >= automated:
+		return pick("preissued_rolling_pipeline")
+	case automated >= 0.35 && freshIssuance >= 0.5:
+		return pick("automated_renewal_policy")
+	default:
+		return pick("endpoint_attribution_unavailable")
+	}
+}
+
+func causeStatusOf(code string, shape models.ChurnShape, unresolved bool) string {
+	switch code {
+	case "endpoint_attribution_unavailable", "replacement_mechanism_unestablished", "insufficient_longitudinal_evidence":
+		return "unestablished"
+	case "concurrent_multi_certificate_pool", "short_lived_certificate_automation":
+		if unresolved || shape.SameEndpointChanges == 0 {
+			return "inferred"
+		}
+		return "established"
+	}
+	if unresolved || shape.SameEndpointChanges == 0 {
+		return "inferred"
+	}
+	return "established"
+}
+
+func churnSummary(primary models.CauseHypothesis, shape models.ChurnShape, ctStatus, ctNote string, rounds int, status string) string {
+	lead := "Most consistent with " + strings.ToLower(primary.Label)
+	switch status {
+	case "inferred":
+		lead = "Inferred from issuance and remaining-life shape as " + strings.ToLower(primary.Label) + "; same-endpoint replacement is not established"
+	case "unestablished":
+		lead = "No operational process is established"
+	}
+	parts := []string{lead + ": " + primary.Rationale}
+	switch shape.Interpretation {
+	case models.ChurnSpatialMultiplexing:
+		parts = append(parts, fmt.Sprintf("Monitoring counted %d changes, but only %d distinct certificates were ever seen and %d of those changes returned to a certificate observed earlier; a replaced certificate cannot come back, so at most %d replacement(s) occurred.",
+			shape.ChangeEvents, shape.DistinctLeaves, shape.RevisitEvents, shape.EffectiveReplacements))
+		if shape.CoexistenceProofs > 0 {
+			parts = append(parts, fmt.Sprintf("%d round(s) observed the predecessor and the successor at the same time on different endpoints, which is direct evidence of concurrent deployment.", shape.CoexistenceProofs))
+		}
+	case models.ChurnMixed:
+		parts = append(parts, fmt.Sprintf("Monitoring counted %d changes across %d distinct certificates; %d change(s) were measured from a different endpoint than the preceding one, so the sequence mixes replacement with endpoint sampling.",
+			shape.ChangeEvents, shape.DistinctLeaves, shape.CrossEndpointChanges))
+	case models.ChurnTemporalReplacement:
+		parts = append(parts, fmt.Sprintf("The sequence is monotone across %d distinct certificates with %d same-endpoint comparison(s), so these are replacements in time.",
+			shape.DistinctLeaves, shape.SameEndpointChanges))
+		if primary.Code == "preissued_rolling_pipeline" && shape.MedianIssuanceAgeDays > 0 {
+			parts = append(parts, fmt.Sprintf("The served leaves had already been issued for %d day(s) and only %d day(s) remained, across %d issuance day(s).",
+				shape.MedianIssuanceAgeDays, shape.MedianRemainingDays, shape.DistinctIssuanceDays))
+		}
+		if primary.Code == "automated_renewal_policy" && shape.MedianIssuanceAgeDays > 0 {
+			parts = append(parts, fmt.Sprintf("The served leaves were issued %d day(s) before they appeared, with %d day(s) remaining.",
+				shape.MedianIssuanceAgeDays, shape.MedianRemainingDays))
+		}
+	default:
+		parts = append(parts, "The retained endpoint identity is insufficient to establish whether the differences are replacements in time or different servers answering.")
+	}
+	if ctStatus != models.CTUnavailable && ctNote != "" {
+		parts = append(parts, ctNote)
+	} else {
+		parts = append(parts, "Certificate Transparency was unavailable, so the replacement count has no independent check.")
+	}
+	parts = append(parts, fmt.Sprintf("Evidence spans %d retained measurement round(s); this is a mechanism inference, not a claim about private operator intent.", rounds))
+	return strings.Join(parts, " ")
+}
+
+func churnMeasurementPlan(shape models.ChurnShape, ctStatus, status string) []string {
+	plan := make([]string, 0, 4)
+	if status == "inferred" || shape.Interpretation != models.ChurnTemporalReplacement {
+		plan = append(plan,
+			"Probe every resolved address in the same round with the same SNI and retain per-address fingerprints; concurrent certificates are proven or refuted in one round.",
+			"Compare successive certificates only between samples taken from the same address.")
+	}
+	if ctStatus != models.CTCorroborated {
+		plan = append(plan, "Retrieve Certificate Transparency for this name, including by served leaf fingerprint, and compare logged issuance timestamps with the observed change times.")
+	}
+	if shape.MedianValidityDays == 0 {
+		plan = append(plan, "Retain the certificate validity period so the replacement rate can be normalized by certificate lifetime.")
+	}
+	if shape.MedianIssuanceAgeDays == 0 || shape.MedianRemainingDays == 0 {
+		plan = append(plan, "Retain issuance dates and remaining life at each replacement so a pre-issued inventory can be separated from issuance at replacement time.")
+	}
+	if len(plan) == 0 {
+		plan = append(plan, "Continue same-endpoint sampling and correlate the next issuance with CT entry time, CAA policy and the CA's ARI window.")
+	}
+	return plan
 }
 
 func insufficientChurnDiagnosis(transitions, rounds int, state bool) models.CauseDiagnosis {
 	return models.CauseDiagnosis{
 		PrimaryCode:          "insufficient_longitudinal_evidence",
 		PrimaryLabel:         "Insufficient longitudinal evidence",
+		CauseStatus:          "unestablished",
 		Confidence:           "low",
 		Summary:              fmt.Sprintf("Only %d certificate replacement event(s) are retained; at least two replacement intervals and three measurement rounds are required before assigning an operational mechanism.", transitions),
 		EvidenceCompleteness: completenessScore(rounds, transitions, state),
@@ -1939,34 +3176,287 @@ func insufficientChurnDiagnosis(transitions, rounds int, state bool) models.Caus
 
 func inferTopologyDiagnosis(item models.Anomaly, context diagnosisContext) models.CauseDiagnosis {
 	topologyChanges, endpointChanges := topologySignals(context.snapshots)
-	current := latestEndpointMap(context.snapshots)
-	stable := stableEndpointMap(context.snapshots, current, 2)
-	resolverAgreement := 0.0
-	if len(context.snapshots) > 0 {
-		resolverAgreement = context.snapshots[0].ResolverAgreement
+	resolverAgreement := latestResolverAgreement(context.snapshots)
+
+	// The structural analysis needs the full endpoint survey (issuer, key
+	// algorithm, name coverage and per-endpoint validation), which only the
+	// lifecycle observation retains. The snapshot series carries addresses and
+	// fingerprints only, and is used for the stability history.
+	probes, previousFingerprint, replacedAt := latestEndpointSurvey(context.observations)
+	history := context.snapshots
+	if len(probes) == 0 && len(context.snapshots) > 0 {
+		// Lifecycle rows do not always retain a full survey. The snapshot series
+		// still carries the address-to-certificate assignment, which is enough for
+		// the partition and stability tests. Issuer, key algorithm and name
+		// coverage stay unknown, so the dual-certificate reading simply cannot
+		// fire rather than being guessed at.
+		probes = probesFromSnapshot(context.snapshots[0])
+		history = context.snapshots[1:]
 	}
-	cdnScore := clampScore(0.35 + 0.35*boolScore(stable) + 0.20*(1-resolverAgreement))
-	rolloutScore := clampScore(0.10 + 0.55*endpointChanges + 0.25*float64(minInt(topologyChanges, 3))/3)
+	now := latestObservedAt(context.observations, context.snapshots)
+	divergence := analyzeEndpointDivergence(probes, history, previousFingerprint, replacedAt, now)
+
+	benignVerdict := divergenceIsBenign(divergence.Verdict)
+	vendorComplete := divergence.CDN != nil && models.CDNMethodFor(divergence.CDN.Completeness) == "vendor"
+	namedMultiCDN := vendorComplete && divergence.CDN.DistinctVendors >= 2 && divergence.CDN.CleanVendorSplit && divergence.StableRounds >= minStableMultiProviderRounds
+	namedSameVendor := vendorComplete && (divergence.CDN.DistinctVendors == 1 || divergence.CDN.VendorConflicts > 0)
+	multiCDN := clampScore(0.05 + 0.45*boolScore((stableMultiProviderPartition(divergence) && !namedSameVendor) || namedMultiCDN) +
+		0.30*boolScore(divergence.StableRounds >= 2) + 0.20*boolScore(divergence.FunctionallyEquivalent))
+	dualCert := clampScore(0.03 + 0.62*boolScore(divergence.DualCertificateSplit) + 0.20*boolScore(divergence.FunctionallyEquivalent) + 0.15*boolScore(divergence.StableRounds >= 1))
+	sameVendorConflict := namedSameVendor && divergence.CDN != nil && (divergence.CDN.VendorConflicts > 0 || divergence.DistinctLeaves >= 2)
+	conflictCount := divergence.IntraGroupConflicts
+	if sameVendorConflict && conflictCount < 1 {
+		conflictCount = 1
+	}
+	intraFleet := clampScore(0.05 + 0.50*boolScore(divergence.IntraGroupConflicts > 0 || sameVendorConflict) +
+		0.25*boolScore(divergence.StableRounds >= 2) + 0.20*math.Min(float64(conflictCount)/2, 1))
+	stuckRollout := clampScore(0.05 + 0.45*boolScore(len(divergence.PredecessorEndpoints) > 0) +
+		0.30*boolScore(divergence.ResidueHours > propagationWindow.Hours()) + 0.20*endpointChanges)
+	defective := clampScore(0.02 + 0.88*boolScore(len(divergence.DefectiveEndpoints) > 0))
+	rollout := clampScore(0.08 + 0.45*endpointChanges + 0.25*float64(minInt(topologyChanges, 3))/3 +
+		0.20*boolScore(len(divergence.PredecessorEndpoints) > 0 && divergence.ResidueHours <= propagationWindow.Hours()))
 	staleScore := 0.0
-	if item.Type == models.ObsStaleAfterChange || item.Type == "stale_after_change" {
-		staleScore = clampScore(0.45 + 0.35*endpointChanges + 0.15*float64(minInt(topologyChanges, 3))/3)
+	if item.Type == models.ObsStaleAfterChange {
+		// A DNS answer-set difference is the normal behaviour of an address pool.
+		// It only supports a cutover reading when the endpoint assignment moved
+		// with it, so the address change alone no longer carries this hypothesis.
+		staleScore = clampScore(0.20 + 0.45*endpointChanges + 0.20*float64(minInt(topologyChanges, 3))/3 +
+			0.15*boolScore(len(divergence.PredecessorEndpoints) > 0))
 	}
-	measurementScore := clampScore(0.65 * (1 - boolScore(len(context.snapshots) >= 3)))
+	coverage := clampScore(0.70 * (1 - boolScore(divergence.EndpointsAnswered >= 2 && len(context.snapshots) >= 3)))
+
 	hypotheses := []models.CauseHypothesis{
-		{Code: "intentional_cdn_diversity", Label: "Intentional CDN or dual-certificate diversity", Score: cdnScore, Confidence: scoreConfidence(cdnScore, len(context.snapshots), len(context.snapshots)), Rationale: "The same per-IP certificate assignment persists across independent rounds, which is expected for edge-specific policy.", Evidence: []string{fmt.Sprintf("stable_per_ip_assignment=%t", stable), fmt.Sprintf("resolver_agreement=%.2f", resolverAgreement), fmt.Sprintf("endpoint_fingerprints=%d", len(current))}, Contradictions: []string{"A per-IP assignment change or predecessor residue weakens the stable-diversity explanation."}},
-		{Code: "partial_edge_rollout", Label: "Partial edge rollout or propagation lag", Score: rolloutScore, Confidence: scoreConfidence(rolloutScore, len(context.snapshots), len(context.snapshots)), Rationale: "The endpoint-to-certificate map changed during a topology or certificate transition.", Evidence: []string{fmt.Sprintf("endpoint_transition_score=%.2f", endpointChanges), fmt.Sprintf("topology_transition_rounds=%d", topologyChanges)}, Contradictions: []string{"Stable endpoint assignments across multiple rounds argue for intentional diversity."}},
-		{Code: "dns_cutover_before_tls_deployment", Label: "DNS cutover before TLS deployment", Score: staleScore, Confidence: scoreConfidence(staleScore, len(context.snapshots), len(context.snapshots)), Rationale: "A prior edge remained on the old leaf while a new edge exposed the successor.", Evidence: []string{fmt.Sprintf("topology_transition_rounds=%d", topologyChanges), fmt.Sprintf("endpoint_transition_score=%.2f", endpointChanges)}, Contradictions: []string{"No direct old-edge predecessor observation is retained."}},
-		{Code: "insufficient_endpoint_coverage", Label: "Insufficient endpoint coverage", Score: measurementScore, Confidence: "low", Rationale: "The public resolver set or endpoint sample is too small to distinguish policy diversity from a rollout.", Evidence: []string{fmt.Sprintf("measurement_rounds=%d", len(context.snapshots)), fmt.Sprintf("resolver_agreement=%.2f", resolverAgreement)}, Contradictions: []string{"Additional independent endpoint rounds can reduce this uncertainty."}},
+		{Code: models.DivergenceIntentionalMultiCDN, Label: "Intentional multi-provider deployment", Score: multiCDN, Rationale: multiCDNRationale(divergence), Evidence: divergenceEvidence(divergence), Contradictions: []string{"This case has two certificates inside one named CDN or one provider network, so it is not a deliberate split across providers."}},
+		{Code: models.DivergenceDualCertificate, Label: "Intentional dual-certificate deployment", Score: dualCert, Rationale: "The leaves differ only by public-key algorithm while covering the same names from the same issuer, which is how an RSA plus ECDSA pair is served.", Evidence: []string{itoaEvidence("distinct_key_algorithms", divergence.DistinctKeyAlgos), itoaEvidence("distinct_issuers", divergence.DistinctIssuers), itoaEvidence("distinct_san_sets", divergence.DistinctSANSets)}, Contradictions: []string{"Differing issuers or name sets would make this something other than an algorithm pair."}},
+		{Code: models.DivergenceIntraFleet, Label: "Inconsistency inside one provider network", Score: intraFleet, Rationale: intraFleetRationale(divergence), Evidence: []string{itoaEvidence("intra_group_conflicts", divergence.IntraGroupConflicts), itoaEvidence("network_groups", divergence.NetworkGroups), itoaEvidence("stable_rounds", divergence.StableRounds)}, Contradictions: []string{"A later round that partitions the certificates onto separately named CDNs would make this look like a deliberate split instead."}},
+		{Code: models.DivergenceStuckRollout, Label: "Replacement that did not reach every endpoint", Score: stuckRollout, Rationale: "At least one endpoint is still serving the certificate that was replaced elsewhere, beyond the time a propagation lag would explain.", Evidence: []string{itoaEvidence("predecessor_endpoints", len(divergence.PredecessorEndpoints)), ftoaEvidence("predecessor_residue_hours", divergence.ResidueHours)}, Contradictions: []string{"If the old certificate had disappeared from active DNS within 24 hours, this would be an in-flight rollout, not a stuck one."}},
+		{Code: models.DivergenceDefectiveEndpoint, Label: "Endpoint serving a certificate invalid for the name", Score: defective, Rationale: "An endpoint presented a certificate that is expired, not yet valid, name-mismatched or fails chain validation, which is a defect independent of how the endpoints are distributed.", Evidence: []string{itoaEvidence("defective_endpoints", len(divergence.DefectiveEndpoints))}, Contradictions: []string{"All endpoints presenting currently valid certificates for the name would remove this reading."}},
+		{Code: models.DivergencePropagating, Label: "Rollout in progress", Score: rollout, Rationale: "The endpoint-to-certificate assignment changed recently and has not yet settled.", Evidence: []string{ftoaEvidence("endpoint_transition_score", endpointChanges), itoaEvidence("topology_transition_rounds", topologyChanges)}, Contradictions: []string{"A stable assignment across rounds argues the arrangement is the steady state."}},
+		{Code: models.DivergenceUndetermined, Label: "Insufficient endpoint coverage", Score: coverage, Rationale: "The endpoint sample or resolver set is too small to tell a deliberate arrangement from an inconsistent one.", Evidence: []string{itoaEvidence("endpoints_answered", divergence.EndpointsAnswered), itoaEvidence("measurement_rounds", len(context.snapshots)), ftoaEvidence("resolver_agreement", resolverAgreement)}, Contradictions: []string{"Additional independent endpoint rounds reduce this uncertainty."}},
 	}
-	sort.SliceStable(hypotheses, func(left, right int) bool { return hypotheses[left].Score > hypotheses[right].Score })
+	if staleScore > 0 {
+		hypotheses = append(hypotheses, models.CauseHypothesis{Code: "dns_cutover_before_tls_deployment", Label: "DNS cutover before TLS deployment", Score: staleScore, Rationale: "The endpoint assignment moved together with the address set, leaving a prior edge on the old leaf while a new edge exposed the successor.", Evidence: []string{itoaEvidence("topology_transition_rounds", topologyChanges), ftoaEvidence("endpoint_transition_score", endpointChanges), itoaEvidence("predecessor_endpoints", len(divergence.PredecessorEndpoints))}, Contradictions: []string{"An address set that rotates inside one provider network without moving the certificate assignment is edge rotation, not a cutover."}})
+	}
+	// The structural verdict is a decision taken from direct measurements, not a
+	// preference among weighted guesses. It selects the primary hypothesis in
+	// every case, including when it concluded the evidence is insufficient —
+	// otherwise a benign-looking score can head a finding whose structure was
+	// never actually confirmed, and the reported cause and the reported severity
+	// end up disagreeing.
+	sort.SliceStable(hypotheses, func(left, right int) bool {
+		leftIsVerdict := hypotheses[left].Code == divergence.Verdict
+		rightIsVerdict := hypotheses[right].Code == divergence.Verdict
+		if leftIsVerdict != rightIsVerdict {
+			return leftIsVerdict
+		}
+		return hypotheses[left].Score > hypotheses[right].Score
+	})
 	primary := hypotheses[0]
-	summary := fmt.Sprintf("Most consistent with %s: %s Evidence uses %d longitudinal endpoint rounds and %d topology transitions; mixed certificates alone are not treated as deployment failure.", strings.ToLower(primary.Label), primary.Rationale, len(context.snapshots), topologyChanges)
-	return models.CauseDiagnosis{
-		PrimaryCode: primary.Code, PrimaryLabel: primary.Label, Confidence: primary.Confidence, Summary: summary,
-		EvidenceCompleteness: completenessScore(len(context.snapshots), topologyChanges, context.state != nil), Hypotheses: hypotheses,
-		MeasurementPlan: []string{"Keep the old and new IP sets for the next three resolver epochs and directly probe both sets.", "Compare per-IP fingerprints, issuer, validity and HTTP/CDN headers; suppress the alert if the assignment remains stable."},
-		MeasuredRounds:  len(context.snapshots), TransitionRounds: topologyChanges,
+
+	ctCoverage, ctEntries, ctIssuances, ctStatus, ctNote := analyzeCTCorroboration(context.snapshots, models.ChurnShape{}, 30*24*time.Hour)
+	corroboration := &models.EvidenceCorroboration{
+		CTCoverage: ctCoverage, CTEntries: ctEntries, CTIssuanceEvents: ctIssuances, CTStatus: ctStatus, CTNote: ctNote,
+		EndpointCoverage:  endpointCoverage(context.snapshots),
+		ResolverAgreement: resolverAgreement,
 	}
+	corroboration.CAACoverage, _ = caaSignals(context.snapshots)
+	corroboration.HTTPCoverage, _ = httpSignals(context.snapshots)
+	attachIndependentCorroboration(corroboration, context)
+	corroboration.ConfidenceCeiling = confidenceCeiling(corroboration,
+		divergence.Verdict != models.DivergenceUndetermined,
+		divergence.EndpointsAnswered >= 2)
+	provenance := evidenceProvenance(lifecycleRowsOfType(context.observations, item.Type))
+	confidence := capConfidence(scoreConfidence(primary.Score, divergence.EndpointsAnswered, len(context.snapshots)), corroboration.ConfidenceCeiling)
+	if provenance.LegacyDominated {
+		confidence = capConfidence(confidence, "medium")
+	}
+	for index := range hypotheses {
+		hypotheses[index].Confidence = capConfidence(scoreConfidence(hypotheses[index].Score, divergence.EndpointsAnswered, len(context.snapshots)), corroboration.ConfidenceCeiling)
+	}
+
+	benign := ""
+	if benignVerdict {
+		switch divergence.Verdict {
+		case models.DivergenceIntentionalMultiCDN:
+			benign = multiCDNBenign(divergence)
+		case models.DivergenceDualCertificate:
+			benign = "The endpoints serve the same names from the same issuer under " + itoa(divergence.DistinctKeyAlgos) + " public-key algorithms, which is a deliberate dual-certificate arrangement rather than an inconsistent deployment."
+		}
+	} else if item.Type == models.ObsStaleAfterChange && divergence.DistinctLeaves < 2 && len(divergence.ActivePredecessorEndpoints) == 0 && !divergence.StrongEvidence {
+		benign = "The current sampled endpoints serve one certificate. A DNS/IP-set change without a leftover predecessor is address-pool rotation, not a stale certificate after topology change."
+	} else if item.Type == models.ObsDeploymentFailure && divergence.DistinctLeaves < 2 {
+		benign = "The current sampled endpoints serve one certificate. An earlier mixed-fingerprint observation is historical and does not establish live certificate diversity."
+	}
+
+	return models.CauseDiagnosis{
+		PrimaryCode: primary.Code, PrimaryLabel: primary.Label, Confidence: confidence,
+		Summary:              divergenceSummary(primary, divergence, len(context.snapshots), topologyChanges),
+		EvidenceCompleteness: completenessScore(len(context.snapshots), divergence.EndpointsAnswered, context.state != nil),
+		Hypotheses:           hypotheses,
+		MeasurementPlan:      divergenceMeasurementPlan(divergence),
+		MeasuredRounds:       len(context.snapshots), TransitionRounds: topologyChanges,
+		Divergence:        &divergence,
+		CauseStatus:       topologyCauseStatus(divergence, benign),
+		Provenance:        provenance,
+		Corroboration:     corroboration,
+		BenignExplanation: benign,
+	}
+}
+
+func topologyCauseStatus(divergence models.EndpointDivergence, benign string) string {
+	if benign != "" {
+		return "established"
+	}
+	switch divergence.Verdict {
+	case models.DivergenceStuckRollout:
+		if divergence.StrongEvidence {
+			return "established"
+		}
+		return "inferred"
+	case models.DivergenceIntraFleet, models.DivergenceDefectiveEndpoint:
+		return "established"
+	case models.DivergencePropagating, models.DivergenceUndetermined:
+		return "inferred"
+	case models.DivergenceIntentionalMultiCDN, models.DivergenceDualCertificate:
+		return "established"
+	default:
+		if divergence.Verdict == "dns_cutover_before_tls_deployment" {
+			return "inferred"
+		}
+		return "unestablished"
+	}
+}
+
+func multiCDNRationale(divergence models.EndpointDivergence) string {
+	if divergence.CDN != nil && models.CDNMethodFor(divergence.CDN.Completeness) == "vendor" && divergence.CDN.DistinctVendors >= 2 {
+		return "Each named CDN served one certificate consistently, so the diversity is between providers rather than inside any one of them."
+	}
+	return "Each provider network served one certificate consistently and the assignment held across independent rounds, so the diversity is between providers rather than inside any one of them. Vendors were not identified for every endpoint, so the reading uses the IPv4 /16 and IPv6 /32 partition."
+}
+
+func intraFleetRationale(divergence models.EndpointDivergence) string {
+	if divergence.CDN != nil && models.CDNMethodFor(divergence.CDN.Completeness) == "vendor" && (divergence.CDN.DistinctVendors == 1 || divergence.CDN.VendorConflicts > 0) {
+		return "Addresses attributed to the same named CDN served different certificates, which no between-provider arrangement explains."
+	}
+	return "Addresses inside the same network allocation served different certificates, which no between-provider arrangement explains."
+}
+
+func multiCDNBenign(divergence models.EndpointDivergence) string {
+	text := "The endpoints are distributed across " + itoa(divergence.NetworkGroups) + " provider networks, each consistently serving its own certificate for " + itoa(divergence.StableRounds) + " earlier round(s). This is a deliberate multi-provider arrangement, not an inconsistent deployment."
+	if divergence.CDN != nil && models.CDNMethodFor(divergence.CDN.Completeness) == "vendor" && divergence.CDN.DistinctVendors >= 2 {
+		text = "The endpoints are distributed across " + itoa(divergence.CDN.DistinctVendors) + " named CDNs, each consistently serving its own certificate for " + itoa(divergence.StableRounds) + " earlier round(s). This is a deliberate multi-provider arrangement, not an inconsistent deployment."
+	}
+	if len(divergence.DefectiveEndpoints) > 0 {
+		text += " A certificate that is not valid for the name on " + strings.Join(divergence.DefectiveEndpoints, ", ") + " is a separate TLS finding, not evidence that the split itself is a deployment failure."
+	}
+	return text
+}
+
+func divergenceSummary(primary models.CauseHypothesis, divergence models.EndpointDivergence, rounds, topologyChanges int) string {
+	parts := []string{"Most consistent with " + strings.ToLower(primary.Label) + ": " + primary.Rationale}
+	if divergence.EndpointsAnswered >= 2 {
+		parts = append(parts, fmt.Sprintf("%d endpoint(s) answered with %d distinct certificate(s) across %d provider network(s); %d network(s) served more than one certificate.",
+			divergence.EndpointsAnswered, divergence.DistinctLeaves, divergence.NetworkGroups, divergence.IntraGroupConflicts))
+		if divergence.StableRounds > 0 {
+			parts = append(parts, fmt.Sprintf("The same provider-to-certificate assignment held in %d earlier round(s), compared by network allocation so that edge address rotation does not reset it.", divergence.StableRounds))
+		}
+		if len(divergence.DefectiveEndpoints) > 0 {
+			parts = append(parts, fmt.Sprintf("%d endpoint(s) served a certificate that is not currently valid for the queried name.", len(divergence.DefectiveEndpoints)))
+		}
+	} else {
+		parts = append(parts, "Fewer than two endpoints answered, so the structure of the diversity could not be measured.")
+	}
+	parts = append(parts, fmt.Sprintf("Evidence uses %d retained round(s) and %d topology transition(s); mixed certificates alone are never treated as a deployment failure.", rounds, topologyChanges))
+	return strings.Join(parts, " ")
+}
+
+func divergenceMeasurementPlan(divergence models.EndpointDivergence) []string {
+	plan := make([]string, 0, 3)
+	if divergence.EndpointsAnswered < 2 {
+		plan = append(plan, "Widen the endpoint survey until at least two addresses answer in the same round; one endpoint cannot show a distribution.")
+	}
+	if divergence.DistinctKeyAlgos == 0 {
+		plan = append(plan, "Retain the public-key algorithm per endpoint so an RSA plus ECDSA pair is not reported as inconsistent deployment.")
+	}
+	if divergence.StableRounds < 2 {
+		plan = append(plan, "Repeat the survey for two further rounds; a deliberate arrangement keeps its provider-to-certificate assignment while a rollout does not.")
+	}
+	if len(divergence.PredecessorEndpoints) > 0 {
+		plan = append(plan, "Re-probe the endpoints still serving the predecessor to establish whether the residue clears within the propagation window.")
+	}
+	if divergence.CDN == nil || models.CDNMethodFor(divergence.CDN.Completeness) != "vendor" {
+		plan = append(plan, "Look up RDAP and ASN for every answering address, and retain NS names, so unnamed /16 and /32 partitions can be replaced with numbering-authority identities.")
+	}
+	if len(plan) == 0 {
+		plan = append(plan, "Continue per-network endpoint sampling and compare issuer, key algorithm and name coverage across providers.")
+	}
+	return plan
+}
+
+// latestEndpointSurvey returns the most recent retained endpoint survey along
+// with the fingerprint it replaced and when that replacement was first seen.
+func latestEndpointSurvey(observations []models.CertObservation) ([]models.EndpointProbe, string, time.Time) {
+	var best models.CertObservation
+	found := false
+	for _, observation := range observations {
+		if strings.TrimSpace(observation.EndpointProbes) == "" {
+			continue
+		}
+		if !found || observation.ObservedAt.After(best.ObservedAt) {
+			best = observation
+			found = true
+		}
+	}
+	if !found {
+		return nil, "", time.Time{}
+	}
+	var probes []models.EndpointProbe
+	if json.Unmarshal([]byte(best.EndpointProbes), &probes) != nil {
+		return nil, "", time.Time{}
+	}
+	replacedAt := time.Time{}
+	if best.PreviousFingerprint != "" {
+		replacedAt = firstObservationOf(observations, best.Fingerprint)
+	}
+	return probes, best.PreviousFingerprint, replacedAt
+}
+
+func firstObservationOf(observations []models.CertObservation, fingerprint string) time.Time {
+	earliest := time.Time{}
+	for _, observation := range observations {
+		if observation.Fingerprint != fingerprint {
+			continue
+		}
+		if earliest.IsZero() || observation.ObservedAt.Before(earliest) {
+			earliest = observation.ObservedAt
+		}
+	}
+	return earliest
+}
+
+func latestObservedAt(observations []models.CertObservation, snapshots []models.MeasurementSnapshot) time.Time {
+	latest := time.Time{}
+	for _, observation := range observations {
+		if observation.ObservedAt.After(latest) {
+			latest = observation.ObservedAt
+		}
+	}
+	for _, snapshot := range snapshots {
+		if snapshot.ObservedAt.After(latest) {
+			latest = snapshot.ObservedAt
+		}
+	}
+	return latest
+}
+
+func lifecycleRowsOfType(observations []models.CertObservation, observationType string) []models.CertObservation {
+	rows := make([]models.CertObservation, 0, len(observations))
+	for _, observation := range observations {
+		if observation.ObservationType == observationType {
+			rows = append(rows, observation)
+		}
+	}
+	return rows
 }
 
 func changeCadence(changes []models.CertObservation) (float64, float64) {
@@ -2041,7 +3531,7 @@ func certificateTransitionSignals(changes []models.CertObservation, certs map[st
 		oldCert, oldOK := certs[change.PreviousFingerprint]
 		newCert, newOK := certs[change.Fingerprint]
 		if oldOK && newOK {
-			if oldCert.Issuer != newCert.Issuer || oldCert.IssuerCN != newCert.IssuerCN {
+			if issuerFamily(oldCert) != issuerFamily(newCert) {
 				issuerChanges++
 			}
 			if normalizedSANs(oldCert.SANs) != normalizedSANs(newCert.SANs) {
@@ -2099,24 +3589,37 @@ func diagnosisEndpointMapChanged(before, after map[string]string) bool {
 			return true
 		}
 	}
-	for ip, fingerprint := range after {
+	for ip := range after {
 		if _, ok := before[ip]; !ok {
-			return true
-		}
-		if previous, ok := before[ip]; ok && previous != fingerprint {
 			return true
 		}
 	}
 	return false
 }
 
+func overlappingFingerprintReplacements(before, after map[string]string) int {
+	count := 0
+	for ip, fingerprint := range before {
+		next, ok := after[ip]
+		if !ok || fingerprint == "" || next == "" {
+			continue
+		}
+		if next != fingerprint {
+			count++
+		}
+	}
+	return count
+}
+
 func topologySignals(snapshots []models.MeasurementSnapshot) (topologyChanges int, endpointChanges float64) {
 	if len(snapshots) < 2 {
 		return 0, 0
 	}
-	// Snapshots are newest first. Compare adjacent rounds regardless of order.
-	mapChanges := 0
-	comparisons := 0
+	// Address-set churn (anycast VIP rotation) is not a certificate rollout.
+	// Only a fingerprint change on an IP that answered in both rounds is
+	// replacement evidence, and that is counted separately from edge rollout.
+	replacementComparisons := 0
+	addressSetChanges := 0
 	for index := 1; index < len(snapshots); index++ {
 		if snapshots[index].TopologyHash != "" && snapshots[index-1].TopologyHash != "" && snapshots[index].TopologyHash != snapshots[index-1].TopologyHash {
 			topologyChanges++
@@ -2126,15 +3629,35 @@ func topologySignals(snapshots []models.MeasurementSnapshot) (topologyChanges in
 		if len(before) == 0 || len(after) == 0 {
 			continue
 		}
-		comparisons++
-		if diagnosisEndpointMapChanged(before, after) || len(before) != len(after) {
-			mapChanges++
+		if overlappingFingerprintReplacements(before, after) > 0 {
+			replacementComparisons++
+		}
+		if diagnosisAddressSetChanged(before, after) && overlappingFingerprintReplacements(before, after) == 0 {
+			addressSetChanges++
 		}
 	}
-	if comparisons > 0 {
-		endpointChanges = float64(mapChanges) / float64(comparisons)
+	_ = addressSetChanges
+	if replacementComparisons > 0 {
+		endpointChanges = float64(replacementComparisons) / float64(len(snapshots)-1)
 	}
 	return topologyChanges, endpointChanges
+}
+
+func diagnosisAddressSetChanged(before, after map[string]string) bool {
+	if len(before) != len(after) {
+		return true
+	}
+	for ip := range before {
+		if _, ok := after[ip]; !ok {
+			return true
+		}
+	}
+	for ip := range after {
+		if _, ok := before[ip]; !ok {
+			return true
+		}
+	}
+	return false
 }
 
 func ctSignals(snapshots []models.MeasurementSnapshot) (coverage, burst float64) {
@@ -2339,40 +3862,45 @@ func minInt(left, right int) int {
 func (d *Database) certificateChangeCause(domain string, observation models.CertObservation) anomalyCause {
 	if observation.Fingerprint == "" {
 		return anomalyCause{
-			inferredReason:   "The replacement cause cannot be determined because the latest certificate fingerprint is incomplete.",
+			inferredReason:   "The replacement cannot be described because the latest certificate fingerprint is incomplete.",
 			inferredEvidence: []string{"fingerprint=missing", "inference=insufficient_certificate_fields"},
 		}
 	}
 	var current, previous models.Certificate
 	if d.db.Where("fingerprint = ?", observation.Fingerprint).First(&current).Error != nil {
 		return anomalyCause{
-			inferredReason:   "The replacement cause cannot be determined because the current certificate fields are unavailable.",
+			inferredReason:   "The replacement cannot be described because the current certificate fields are unavailable.",
 			inferredEvidence: []string{"new_fingerprint=" + observation.Fingerprint, "inference=insufficient_certificate_fields"},
 		}
 	}
 	if observation.PreviousFingerprint == "" || d.db.Where("fingerprint = ?", observation.PreviousFingerprint).First(&previous).Error != nil {
 		return anomalyCause{
-			inferredReason:   "The replacement cause cannot be classified as same-SPKI reissuance or public-key rotation because the previous certificate fields are unavailable.",
+			inferredReason:   "A different leaf was observed, but the predecessor certificate was not retained, so issuance dates and remaining life cannot be compared.",
 			inferredEvidence: []string{"new_fingerprint=" + observation.Fingerprint, "inference=insufficient_previous_certificate_fields"},
 		}
 	}
-	oldSPKI, newSPKI := certificateSPKI(&previous), certificateSPKI(&current)
 	confirmedEvidence := []string{"previous_fingerprint=" + previous.Fingerprint, "new_fingerprint=" + current.Fingerprint}
-	if oldSPKI == "" || newSPKI == "" {
-		return anomalyCause{
-			inferredReason:   "The certificate changed, but the cause cannot be classified as same-SPKI reissuance or SPKI/public-key rotation because one or both SPKI values are unavailable.",
-			inferredEvidence: append(confirmedEvidence, "spki=unavailable", "inference=insufficient_spki_fields"),
+	oldSPKI, newSPKI := certificateSPKI(&previous), certificateSPKI(&current)
+	if oldSPKI != "" && newSPKI != "" {
+		if oldSPKI == newSPKI {
+			confirmedEvidence = append(confirmedEvidence, "spki=unchanged")
+		} else {
+			confirmedEvidence = append(confirmedEvidence, "spki=changed")
 		}
 	}
 	var confirmedParts []string
-	if oldSPKI == newSPKI {
-		confirmedEvidence = append(confirmedEvidence, "spki=unchanged")
-		confirmedParts = []string{"Observed technical mechanism: same-SPKI certificate reissuance or replacement; the leaf fingerprint changed while the public key remained unchanged. The longitudinal diagnosis must determine whether this follows a renewal policy, CA migration or edge process"}
-	} else {
-		confirmedEvidence = append(confirmedEvidence, "spki=changed")
-		confirmedParts = []string{"Observed technical mechanism: SPKI/public-key rotation; both the leaf fingerprint and SPKI changed. The longitudinal diagnosis must determine whether this follows a security policy, incident response or deployment process"}
+	if !previous.NotBefore.IsZero() && !current.NotBefore.IsZero() {
+		confirmedParts = append(confirmedParts, fmt.Sprintf("predecessor issued %s, successor issued %s", previous.NotBefore.UTC().Format("2006-01-02"), current.NotBefore.UTC().Format("2006-01-02")))
+		confirmedEvidence = append(confirmedEvidence, "previous_not_before="+previous.NotBefore.UTC().Format(time.RFC3339), "new_not_before="+current.NotBefore.UTC().Format(time.RFC3339))
+	}
+	if observation.DaysUntilExpiry > 0 {
+		confirmedParts = append(confirmedParts, fmt.Sprintf("the successor had %d day(s) remaining when it was observed", observation.DaysUntilExpiry))
+		confirmedEvidence = append(confirmedEvidence, fmt.Sprintf("days_until_expiry=%d", observation.DaysUntilExpiry))
 	}
 	appendCertificateFieldDifferences(&confirmedParts, &confirmedEvidence, &previous, &current)
+	if len(confirmedParts) == 0 {
+		confirmedParts = []string{"A different leaf certificate was observed; a pairwise public-key comparison is not a cause"}
+	}
 	return anomalyCause{
 		confirmedReason:   strings.Join(confirmedParts, "; ") + ".",
 		confirmedEvidence: confirmedEvidence,
@@ -2394,6 +3922,29 @@ func lifecycleDescription(kind string, count int) string {
 	}
 }
 
+// appendEndpointPairEvidence adds the endpoint that served the predecessor leaf
+// and the endpoint observed in this round. Both are needed to recheck any
+// "same endpoint" claim after the fact; either may be absent on rows written
+// before the endpoint pair was persisted.
+func appendEndpointPairEvidence(evidence []string, row models.CertObservation) []string {
+	if row.PreviousIPAddress != "" {
+		evidence = append(evidence, "previous_endpoint_ip="+row.PreviousIPAddress)
+	}
+	if row.IPAddress != "" {
+		evidence = append(evidence, "observed_endpoint_ip="+row.IPAddress)
+	}
+	if row.PreviousIPAddress != "" && row.IPAddress != "" {
+		if row.PreviousIPAddress == row.IPAddress {
+			evidence = append(evidence, "endpoint_comparison=same_endpoint")
+		} else {
+			evidence = append(evidence, "endpoint_comparison=different_endpoint")
+		}
+	} else {
+		evidence = append(evidence, "endpoint_comparison=unknown")
+	}
+	return evidence
+}
+
 func lifecycleCause(row models.CertObservation, count int) anomalyCause {
 	cause := anomalyCause{evidenceStatus: firstNonEmpty(row.EvidenceStatus, models.EvidenceStatusUnknown)}
 	base := []string{"observation_type=" + row.ObservationType, fmt.Sprintf("observed_at=%s", row.ObservedAt.Format(time.RFC3339)), fmt.Sprintf("observed_events=%d", count)}
@@ -2401,6 +3952,10 @@ func lifecycleCause(row models.CertObservation, count int) anomalyCause {
 	case models.ObsSameKey:
 		cause.confirmedReason = "A new leaf certificate was observed with the same SPKI fingerprint as its predecessor. This confirms same-key replacement at the observed endpoint."
 		cause.confirmedEvidence = append(base, "spki=unchanged", "previous_fingerprint="+row.PreviousFingerprint, "new_fingerprint="+row.Fingerprint)
+		// The reason above names "the observed endpoint", so the endpoint pair
+		// has to travel with the evidence; otherwise the claim cannot be
+		// rechecked from the finding alone.
+		cause.confirmedEvidence = appendEndpointPairEvidence(cause.confirmedEvidence, row)
 		cause.inferredReason = "The operator likely reissued or replaced the certificate without rotating the public key; public evidence cannot establish intent or private-key exposure."
 		cause.inferredEvidence = append([]string{}, cause.confirmedEvidence...)
 		cause.inferredEvidence = append(cause.inferredEvidence, "interpretation=reissuance_or_replacement_without_key_rotation")
@@ -2412,6 +3967,15 @@ func lifecycleCause(row models.CertObservation, count int) anomalyCause {
 		}
 		if row.PreviousResolvedIPs != "" {
 			cause.confirmedEvidence = append(cause.confirmedEvidence, "previous_resolved_ips="+row.PreviousResolvedIPs)
+		}
+		// staleEndpointEvidence() only records this event when a retired address
+		// still served the predecessor while a current address served the
+		// successor. Those probes are the actual proof, so surface them here the
+		// way deployment_failure already does instead of leaving the finding
+		// resting on set inequality alone.
+		cause.confirmedEvidence = appendEndpointPairEvidence(cause.confirmedEvidence, row)
+		if row.EndpointProbes != "" {
+			cause.confirmedEvidence = append(cause.confirmedEvidence, "endpoint_probes="+row.EndpointProbes)
 		}
 		cause.inferredReason = "This is consistent with a stale certificate after hosting or control-plane change, but DNS/IP-set change alone does not prove registrant transfer, provider exit, or private-key retention."
 		cause.inferredEvidence = append([]string{}, cause.confirmedEvidence...)
@@ -2427,14 +3991,14 @@ func lifecycleCause(row models.CertObservation, count int) anomalyCause {
 		cause.inferredEvidence = append([]string{}, cause.confirmedEvidence...)
 		cause.inferredEvidence = append(cause.inferredEvidence, "interpretation=endpoint_configuration_lag", "scope=observed_endpoint_only")
 	case models.ObsDeploymentFailure:
-		cause.confirmedReason = "Sampled endpoints presented different leaf fingerprints. This establishes certificate diversity only; intentional CDN or dual-certificate configurations are possible."
+		cause.confirmedReason = "Sampled endpoints of this name served different leaf certificates in the same measurement round."
 		cause.confirmedEvidence = append(base, "measurement=multi_endpoint_tls_probe", "deployment_state=mixed_leaf_fingerprints", "previous_fingerprint="+row.PreviousFingerprint, "current_fingerprint="+row.Fingerprint)
 		if row.EndpointProbes != "" {
 			cause.confirmedEvidence = append(cause.confirmedEvidence, "endpoint_probes="+row.EndpointProbes)
 		}
-		cause.inferredReason = "The rollout may have been incomplete or edge-local; public probes cannot prove a global deployment failure without an authoritative edge inventory or testbed control-plane record."
+		cause.inferredReason = "Whether this is a stuck rollout, an intra-network inconsistency, or a still-settling replacement is decided from the endpoint structure, not from mixed fingerprints alone."
 		cause.inferredEvidence = append([]string{}, cause.confirmedEvidence...)
-		cause.inferredEvidence = append(cause.inferredEvidence, "interpretation=partial_rollout_or_edge_lag", "scope=sampled_resolved_endpoints")
+		cause.inferredEvidence = append(cause.inferredEvidence, "interpretation=awaiting_endpoint_structure", "scope=sampled_resolved_endpoints")
 	}
 	return cause
 }
@@ -2484,7 +4048,62 @@ func certTime(cert *models.Certificate) string {
 	if cert == nil {
 		return "unknown"
 	}
+	if !jsonableTime(cert.NotAfter) {
+		return "invalid"
+	}
 	return cert.NotAfter.Format(time.RFC3339)
+}
+
+// jsonableTime is encoding/json's Time.MarshalJSON range: year in [0, 9999].
+// Dates outside that range cannot be serialized and also cannot be used as
+// remaining-life evidence.
+func jsonableTime(value time.Time) bool {
+	if value.IsZero() {
+		return true
+	}
+	year := value.Year()
+	return year >= 0 && year < 10000
+}
+
+func jsonableTimePtr(value *time.Time) *time.Time {
+	if value == nil || !jsonableTime(*value) {
+		return nil
+	}
+	return value
+}
+
+func sanitizeAnomalyJSONTimes(items []models.Anomaly) {
+	for index := range items {
+		if !jsonableTime(items[index].DetectedAt) {
+			items[index].DetectedAt = time.Time{}
+		}
+		items[index].FirstObservedAt = jsonableTimePtr(items[index].FirstObservedAt)
+		items[index].LastObservedAt = jsonableTimePtr(items[index].LastObservedAt)
+		if items[index].Diagnosis == nil {
+			continue
+		}
+		if investigation := items[index].Diagnosis.Investigation; investigation != nil {
+			for certIndex := range investigation.Certificates {
+				investigation.Certificates[certIndex].NotBefore = jsonableTimePtr(investigation.Certificates[certIndex].NotBefore)
+				investigation.Certificates[certIndex].NotAfter = jsonableTimePtr(investigation.Certificates[certIndex].NotAfter)
+			}
+			for changeIndex := range investigation.ChangeSequence {
+				if !jsonableTime(investigation.ChangeSequence[changeIndex].ObservedAt) {
+					investigation.ChangeSequence[changeIndex].ObservedAt = time.Time{}
+				}
+			}
+		}
+		if caseFile := items[index].Diagnosis.EvidenceCase; caseFile != nil {
+			if !jsonableTime(caseFile.GeneratedAt) {
+				caseFile.GeneratedAt = time.Time{}
+			}
+			for roundIndex := range caseFile.Rounds {
+				if !jsonableTime(caseFile.Rounds[roundIndex].ObservedAt) {
+					caseFile.Rounds[roundIndex].ObservedAt = time.Time{}
+				}
+			}
+		}
+	}
 }
 
 func firstTime(value *time.Time, fallback time.Time) time.Time {

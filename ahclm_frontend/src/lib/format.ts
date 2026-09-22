@@ -33,3 +33,9 @@ export function fmtDays(days: number): string {
   if (days === 0) return 'today';
   return `${days}d`;
 }
+
+export function shortFp(value?: string, length = 12): string {
+  const fingerprint = (value || '').trim();
+  if (!fingerprint) return 'not captured';
+  return fingerprint.length <= length ? fingerprint : `${fingerprint.slice(0, length)}…`;
+}

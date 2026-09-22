@@ -19,8 +19,9 @@ import {
   ExternalLink,
 } from 'lucide-react';
 import { getDomain, getDomainObservations, getDomainMeasurements, getDiagnosis } from '@/api';
-import type { CertObservation, ChainEntry, CauseDiagnosis, MeasurementSnapshot } from '@/types';
+import type { Anomaly, CertObservation, ChainEntry, CauseDiagnosis, MeasurementSnapshot } from '@/types';
 import { fmtDate, fmtDateTime, fmtDays, timeUntil } from '@/lib/format';
+import CauseInvestigation from '@/components/CauseInvestigation';
 
 const obsMeta: Record<string, { icon: typeof Flag; color: string; label: string }> = {
   initial: { icon: Plus, color: 'text-blue-400 bg-blue-500/15', label: 'Initial sighting' },
@@ -44,6 +45,53 @@ const ariStatusText: Record<string, string> = {
   error: 'Could not reach the ARI endpoint on the last scan.',
   not_checked: 'ARI has not been checked yet.',
 };
+
+function findingTypeFromDiagnosis(diagnosis: CauseDiagnosis): string {
+  if (diagnosis.churn_shape) {
+    switch (diagnosis.primary_code) {
+      case 'same_key_reissue':
+      case 'concurrent_same_key':
+      case 'same_key_unestablished':
+        return 'same_key';
+      case 'early_renewal_replacement':
+      case 'early_renewal_unestablished':
+        return 'early_renewal';
+      default:
+        return 'frequent_change';
+    }
+  }
+  if (diagnosis.endpoint_divergence) {
+    return diagnosis.investigation?.cause_code === 'dns_cutover_before_tls_deployment' ? 'stale_after_change' : 'deployment_failure';
+  }
+  switch (diagnosis.primary_code) {
+    case 'expired_leaf_still_served':
+      return 'expired_served';
+    case 'expired_leaf_historically_observed':
+      return 'expired_observed';
+    case 'current_leaf_inside_expiry_window':
+      return 'expiring_soon';
+    case 'current_leaf_revoked':
+      return 'revoked';
+    case 'revoked_leaf_still_observable':
+      return 'residual';
+    case 'tls_measurement_failed':
+      return 'unreachable';
+    case 'ari_window_pulled_to_present':
+      return 'ari_emergency';
+    case 'expired_leaf_at_sampled_endpoint':
+      return 'expired_endpoint';
+    case 'name_mismatch_at_sampled_endpoint':
+      return 'hostname_mismatch';
+    case 'not_yet_valid_leaf_at_sampled_endpoint':
+      return 'not_yet_valid';
+    case 'local_chain_invalid_at_sampled_endpoint':
+      return 'local_chain_validation_failed';
+    case 'endpoint_probe_incomplete':
+      return 'endpoint_probe_inconclusive';
+    default:
+      return diagnosis.investigation?.cause_code || 'deployment_failure';
+  }
+}
 
 function TimelineItem({ o, last }: { o: CertObservation; last: boolean }) {
   const meta = obsMeta[o.observation_type] ?? obsMeta.initial;
@@ -235,6 +283,7 @@ export default function DomainDetail() {
             <Row label="Resolver consensus" value={dc.consensus_ips || 'Not established'} />
             <Row label="Resolver agreement" value={dc.topology_resolver_agreement !== undefined ? `${Math.round(dc.topology_resolver_agreement * 100)}% (${dc.topology_resolver_quorum ?? 0} resolvers)` : '—'} />
             <Row label="Endpoint diversity" value={dc.endpoint_diversity_status || 'Not measured'} />
+            {dc.endpoint_diversity_rounds ? <Row label="Diversity rounds" value={dc.endpoint_diversity_rounds} /> : null}
             <Row label="Last DNS snapshot" value={dc.last_dns_observed_at ? fmtDateTime(dc.last_dns_observed_at) : '—'} />
             {dc.residual_fingerprint ? (
               <>
@@ -248,21 +297,34 @@ export default function DomainDetail() {
             )}
           </div>
 
-          {diagnosis && (
+          {diagnosis?.investigation && (
             <div className="card">
-              {(() => {
-                const hypotheses = Array.isArray(diagnosis.hypotheses) ? diagnosis.hypotheses : [];
-                return (
-                  <>
-              <h2 className="text-lg font-semibold mb-3 flex items-center gap-2"><Network className="h-5 w-5 text-cyan-400" /> Deep cause assessment</h2>
-              <p className="text-sm text-slate-200">{diagnosis.summary}</p>
-              <p className="text-xs text-slate-500 mt-2">{diagnosis.measured_rounds} measurement rounds · {diagnosis.transition_rounds} transitions · {Math.round(diagnosis.evidence_completeness * 100)}% evidence completeness</p>
-              <div className="mt-3 space-y-2">
-                {hypotheses.slice(0, 3).map((hypothesis) => <div key={hypothesis.code} className="text-xs"><div className="flex justify-between text-slate-400"><span>{hypothesis.label}</span><span>{Math.round(hypothesis.score * 100)}%</span></div><div className="h-1 bg-slate-700 mt-1"><div className="h-1 bg-cyan-500" style={{ width: `${Math.round(hypothesis.score * 100)}%` }} /></div></div>)}
-              </div>
-                  </>
-                );
-              })()}
+              <h2 className="text-lg font-semibold mb-3 flex items-center gap-2"><Network className="h-5 w-5 text-cyan-400" /> Problem, proof and inference</h2>
+              <CauseInvestigation
+                rounds={diagnosis.endpoint_divergence || (diagnosis.investigation.provider_groups?.length ?? 0) > 0
+                  ? (diagnosis.evidence_case?.rounds ?? [])
+                  : []}
+                anomaly={{
+                  domain,
+                  type: findingTypeFromDiagnosis(diagnosis),
+                  severity: diagnosis.benign_explanation ? 'info' : 'warning',
+                  description: diagnosis.investigation.problem,
+                  reason: diagnosis.investigation.cause,
+                  cause_classification: 'inferred',
+                  confirmed_reason: '',
+                  inferred_reason: diagnosis.investigation.cause,
+                  confirmed_evidence: [],
+                  inferred_evidence: [],
+                  occurrence_count: 1,
+                  monitoring_count: diagnosis.measured_rounds,
+                  successful_monitoring_count: 0,
+                  failed_monitoring_count: 0,
+                  detected_at: '',
+                  finding_class: diagnosis.investigation.finding_class,
+                  diagnosis,
+                } as Anomaly}
+                investigation={diagnosis.investigation}
+              />
             </div>
           )}
 

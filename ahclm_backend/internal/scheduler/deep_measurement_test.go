@@ -92,3 +92,100 @@ func TestUpdateEndpointStatesRetainsPerIPHistory(t *testing.T) {
 		t.Fatalf("unexpected endpoint state: %#v", state)
 	}
 }
+
+// A round that reaches the predecessor and the successor at the same time has
+// shown the two certificates are deployed concurrently. Counting that as a
+// replacement is what inflates the change counter on load-balanced domains.
+func TestSameIPReplacementsCountsOnlyOverlappingAddresses(t *testing.T) {
+	previous := map[string]models.EndpointState{
+		"192.0.2.1":   {IPAddress: "192.0.2.1", Fingerprint: "a"},
+		"198.51.100.1": {IPAddress: "198.51.100.1", Fingerprint: "b"},
+	}
+	got := sameIPReplacements(previous, map[string]string{"192.0.2.1": "c", "203.0.113.1": "d"})
+	if len(got) != 1 || got[0].IP != "192.0.2.1" || got[0].Previous != "a" || got[0].Current != "c" {
+		t.Fatalf("overlapping replacement = %#v, want one change on 192.0.2.1", got)
+	}
+	if got := sameIPReplacements(previous, map[string]string{"192.0.2.1": "a", "198.51.100.1": "b"}); len(got) != 0 {
+		t.Fatalf("unchanged overlapping leaves must not count: %#v", got)
+	}
+	if got := sameIPReplacements(previous, map[string]string{"203.0.113.1": "z"}); len(got) != 0 {
+		t.Fatalf("a disjoint new address is not a replacement: %#v", got)
+	}
+	mixed := map[string]string{"192.0.2.1": "a", "198.51.100.1": "b"}
+	if got := sameIPReplacements(previous, mixed); len(got) != 0 {
+		t.Fatalf("two live addresses keeping their own leaves is not a replacement: %#v", got)
+	}
+}
+
+func TestCurrentEndpointLeavesPrefersProbeMap(t *testing.T) {
+	result := &models.ScanResult{
+		Cert: &models.Certificate{Fingerprint: "baseline"},
+		ConnectionInfo: &models.ConnectionInfo{IPAddress: "192.0.2.1"},
+		EndpointProbes: []models.EndpointProbe{
+			{IPAddress: "192.0.2.1", Success: true, Fingerprint: "a"},
+			{IPAddress: "198.51.100.1", Success: true, Fingerprint: "b"},
+		},
+	}
+	got := currentEndpointLeaves(result)
+	if got["192.0.2.1"] != "a" || got["198.51.100.1"] != "b" {
+		t.Fatalf("leaves = %#v", got)
+	}
+}
+
+func TestClassifyCertificateChangeDetectsConcurrentDeployment(t *testing.T) {
+	result := &models.ScanResult{EndpointProbes: []models.EndpointProbe{
+		{IPAddress: "192.0.2.1", Success: true, Fingerprint: "old"},
+		{IPAddress: "198.51.100.1", Success: true, Fingerprint: "new"},
+	}}
+	if got := classifyCertificateChange(result, "old", "new", "192.0.2.1", "198.51.100.1"); got != models.ChangeClassCoexisting {
+		t.Fatalf("class = %q, want coexisting leaves", got)
+	}
+	single := &models.ScanResult{EndpointProbes: []models.EndpointProbe{
+		{IPAddress: "192.0.2.1", Success: true, Fingerprint: "new"},
+	}}
+	if got := classifyCertificateChange(single, "old", "new", "192.0.2.1", "192.0.2.1"); got != models.ChangeClassReplacement {
+		t.Fatalf("class = %q, want a same-endpoint replacement", got)
+	}
+	if got := classifyCertificateChange(single, "old", "new", "192.0.2.1", "198.51.100.1"); got != models.ChangeClassEndpointSampling {
+		t.Fatalf("class = %q, want endpoint sampling", got)
+	}
+	if got := classifyCertificateChange(single, "old", "new", "", "198.51.100.1"); got != models.ChangeClassUnknown {
+		t.Fatalf("class = %q, want unknown without an endpoint comparison", got)
+	}
+}
+
+// CDN edge addresses rotate on nearly every query. Keying the stability test on
+// the exact address meant a permanently stable arrangement never accumulated a
+// single stable round, so every round looked like a fresh transition.
+func TestStableEndpointDiversitySurvivesEdgeAddressRotation(t *testing.T) {
+	mapJSON := func(value map[string]string) string { encoded, _ := json.Marshal(value); return string(encoded) }
+	rotating := []models.MeasurementSnapshot{
+		{FingerprintCount: 2, EndpointFingerprintsJSON: mapJSON(map[string]string{"23.43.51.10": "a", "104.16.7.9": "b"})},
+		{FingerprintCount: 2, EndpointFingerprintsJSON: mapJSON(map[string]string{"23.43.99.4": "a", "104.16.200.1": "b"})},
+	}
+	current := map[string]string{"23.43.12.55": "a", "104.16.31.77": "b"}
+	if !stableEndpointDiversity(rotating, current, 2) {
+		t.Fatal("address rotation inside one allocation must not reset the stability baseline")
+	}
+	moved := map[string]string{"23.43.12.55": "b", "104.16.31.77": "a"}
+	if stableEndpointDiversity(rotating, moved, 2) {
+		t.Fatal("swapping which provider serves which certificate is a real assignment change")
+	}
+}
+
+// The deployment-failure detector must stop re-firing on an arrangement that
+// only changed its edge addresses.
+func TestDeploymentFailureIgnoresEdgeAddressRotation(t *testing.T) {
+	mapJSON := func(value map[string]string) string { encoded, _ := json.Marshal(value); return string(encoded) }
+	previous := []models.MeasurementSnapshot{
+		{FingerprintCount: 2, EndpointFingerprintsJSON: mapJSON(map[string]string{"23.43.51.10": "a", "104.16.7.9": "b"})},
+		{FingerprintCount: 2, EndpointFingerprintsJSON: mapJSON(map[string]string{"23.43.99.4": "a", "104.16.200.1": "b"})},
+	}
+	rotated := &models.ScanResult{EndpointProbes: []models.EndpointProbe{
+		{IPAddress: "23.43.12.55", Success: true, Fingerprint: "a"},
+		{IPAddress: "104.16.31.77", Success: true, Fingerprint: "b"},
+	}}
+	if deploymentFailureEvidence(&models.DomainCertificate{}, rotated, previous, "a", false) {
+		t.Fatal("rotating edge addresses under a stable assignment must not raise a deployment finding")
+	}
+}

@@ -290,6 +290,12 @@ func (s *Scheduler) processResult(dc *models.DomainCertificate, result *models.S
 	prevFP := dc.CurrentFingerprint
 	prevDays := dc.LastDaysUntilExpiry
 	certificateChanged := hasPrev && prevFP != cert.Fingerprint
+	previousEndpointStates := parseEndpointStatesJSON(dc.EndpointStates)
+	if len(previousEndpointStates) == 0 && strings.TrimSpace(dc.LastEndpointIP) != "" && prevFP != "" {
+		previousEndpointStates[dc.LastEndpointIP] = models.EndpointState{
+			IPAddress: dc.LastEndpointIP, Fingerprint: prevFP,
+		}
+	}
 	previousIPs := parseIPs(dc.ResolvedIPs)
 	dnsIPs := append([]string(nil), result.ResolvedIPs...)
 	currentIPs := append([]string(nil), dnsIPs...)
@@ -315,16 +321,24 @@ func (s *Scheduler) processResult(dc *models.DomainCertificate, result *models.S
 		dc.TopologyResolverAgreement = result.Topology.ResolverAgreement
 	}
 
+	replacements := sameIPReplacements(previousEndpointStates, currentEndpointLeaves(result))
 	switch {
 	case !hasPrev:
 		s.appendObs(s.newObs(dc.Domain, cert, models.ObsInitial, "", curDays, result))
-	case certificateChanged:
+	case len(replacements) > 0:
 		stat.ChangesDetected = 1
-		dc.ChangeCount++
+		dc.ChangeCount += len(replacements)
 		dc.LastChangedAt = &now
 		obs := s.newObs(dc.Domain, cert, models.ObsChange, "", curDays, result)
-		obs.PreviousFingerprint = prevFP
-		if previous, e := s.db.GetCertificateByFingerprint(prevFP); e == nil {
+		obs.PreviousFingerprint = replacements[0].Previous
+		obs.PreviousIPAddress = replacements[0].IP
+		obs.ChangeClass = models.ChangeClassReplacement
+		if len(replacements) == 1 {
+			obs.Notes = "Same endpoint " + replacements[0].IP + " served a different leaf than in the previous round."
+		} else {
+			obs.Notes = fmt.Sprintf("%d live endpoints replaced their leaf in this round; new or retired addresses are not counted.", len(replacements))
+		}
+		if previous, e := s.db.GetCertificateByFingerprint(obs.PreviousFingerprint); e == nil {
 			obs.PreviousSPKIFingerprint = previous.SPKIFingerprint
 			if obs.PreviousSPKIFingerprint == "" {
 				obs.PreviousSPKIFingerprint = models.SPKIFingerprintFromRaw(previous.RawCert)
@@ -333,14 +347,20 @@ func (s *Scheduler) processResult(dc *models.DomainCertificate, result *models.S
 		s.appendObs(obs)
 		if obs.PreviousSPKIFingerprint != "" && obs.PreviousSPKIFingerprint == cert.SPKIFingerprint {
 			sameKey := s.newObs(dc.Domain, cert, models.ObsSameKey, "", curDays, result)
-			sameKey.PreviousFingerprint = prevFP
+			sameKey.PreviousFingerprint = obs.PreviousFingerprint
 			sameKey.PreviousSPKIFingerprint = obs.PreviousSPKIFingerprint
-			sameKey.Notes = "The leaf certificate changed while the SPKI fingerprint remained unchanged; this confirms same-key replacement, not private-key compromise."
+			sameKey.ChangeClass = models.ChangeClassReplacement
+			// The reason text claims same-key replacement "at the observed
+			// endpoint". Carry the endpoint that served the predecessor so that
+			// claim stays reproducible from the row alone.
+			sameKey.PreviousIPAddress = obs.PreviousIPAddress
+			sameKey.Notes = "The leaf certificate changed on the same endpoint while the SPKI fingerprint remained unchanged; this confirms same-key replacement, not private-key compromise."
 			s.appendObs(sameKey)
 		}
 		s.fireAlert("certificate_changed", dc.Domain, cert, "",
-			fmt.Sprintf("Certificate for %s changed", dc.Domain))
+			fmt.Sprintf("Certificate for %s changed on the same endpoint", dc.Domain))
 	}
+
 	// A stale event requires a quorum-confirmed DNS transition *and* direct
 	// evidence that an old edge is still serving the predecessor while a new edge
 	// serves the successor. A changed RRset by itself is not a stale certificate.
@@ -568,6 +588,11 @@ func (s *Scheduler) processResult(dc *models.DomainCertificate, result *models.S
 	dc.LastScannedAt = now
 	dc.LastDaysUntilExpiry = curDays
 	dc.ScanCount++
+	// Record which endpoint produced this certificate so the next scan can tell a
+	// replacement on one server apart from a different server answering.
+	if result.ConnectionInfo != nil && result.ConnectionInfo.IPAddress != "" {
+		dc.LastEndpointIP = result.ConnectionInfo.IPAddress
+	}
 
 	var ariNextPoll *time.Time
 	if s.scanCfg != nil && s.scanCfg.CheckARI && dc.ARISupported {
@@ -595,6 +620,104 @@ func (s *Scheduler) processResult(dc *models.DomainCertificate, result *models.S
 	if s.onScanComplete != nil {
 		s.onScanComplete(result)
 	}
+}
+
+// classifyCertificateChange decides what a fingerprint difference between two
+// consecutive scans demonstrates.
+//
+// The difference is only a replacement in time when the same endpoint served
+// both leaves and the predecessor is no longer answering anywhere in this
+// round. When the round can still reach the predecessor on another address, the
+// two certificates are deployed at the same time and the "change" is an artifact
+// of which server answered.
+type sameIPReplacement struct {
+	IP       string
+	Previous string
+	Current  string
+}
+
+func parseEndpointStatesJSON(raw string) map[string]models.EndpointState {
+	states := make(map[string]models.EndpointState)
+	if strings.TrimSpace(raw) == "" {
+		return states
+	}
+	_ = json.Unmarshal([]byte(raw), &states)
+	return states
+}
+
+func currentEndpointLeaves(result *models.ScanResult) map[string]string {
+	leaves := make(map[string]string)
+	if result == nil {
+		return leaves
+	}
+	for ip, fingerprint := range endpointFingerprintSet(result.EndpointProbes) {
+		leaves[ip] = fingerprint
+	}
+	if result.Cert != nil && result.ConnectionInfo != nil {
+		ip := strings.TrimSpace(result.ConnectionInfo.IPAddress)
+		if ip != "" && result.Cert.Fingerprint != "" {
+			if _, exists := leaves[ip]; !exists {
+				leaves[ip] = result.Cert.Fingerprint
+			}
+		}
+	}
+	return leaves
+}
+
+// sameIPReplacements counts only overlapping addresses whose leaf changed.
+// A new IP has no previous leaf, so it is not a replacement. A retired IP is
+// a topology event, not a certificate replacement.
+func sameIPReplacements(previous map[string]models.EndpointState, current map[string]string) []sameIPReplacement {
+	if len(previous) == 0 || len(current) == 0 {
+		return nil
+	}
+	var replacements []sameIPReplacement
+	for ip, nowLeaf := range current {
+		ip = strings.TrimSpace(ip)
+		nowLeaf = strings.TrimSpace(nowLeaf)
+		if ip == "" || nowLeaf == "" {
+			continue
+		}
+		state, ok := previous[ip]
+		if !ok {
+			continue
+		}
+		was := strings.TrimSpace(state.Fingerprint)
+		if was == "" || was == nowLeaf {
+			continue
+		}
+		replacements = append(replacements, sameIPReplacement{IP: ip, Previous: was, Current: nowLeaf})
+	}
+	sort.Slice(replacements, func(i, j int) bool { return replacements[i].IP < replacements[j].IP })
+	return replacements
+}
+
+func classifyCertificateChange(result *models.ScanResult, previousFingerprint, currentFingerprint, previousIP, currentIP string) string {
+	if previousFingerprint == "" || currentFingerprint == "" || previousFingerprint == currentFingerprint {
+		return models.ChangeClassUnknown
+	}
+	sawPrevious, sawCurrent := false, false
+	for _, probe := range result.EndpointProbes {
+		if !probe.Success || probe.Fingerprint == "" {
+			continue
+		}
+		if probe.Fingerprint == previousFingerprint {
+			sawPrevious = true
+		}
+		if probe.Fingerprint == currentFingerprint {
+			sawCurrent = true
+		}
+	}
+	if sawPrevious && sawCurrent {
+		return models.ChangeClassCoexisting
+	}
+	if previousIP == "" || currentIP == "" {
+		return models.ChangeClassUnknown
+	}
+	if previousIP == currentIP {
+		return models.ChangeClassReplacement
+	}
+	return models.ChangeClassEndpointSampling
 }
 
 func measurementTrigger(result *models.ScanResult, certificateChanged, topologyChanged bool) string {
@@ -755,54 +878,54 @@ func endpointFingerprintSetFromSnapshot(snapshot models.MeasurementSnapshot) map
 	return result
 }
 
+// endpointMapChanged reports whether the provider-to-certificate assignment
+// moved between two rounds.
+//
+// Address identity is deliberately not the unit of comparison. A CDN hands out
+// a different edge address on nearly every query, so comparing addresses
+// reports a transition every round and makes a steady state indistinguishable
+// from a rollout. What has to move for this to be a deployment transition is
+// which provider network serves which certificate, or a provider entering or
+// leaving the answer entirely.
 func endpointMapChanged(before, after map[string]string) bool {
-	// A newly sampled or retired address is itself a deployment/topology
-	// transition. Certificate equality on the intersection must not hide an
-	// edge being added or removed from the observable set.
-	if len(before) != len(after) {
-		return true
+	beforeSignature := models.ProviderAssignmentSignature(before)
+	afterSignature := models.ProviderAssignmentSignature(after)
+	if beforeSignature == "" || afterSignature == "" {
+		return len(before) != len(after)
 	}
-	for ip, fp := range before {
-		if _, ok := after[ip]; !ok {
-			return true
-		}
-		if current, ok := after[ip]; ok && current != fp {
-			return true
-		}
-	}
-	for ip, fp := range after {
-		if _, ok := before[ip]; !ok {
-			return true
-		}
-		if beforeFP, ok := before[ip]; ok && beforeFP != fp {
-			return true
-		}
-	}
-	return false
+	return beforeSignature != afterSignature
 }
 
+// stableEndpointDiversity reports whether the current per-endpoint certificate
+// assignment has already been seen in enough earlier rounds to be the
+// deployment's steady state rather than a transition.
+//
+// The comparison is by provider network allocation, not by exact address. A CDN
+// answers from a different edge address on nearly every query, so an
+// address-keyed comparison never matches twice and a permanently stable
+// arrangement looks like a fresh transition every round. Grouping by allocation
+// keeps what is actually stable — which provider serves which certificate — and
+// discards the part that rotates by design.
 func stableEndpointDiversity(previous []models.MeasurementSnapshot, current map[string]string, needed int) bool {
 	if len(current) < 2 || needed <= 0 {
+		return false
+	}
+	signature := models.ProviderAssignmentSignature(current)
+	if signature == "" {
 		return false
 	}
 	matched := 0
 	for _, snapshot := range previous {
 		before := endpointFingerprintSetFromSnapshot(snapshot)
-		if len(before) < 2 || len(before) != len(current) {
+		if len(before) < 2 {
 			continue
 		}
-		equal := true
-		for ip, fp := range current {
-			if before[ip] != fp {
-				equal = false
-				break
-			}
+		if models.ProviderAssignmentSignature(before) != signature {
+			continue
 		}
-		if equal {
-			matched++
-			if matched >= needed {
-				return true
-			}
+		matched++
+		if matched >= needed {
+			return true
 		}
 	}
 	return false
@@ -828,7 +951,19 @@ func (s *Scheduler) recordMeasurement(dc *models.DomainCertificate, result *mode
 	}
 	if result.Cert != nil && result.ConnectionInfo != nil && result.ConnectionInfo.IPAddress != "" {
 		if _, exists := seenIPs[result.ConnectionInfo.IPAddress]; !exists {
-			endpoints = append(endpoints, models.EndpointProbe{IPAddress: result.ConnectionInfo.IPAddress, Success: true, Fingerprint: result.Cert.Fingerprint, SPKIFingerprint: result.Cert.SPKIFingerprint, IssuerCN: result.Cert.IssuerCN, CommonName: result.Cert.CommonName})
+			endpoints = append(endpoints, models.EndpointProbe{
+				IPAddress:       result.ConnectionInfo.IPAddress,
+				Success:         true,
+				Fingerprint:     result.Cert.Fingerprint,
+				SPKIFingerprint: result.Cert.SPKIFingerprint,
+				IssuerCN:        result.Cert.IssuerCN,
+				CommonName:      result.Cert.CommonName,
+				SerialNumber:    result.Cert.SerialNumber,
+				SANs:            models.ParseSANs(result.Cert.SANs),
+				KeyAlgorithm:    result.Cert.KeyAlgorithm,
+				KeySize:         result.Cert.KeySize,
+				SANsHash:        models.SANSetHash(models.ParseSANs(result.Cert.SANs)),
+			})
 		}
 	}
 	fingerprintMap := endpointFingerprintSet(endpoints)
@@ -853,8 +988,13 @@ func (s *Scheduler) recordMeasurement(dc *models.DomainCertificate, result *mode
 	if result.DeepEvidence != nil {
 		snapshot.CAAJSON = marshalString(result.DeepEvidence.CAA)
 		snapshot.CTJSON = marshalString(result.DeepEvidence.CT)
+		snapshot.SCTJSON = marshalString(result.DeepEvidence.SCTs)
 		snapshot.HTTPJSON = marshalString(result.DeepEvidence.HTTP)
+		snapshot.DirectoryJSON = marshalString(result.DeepEvidence.Directory)
 		snapshot.ErrorsJSON = marshalString(result.DeepEvidence.Errors)
+	}
+	if strings.TrimSpace(snapshot.SCTJSON) == "" && result.ConnectionInfo != nil && len(result.ConnectionInfo.SCTs) > 0 {
+		snapshot.SCTJSON = marshalString(result.ConnectionInfo.SCTs)
 	}
 	if err := s.db.SaveMeasurementSnapshot(&snapshot); err != nil {
 		log.Printf("scheduler: save measurement snapshot for %s: %v", dc.Domain, err)
@@ -961,6 +1101,10 @@ func (s *Scheduler) newObs(domain string, cert *models.Certificate, obsType, mil
 		EvidencePendingReason: r.EvidencePendingReason,
 		SPKIFingerprint:       cert.SPKIFingerprint,
 		ScanDurationMs:        r.ScanDuration.Milliseconds(),
+		// Tag the row with the rule generation that produced it. Detection rules
+		// have been tightened over time and the analysis layer must not extend
+		// the current rules' guarantees to rows an older rule wrote.
+		DetectorVersion: models.DetectorCurrent,
 	}
 	if r.ConnectionInfo != nil {
 		obs.TLSVersion = r.ConnectionInfo.TLSVersion

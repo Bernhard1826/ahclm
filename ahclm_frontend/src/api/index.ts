@@ -1,7 +1,6 @@
 import axios, { AxiosError } from 'axios';
 import type {
   APIResponse,
-  CostBreakdown,
   PaginatedResponse,
   Anomaly,
   CertObservation,
@@ -22,6 +21,7 @@ import type {
   TrancoList,
   RuntimeConfig,
   CauseDiagnosis,
+  EvidenceCase,
   MeasurementSnapshot,
 } from '@/types';
 
@@ -98,19 +98,19 @@ export const getExpiredCertificates = () =>
 export const getRevocations = () =>
   api.get<APIResponse<{ count: number; domains: DomainView[] }>>('/revocations').then((r) => r.data);
 
-export const getAnomalies = (limit = 100, includeCost = false) =>
+export const getAnomalies = (limit = 100, page = 1) =>
   api
-    .get<APIResponse<{ count: number; anomalies: Anomaly[] }>>(`/analysis/anomalies?${qs({ limit, include_cost: includeCost ? 'true' : undefined })}`)
+    .get<APIResponse<{ count: number; page?: number; per_page?: number; total_pages?: number; anomalies: Anomaly[] }>>(`/analysis/anomalies?${qs({ per_page: limit, page })}`)
     .then((r) => r.data);
 
-export const getAnomalyCost = (domain: string) =>
+export const getDiagnosis = (domain: string, type?: string) =>
   api
-    .get<APIResponse<{ domain: string; cost?: CostBreakdown }>>(`/analysis/anomalies/cost?${qs({ domain })}`)
+    .get<APIResponse<{ domain: string; type?: string; diagnosis: CauseDiagnosis }>>(`/analysis/diagnosis?${qs({ domain, type })}`)
     .then((r) => r.data);
 
-export const getDiagnosis = (domain: string) =>
+export const getAnomalyEvidence = (domain: string, type?: string) =>
   api
-    .get<APIResponse<{ domain: string; diagnosis: CauseDiagnosis }>>(`/analysis/diagnosis?${qs({ domain })}`)
+    .get<APIResponse<{ domain: string; type?: string; diagnosis: CauseDiagnosis; investigation?: CauseDiagnosis['investigation']; evidence_case?: EvidenceCase; measurements: MeasurementSnapshot[] }>>(`/analysis/evidence?${qs({ domain, type })}`)
     .then((r) => r.data);
 
 export const getPatterns = () =>

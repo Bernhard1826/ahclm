@@ -31,51 +31,6 @@ export interface ChainEntry {
   is_ca: boolean;
 }
 
-export interface CostLineItem {
-  lower?: number;
-  upper?: number;
-  interval_kind?: string;
-	method?: string;
-	probability?: number;
-	sample_count?: number;
-  code: string;
-  label: string;
-  amount: number;
-  basis: string;
-  evidence?: string[];
-}
-
-export interface CostBreakdown {
-  method_version?: string;
-  delta_lower?: number;
-  delta_upper?: number;
-  delta_basis?: string;
-  observation_runs?: {condition: string; first_observed: string; last_observed: string; first_clear?: string; left_truncated: boolean; right_censored: boolean; evidence_gap: boolean}[];
-  wait_lower?: number;
-  wait_upper?: number;
-  rotate_lower?: number;
-  rotate_upper?: number;
-  comparison?: string;
-  sensitivity?: string[];
-  validation?: { samples: number; brier_score: number; baseline_brier: number; persistence_brier: number; failure_count: number; basis: string };
-  applicable: boolean;
-  scope: string;
-  basis: string;
-  currency: string;
-  issue_types?: string[];
-  evidence_status: string;
-  confidence: string;
-  wait_horizon_hours: number;
-  next_measurement_at?: string;
-  wait_cost: number;
-  rotate_cost: number;
-  decision: 'wait' | 'issue' | 'remeasure' | 'not_applicable' | string;
-  hard_constraint: boolean;
-  unknowns?: string[];
-  wait_items?: CostLineItem[];
-  rotate_items?: CostLineItem[];
-}
-
 export interface DomainCertificate {
   id: number;
   domain: string;
@@ -239,7 +194,7 @@ export interface Anomaly {
   last_observed_at?: string;
   detected_at: string;
   diagnosis?: CauseDiagnosis;
-  cost?: CostBreakdown;
+  finding_class?: 'incident' | 'expected' | 'insufficient' | string;
 }
 
 export interface CauseHypothesis {
@@ -252,6 +207,149 @@ export interface CauseHypothesis {
   contradictions?: string[];
 }
 
+export interface ChurnShape {
+  change_events: number;
+  distinct_leaves: number;
+  distinct_spkis: number;
+  revisit_events: number;
+  revisit_ratio: number;
+  alternation_events: number;
+  coexistence_proofs: number;
+  same_endpoint_changes: number;
+  cross_endpoint_changes: number;
+  unknown_endpoint_changes: number;
+  effective_replacements: number;
+  mean_interval_hours: number;
+  cadence_regularity: number;
+  median_validity_days: number;
+  observed_span_days: number;
+  replacements_per_validity_period: number;
+  median_remaining_days?: number;
+  remaining_spread_days?: number;
+  median_issuance_age_days?: number;
+  distinct_issuance_days?: number;
+  issuance_cadence_days?: number;
+  same_issuer_fraction?: number;
+  same_name_fraction?: number;
+  issuance_monotone?: boolean;
+  recovered_endpoint_changes?: number;
+  interpretation: string;
+}
+export interface EndpointDivergence {
+  endpoints_probed: number;
+  endpoints_answered: number;
+  distinct_leaves: number;
+  distinct_issuers: number;
+  distinct_key_algorithms: number;
+  distinct_san_sets: number;
+  network_groups: number;
+  clean_partition: boolean;
+  intra_group_conflicts: number;
+  dual_certificate_split: boolean;
+  functionally_equivalent: boolean;
+  defective_endpoints?: string[];
+  predecessor_endpoints?: string[];
+  residue_hours: number;
+  stable_rounds: number;
+  consecutive_predecessor_rounds: number;
+  predecessor_span_hours: number;
+  resolver_consistent_rounds: number;
+  active_endpoint_coverage: number;
+  active_predecessor_endpoints?: string[];
+  retired_predecessor_endpoints?: string[];
+  strong_evidence: boolean;
+  missing_evidence?: string[];
+  reversal_conditions?: string[];
+  cdn?: CDNEvidence | null;
+  verdict: string;
+}
+
+export interface CDNEvidence {
+  completeness: string;
+  method?: string;
+  hostname_vendors?: string[];
+  cname_vendors?: string[];
+  https_vendors?: string[];
+  http_vendors?: string[];
+  endpoint_vendors?: Record<string, string>;
+  distinct_vendors: number;
+  identified_endpoints: number;
+  unidentified_endpoints?: string[];
+  vendor_conflicts: number;
+  clean_vendor_split: boolean;
+  sources?: string[];
+  note?: string;
+}
+export interface EvidenceEndpoint {
+  ip_address: string;
+  provider_group?: string;
+  fingerprint?: string;
+  spki_fingerprint?: string;
+  issuer_cn?: string;
+  key_algorithm?: string;
+  sans_hash?: string;
+  success: boolean;
+  active_dns: boolean;
+  error?: string;
+}
+export interface EvidenceRound {
+  observed_at: string;
+  trigger?: string;
+  resolver_quorum: number;
+  resolver_agreement: number;
+  endpoint_coverage: number;
+  consensus_ips?: string[];
+  topology_changed: boolean;
+  endpoints: EvidenceEndpoint[];
+}
+export interface EvidenceCase {
+  domain: string;
+  anomaly_type: string;
+  status: string;
+  generated_at: string;
+  confidence_ceiling: string;
+  rounds: EvidenceRound[];
+  supporting_evidence: string[];
+  contradictions: string[];
+  missing_evidence: string[];
+  reversal_conditions: string[];
+}
+export interface EvidenceProvenance {
+  total_events: number;
+  current_rule_events: number;
+  legacy_rule_events: number;
+  current_rule_share: number;
+  legacy_dominated: boolean;
+}
+export interface EvidenceCorroboration {
+  ct_coverage: number;
+  ct_entries: number;
+  ct_issuance_events: number;
+  ct_status: string;
+  ct_note?: string;
+  sct_presented?: boolean;
+  sct_count?: number;
+  sct_log_count?: number;
+  sct_qualified_logs?: number;
+  sct_apple_logs?: number;
+  sct_inclusion_proofs?: number;
+  sct_note?: string;
+  caa_coverage: number;
+  caa_status?: string;
+  caa_note?: string;
+  http_coverage: number;
+  endpoint_coverage: number;
+  resolver_agreement: number;
+  directory_coverage?: number;
+  directory_status?: string;
+  directory_note?: string;
+  ns_coverage?: number;
+  ns_rdap_agreement?: string;
+  dnssec_validated?: boolean;
+  dnssec_note?: string;
+  timing_note?: string;
+  confidence_ceiling: string;
+}
 export interface CauseDiagnosis {
   primary_code: string;
   primary_label: string;
@@ -262,7 +360,98 @@ export interface CauseDiagnosis {
   measurement_plan?: string[];
   measured_rounds: number;
   transition_rounds: number;
+  churn_shape?: ChurnShape | null;
+  endpoint_divergence?: EndpointDivergence | null;
+  provenance?: EvidenceProvenance | null;
+  corroboration?: EvidenceCorroboration | null;
+  benign_explanation?: string;
+  evidence_case?: EvidenceCase | null;
+  investigation?: Investigation | null;
+  cause_status?: string;
 }
+
+export interface InvestigationRuledOut {
+  label: string;
+  reason: string;
+}
+
+export interface InvestigationProofStep {
+  kind: 'proven' | 'inferred' | string;
+  label: string;
+  claim: string;
+  evidence?: string[];
+  basis?: string;
+}
+
+export interface EndpointExhibit {
+  ip_address: string;
+  active_dns: boolean;
+  success: boolean;
+  fingerprint?: string;
+  spki_fingerprint?: string;
+  issuer_cn?: string;
+  key_algorithm?: string;
+  error?: string;
+}
+
+export interface ProviderExhibit {
+  group: string;
+  vendor?: string;
+  conflict: boolean;
+  leaf_count: number;
+  endpoints: EndpointExhibit[];
+}
+
+export interface ChangeExhibit {
+  observed_at: string;
+  previous_fingerprint?: string;
+  fingerprint?: string;
+  previous_ip?: string;
+  ip_address?: string;
+  endpoint_relation: string;
+  coexisting: boolean;
+  change_class?: string;
+  days_until_expiry?: number;
+  previous_spki_fingerprint?: string;
+  spki_fingerprint?: string;
+}
+
+export interface CertificateExhibit {
+  fingerprint: string;
+  spki_fingerprint?: string;
+  serial_number?: string;
+  issuer_cn?: string;
+  common_name?: string;
+  sans?: string[];
+  key_algorithm?: string;
+  validity_days?: number;
+  not_before?: string;
+  not_after?: string;
+}
+
+export interface Investigation {
+  finding_class: 'incident' | 'expected' | 'insufficient' | string;
+  problem: string;
+  why_this_is_a_problem?: string;
+  cause: string;
+  cause_label: string;
+  cause_code?: string;
+  cause_status?: string;
+  confidence: string;
+  why_this_cause?: string[];
+  ruled_out?: InvestigationRuledOut[];
+  facts?: string[];
+  missing_evidence?: string[];
+  reversal_conditions?: string[];
+  proof_kind?: 'proven' | 'mixed' | 'inferred' | 'unestablished' | string;
+  proof?: InvestigationProofStep[];
+  inference?: InvestigationProofStep[];
+  provider_groups?: ProviderExhibit[];
+  change_sequence?: ChangeExhibit[];
+  certificates?: CertificateExhibit[];
+  cdn?: CDNEvidence | null;
+}
+
 
 export interface EndpointProbe {
   ip_address: string;
@@ -427,9 +616,8 @@ export interface SchedulerStatus {
 export interface RuntimeConfig {
   server: { host: string; port: number; cors: boolean; cors_origins: string[] };
   database: { host: string; port: number; database: string; sslmode: string; max_open_connections: number; max_idle_connections: number; conn_max_lifetime: string };
-  scanner: { tls_port: number; timeout: string; workers: number; rate_limit: number; check_revocation: boolean; check_crl: boolean; check_ari: boolean; dns_resolvers?: string[]; max_endpoint_samples?: number; endpoint_probe_concurrency?: number; check_caa?: boolean; check_ct?: boolean; ct_endpoint?: string; check_http_fingerprint?: boolean };
+  scanner: { tls_port: number; timeout: string; workers: number; rate_limit: number; check_revocation: boolean; check_crl: boolean; check_ari: boolean; dns_resolvers?: string[]; max_endpoint_samples?: number; endpoint_probe_concurrency?: number; check_caa?: boolean; check_ct?: boolean; ct_endpoint?: string; check_http_fingerprint?: boolean; check_rdap?: boolean; rdap_endpoint?: string; check_asn?: boolean; check_ripestat?: boolean; check_official_prefixes?: boolean; check_chrome_log_list?: boolean; check_apple_log_list?: boolean; check_sct_inclusion?: boolean; check_certspotter?: boolean; official_cdn_prefixes?: number; chrome_ct_logs?: number; apple_ct_logs?: number };
   scheduler: { enabled: boolean; milestones: number[]; post_expiry_checks: number[]; baseline_interval: string; near_expiry_interval: string; min_gap: string; ari_poll_interval: string; revocation_poll_interval: string; max_daily_scans: number };
-  cost: { currency: string; issuance_cost: number; ct_per_certificate_cost: number; deployment_cost: number; verification_cost: number; active_measurement_cost: number; manual_review_cost: number; retry_cost: number; rollback_cost: number; revoked_service_per_hour: number; residual_exposure_per_hour: number; expired_service_per_hour: number; partial_deployment_per_hour: number; stale_certificate_per_hour: number; unreachable_service_per_hour: number; expiry_incident_cost: number };
   tranco: { enabled: boolean; source_url: string; max_domains: number; refresh_interval: string; fetch_on_start: boolean };
   local_lists: { enabled: boolean; refresh_interval: string; fetch_on_start: boolean; sources: { name: string; path: string; format: string; max_domains: number }[] };
 }

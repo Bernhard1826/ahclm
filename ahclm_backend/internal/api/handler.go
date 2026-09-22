@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
-	"ahclm/internal/cost"
 	"ahclm/internal/database"
 	"ahclm/internal/models"
 	"ahclm/internal/scanner"
@@ -72,8 +72,8 @@ func (h *Handler) SetupRouter() *gin.Engine {
 		// Revocation & analysis
 		api.GET("/revocations", h.revocations)
 		api.GET("/analysis/anomalies", h.anomalies)
-		api.GET("/analysis/anomalies/cost", h.anomalyCost)
 		api.GET("/analysis/diagnosis", h.diagnosis)
+		api.GET("/analysis/evidence", h.evidence)
 		api.GET("/analysis/patterns", h.patterns)
 
 		// Scanning
@@ -141,9 +141,8 @@ func (h *Handler) runtimeConfig(c *gin.Context) {
 	h.ok(c, gin.H{
 		"server":      gin.H{"host": cfg.Server.Host, "port": cfg.Server.Port, "cors": cfg.Server.CORS, "cors_origins": cfg.Server.CORSOrigins},
 		"database":    gin.H{"host": cfg.Database.Host, "port": cfg.Database.Port, "database": cfg.Database.Database, "sslmode": cfg.Database.SSLMode, "max_open_connections": cfg.Database.MaxOpenConnections, "max_idle_connections": cfg.Database.MaxIdleConnections, "conn_max_lifetime": cfg.Database.ConnMaxLifetime.String()},
-		"scanner":     gin.H{"tls_port": cfg.Scanner.TLSPort, "timeout": cfg.Scanner.Timeout.String(), "workers": cfg.Scanner.Workers, "rate_limit": cfg.Scanner.RateLimit, "check_revocation": cfg.Scanner.CheckRevocation, "check_crl": cfg.Scanner.CheckCRL, "check_ari": cfg.Scanner.CheckARI, "dns_resolvers": cfg.Scanner.DNSResolvers, "max_endpoint_samples": cfg.Scanner.MaxEndpointSamples, "endpoint_probe_concurrency": cfg.Scanner.EndpointProbeConcurrency, "check_caa": cfg.Scanner.CheckCAA, "check_ct": cfg.Scanner.CheckCT, "ct_endpoint": cfg.Scanner.CTEndpoint, "check_http_fingerprint": cfg.Scanner.CheckHTTPFingerprint},
+		"scanner":     gin.H{"tls_port": cfg.Scanner.TLSPort, "timeout": cfg.Scanner.Timeout.String(), "workers": cfg.Scanner.Workers, "rate_limit": cfg.Scanner.RateLimit, "check_revocation": cfg.Scanner.CheckRevocation, "check_crl": cfg.Scanner.CheckCRL, "check_ari": cfg.Scanner.CheckARI, "dns_resolvers": cfg.Scanner.DNSResolvers, "max_endpoint_samples": cfg.Scanner.MaxEndpointSamples, "endpoint_probe_concurrency": cfg.Scanner.EndpointProbeConcurrency, "check_caa": cfg.Scanner.CheckCAA, "check_ct": cfg.Scanner.CheckCT, "ct_endpoint": cfg.Scanner.CTEndpoint, "check_http_fingerprint": cfg.Scanner.CheckHTTPFingerprint, "check_rdap": cfg.Scanner.CheckRDAP, "rdap_endpoint": cfg.Scanner.RDAPEndpoint, "check_asn": cfg.Scanner.CheckASN, "check_ripestat": cfg.Scanner.CheckRIPEstat, "check_official_prefixes": cfg.Scanner.CheckOfficialPrefixes, "check_chrome_log_list": cfg.Scanner.CheckChromeLogList, "check_apple_log_list": cfg.Scanner.CheckAppleLogList, "check_sct_inclusion": cfg.Scanner.CheckSCTInclusion, "check_certspotter": cfg.Scanner.CheckCertSpotter, "official_cdn_prefixes": models.DatasetPrefixCount(), "chrome_ct_logs": models.DatasetLogListCount("chrome"), "apple_ct_logs": models.DatasetLogListCount("apple")},
 		"scheduler":   gin.H{"enabled": cfg.Scheduler.Enabled, "milestones": cfg.Scheduler.Milestones, "post_expiry_checks": cfg.Scheduler.PostExpiryChecks, "baseline_interval": cfg.Scheduler.BaselineInterval.String(), "near_expiry_interval": cfg.Scheduler.NearExpiryInterval.String(), "min_gap": cfg.Scheduler.MinGap.String(), "ari_poll_interval": cfg.Scheduler.ARIPollInterval.String(), "revocation_poll_interval": cfg.Scheduler.RevocationPollInterval.String(), "max_daily_scans": cfg.Scheduler.MaxDailyScans},
-		"cost":        gin.H{"currency": cfg.Cost.Currency, "issuance_cost": cfg.Cost.IssuanceCost, "ct_per_certificate_cost": cfg.Cost.CTPerCertificateCost, "deployment_cost": cfg.Cost.DeploymentCost, "verification_cost": cfg.Cost.VerificationCost, "active_measurement_cost": cfg.Cost.ActiveMeasurementCost, "manual_review_cost": cfg.Cost.ManualReviewCost, "retry_cost": cfg.Cost.RetryCost, "rollback_cost": cfg.Cost.RollbackCost, "revoked_service_per_hour": cfg.Cost.RevokedServicePerHour, "residual_exposure_per_hour": cfg.Cost.ResidualExposurePerHour, "expired_service_per_hour": cfg.Cost.ExpiredServicePerHour, "partial_deployment_per_hour": cfg.Cost.PartialDeploymentPerHour, "stale_certificate_per_hour": cfg.Cost.StaleCertificatePerHour, "unreachable_service_per_hour": cfg.Cost.UnreachableServicePerHour, "expiry_incident_cost": cfg.Cost.ExpiryIncidentCost},
 		"tranco":      gin.H{"enabled": cfg.Tranco.Enabled, "source_url": cfg.Tranco.SourceURL, "max_domains": cfg.Tranco.MaxDomains, "refresh_interval": cfg.Tranco.RefreshInterval.String(), "fetch_on_start": cfg.Tranco.FetchOnStart},
 		"local_lists": gin.H{"enabled": cfg.LocalLists.Enabled, "refresh_interval": cfg.LocalLists.RefreshInterval.String(), "fetch_on_start": cfg.LocalLists.FetchOnStart, "sources": cfg.LocalLists.Sources},
 	})
@@ -270,47 +269,27 @@ func (h *Handler) revocations(c *gin.Context) {
 }
 
 func (h *Handler) anomalies(c *gin.Context) {
-	limit := queryInt(c, "limit", 100)
-	items, err := h.db.GetAnomalies(limit)
+	perPage := queryInt(c, "per_page", 0)
+	if perPage == 0 {
+		// Preserve compatibility with existing clients that send limit while
+		// making the server-side result complete and explicitly paginated.
+		perPage = queryInt(c, "limit", 100)
+	}
+	perPage = clamp(perPage, 1, 500)
+	page := queryInt(c, "page", 1)
+	if page < 1 {
+		page = 1
+	}
+	items, total, err := h.db.GetAnomaliesPage(page, perPage, c.Query("type"), models.GetDomain(c.Query("domain")))
 	if err != nil {
 		h.fail(c, http.StatusInternalServerError, err)
 		return
 	}
-	if c.Query("include_cost") == "true" {
-		if err := h.attachAnomalyCosts(items); err != nil {
-			h.fail(c, http.StatusInternalServerError, err)
-			return
-		}
+	totalPages := 0
+	if total > 0 {
+		totalPages = (total + perPage - 1) / perPage
 	}
-	h.ok(c, gin.H{"count": len(items), "anomalies": items})
-}
-
-// anomalyCost returns the current-certificate cost comparison for one
-// anomaly domain. Cost is intentionally a separate, on-demand request so the
-// anomaly list remains a fast evidence index even when it contains hundreds
-// of historical or low-priority findings.
-func (h *Handler) anomalyCost(c *gin.Context) {
-	domain := models.GetDomain(c.Query("domain"))
-	if domain == "" {
-		h.fail(c, http.StatusBadRequest, fmt.Errorf("domain is required"))
-		return
-	}
-	evidence, err := h.db.GetCostEvidence(domain)
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			h.fail(c, http.StatusNotFound, fmt.Errorf("domain not found"))
-			return
-		}
-		h.fail(c, http.StatusInternalServerError, fmt.Errorf("load cost evidence: %w", err))
-		return
-	}
-	now := time.Now()
-	if !cost.HasMeasuredProblem(*evidence, now) {
-		h.ok(c, gin.H{"domain": domain, "cost": nil})
-		return
-	}
-	breakdown := cost.Calculate(*evidence, h.config.Cost, now)
-	h.ok(c, gin.H{"domain": domain, "cost": breakdown})
+	h.ok(c, gin.H{"count": total, "page": page, "per_page": perPage, "total_pages": totalPages, "anomalies": items})
 }
 
 func (h *Handler) diagnosis(c *gin.Context) {
@@ -319,7 +298,7 @@ func (h *Handler) diagnosis(c *gin.Context) {
 		h.fail(c, http.StatusBadRequest, fmt.Errorf("domain is required"))
 		return
 	}
-	diagnosis, err := h.db.GetDomainDiagnosis(domain)
+	diagnosis, err := h.db.GetDomainDiagnosisFor(domain, c.Query("type"))
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			h.fail(c, http.StatusNotFound, fmt.Errorf("domain not found"))
@@ -328,34 +307,48 @@ func (h *Handler) diagnosis(c *gin.Context) {
 		h.fail(c, http.StatusInternalServerError, fmt.Errorf("load diagnosis: %w", err))
 		return
 	}
-	h.ok(c, gin.H{"domain": domain, "diagnosis": diagnosis})
+	h.ok(c, gin.H{"domain": domain, "type": diagnosisTypeLabel(c.Query("type")), "diagnosis": diagnosis})
 }
 
-// attachAnomalyCosts adds one current-certificate cost comparison per anomaly
-// domain. The domain guard prevents repeated anomaly types for the same domain
-// from triggering repeated evidence queries or duplicated calculations. Only the
-// first anomaly row for a domain carries the result; the frontend promotes it
-// to the domain-level cost section instead of repeating a card per finding.
-func (h *Handler) attachAnomalyCosts(items []models.Anomaly) error {
-	now := time.Now()
-	loaded := make(map[string]bool)
-	for i := range items {
-		domain := items[i].Domain
-		if loaded[domain] {
-			continue
-		}
-		loaded[domain] = true
-		evidence, err := h.db.GetCostEvidence(domain)
-		if err != nil {
-			return fmt.Errorf("load cost evidence for %s: %w", domain, err)
-		}
-		if !cost.HasMeasuredProblem(*evidence, now) {
-			continue
-		}
-		breakdown := cost.Calculate(*evidence, h.config.Cost, now)
-		items[i].Cost = &breakdown
+// evidence returns the complete bounded evidence chain for one domain and
+// finding type. The anomaly index carries a compact diagnosis; this endpoint
+// is the on-demand round-by-round view used by the inspector.
+func (h *Handler) evidence(c *gin.Context) {
+	domain := models.GetDomain(c.Query("domain"))
+	if domain == "" {
+		h.fail(c, http.StatusBadRequest, fmt.Errorf("domain is required"))
+		return
 	}
-	return nil
+	findingType := c.Query("type")
+	diagnosis, err := h.db.GetDomainDiagnosisFor(domain, findingType)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			h.fail(c, http.StatusNotFound, fmt.Errorf("domain not found"))
+			return
+		}
+		h.fail(c, http.StatusInternalServerError, fmt.Errorf("load evidence: %w", err))
+		return
+	}
+	measurements, err := h.db.GetMeasurementSnapshots(domain, 2000)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		h.fail(c, http.StatusInternalServerError, fmt.Errorf("load measurement evidence: %w", err))
+		return
+	}
+	h.ok(c, gin.H{
+		"domain":        domain,
+		"type":          diagnosisTypeLabel(findingType),
+		"diagnosis":     diagnosis,
+		"investigation": diagnosis.Investigation,
+		"evidence_case": diagnosis.EvidenceCase,
+		"measurements":  measurements,
+	})
+}
+
+func diagnosisTypeLabel(requested string) string {
+	if strings.TrimSpace(requested) == "" {
+		return ""
+	}
+	return requested
 }
 
 func (h *Handler) patterns(c *gin.Context) {

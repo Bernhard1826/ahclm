@@ -14,6 +14,7 @@ import (
 	"math"
 	"net"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 )
@@ -41,6 +42,38 @@ const (
 	ObsStaleAfterChange  = "stale_after_change" // same valid leaf remained after DNS/IP change (proxy)
 	ObsResidual          = "residual"           // revoked predecessor observed after CA revocation
 	ObsDeploymentFailure = "deployment_failure" // authorized/multi-endpoint deployment failure evidence
+)
+
+// DetectorVersion tags every observation with the detection-rule generation
+// that produced it. Rows written before this field existed are backfilled to
+// DetectorLegacy. Detection rules have been tightened over time, so a finding
+// that aggregates legacy rows cannot claim the same confidence as one built
+// from current-rule rows; the diagnosis layer reads this tag to say so.
+const (
+	DetectorLegacy  = "v1"
+	DetectorCurrent = "v2"
+)
+
+// ChangeClass records what a "the certificate changed" observation actually
+// proves. A fingerprint difference between two consecutive scans is only a
+// replacement in time when both samples came from the same endpoint and the
+// predecessor is no longer being served anywhere. Otherwise the difference is
+// a property of *which server answered*, not of the deployment's history.
+const (
+	// ChangeClassReplacement: the same endpoint served a different leaf than it
+	// did before, and the predecessor was not observed concurrently.
+	ChangeClassReplacement = "replacement"
+	// ChangeClassCoexisting: the same measurement round observed the predecessor
+	// and the successor simultaneously on different endpoints. This is direct
+	// proof that the two certificates are deployed concurrently, so the event is
+	// not a replacement at all.
+	ChangeClassCoexisting = "coexisting_leaf"
+	// ChangeClassEndpointSampling: the leaf differs but the observation came
+	// from a different address than the previous one, and no concurrent proof is
+	// available. The difference may be temporal or spatial; it is undetermined.
+	ChangeClassEndpointSampling = "endpoint_sampling"
+	// ChangeClassUnknown: no endpoint identity was retained for the comparison.
+	ChangeClassUnknown = "unknown"
 )
 
 // Domain deployment status.
@@ -145,32 +178,36 @@ type Certificate struct {
 // lifecycle & scheduling metadata. One small row per domain; NextScanAt is the
 // heart of the adaptive scheduler.
 type DomainCertificate struct {
-	TLSFindings               string     `json:"tls_findings,omitempty" gorm:"type:text"`
-	TLSCheckedAt              *time.Time `json:"tls_checked_at,omitempty"`
-	ID                        uint       `json:"id" gorm:"primaryKey"`
-	Domain                    string     `json:"domain" gorm:"uniqueIndex;size:255"`
-	TrancoRank                int        `json:"tranco_rank" gorm:"index"`
-	LocalListMember           bool       `json:"local_list_member" gorm:"index;default:false"`
-	CurrentCertificateID      uint       `json:"current_certificate_id" gorm:"index"`
-	CurrentFingerprint        string     `json:"current_fingerprint" gorm:"index;size:64"`
-	Status                    string     `json:"status" gorm:"index"`            // active, unreachable; dormant is legacy only
-	RevocationStatus          string     `json:"revocation_status" gorm:"index"` // good, revoked, unknown, not_checked
-	RevocationCheckedVia      string     `json:"revocation_checked_via"`
-	RevokedAt                 *time.Time `json:"revoked_at,omitempty"`
-	RevocationReason          string     `json:"revocation_reason,omitempty"`
-	RevocationCheckedAt       *time.Time `json:"revocation_checked_at,omitempty"`
-	RevocationNextCheckAt     *time.Time `json:"revocation_next_check_at,omitempty" gorm:"index"`
-	OCSPCheckedAt             *time.Time `json:"ocsp_checked_at,omitempty"`
-	EvidenceStatus            string     `json:"evidence_status" gorm:"index"`
-	EvidencePendingReason     string     `json:"evidence_pending_reason,omitempty" gorm:"type:text"`
-	EvidenceCheckedAt         *time.Time `json:"evidence_checked_at,omitempty"`
-	FirstSeenAt               time.Time  `json:"first_seen_at"`
-	LastScannedAt             time.Time  `json:"last_scanned_at" gorm:"index"`
-	LastChangedAt             *time.Time `json:"last_changed_at,omitempty"`
-	LastDaysUntilExpiry       int        `json:"last_days_until_expiry"`
-	NextScanAt                time.Time  `json:"next_scan_at" gorm:"index"`
-	Priority                  int        `json:"priority" gorm:"index"`
-	ScanCount                 int        `json:"scan_count"`
+	TLSFindings           string     `json:"tls_findings,omitempty" gorm:"type:text"`
+	TLSCheckedAt          *time.Time `json:"tls_checked_at,omitempty"`
+	ID                    uint       `json:"id" gorm:"primaryKey"`
+	Domain                string     `json:"domain" gorm:"uniqueIndex;size:255"`
+	TrancoRank            int        `json:"tranco_rank" gorm:"index"`
+	LocalListMember       bool       `json:"local_list_member" gorm:"index;default:false"`
+	CurrentCertificateID  uint       `json:"current_certificate_id" gorm:"index"`
+	CurrentFingerprint    string     `json:"current_fingerprint" gorm:"index;size:64"`
+	Status                string     `json:"status" gorm:"index"`            // active, unreachable; dormant is legacy only
+	RevocationStatus      string     `json:"revocation_status" gorm:"index"` // good, revoked, unknown, not_checked
+	RevocationCheckedVia  string     `json:"revocation_checked_via"`
+	RevokedAt             *time.Time `json:"revoked_at,omitempty"`
+	RevocationReason      string     `json:"revocation_reason,omitempty"`
+	RevocationCheckedAt   *time.Time `json:"revocation_checked_at,omitempty"`
+	RevocationNextCheckAt *time.Time `json:"revocation_next_check_at,omitempty" gorm:"index"`
+	OCSPCheckedAt         *time.Time `json:"ocsp_checked_at,omitempty"`
+	EvidenceStatus        string     `json:"evidence_status" gorm:"index"`
+	EvidencePendingReason string     `json:"evidence_pending_reason,omitempty" gorm:"type:text"`
+	EvidenceCheckedAt     *time.Time `json:"evidence_checked_at,omitempty"`
+	FirstSeenAt           time.Time  `json:"first_seen_at"`
+	LastScannedAt         time.Time  `json:"last_scanned_at" gorm:"index"`
+	LastChangedAt         *time.Time `json:"last_changed_at,omitempty"`
+	LastDaysUntilExpiry   int        `json:"last_days_until_expiry"`
+	NextScanAt            time.Time  `json:"next_scan_at" gorm:"index"`
+	Priority              int        `json:"priority" gorm:"index"`
+	ScanCount             int        `json:"scan_count"`
+	// ChangeCount is the number of same-IP leaf replacements, not the number of
+	// times the domain-level current fingerprint differed. A new address, a
+	// retired address, or two live addresses serving different leaves does not
+	// increment this counter.
 	ChangeCount               int        `json:"change_count"`
 	ConsecutiveFailures       int        `json:"consecutive_failures"`
 	LastError                 string     `json:"last_error,omitempty"`
@@ -185,14 +222,20 @@ type DomainCertificate struct {
 	EndpointStates            string     `json:"endpoint_states,omitempty" gorm:"type:text"`
 	EndpointDiversityStatus   string     `json:"endpoint_diversity_status,omitempty" gorm:"index;size:32"`
 	EndpointDiversityRounds   int        `json:"endpoint_diversity_rounds"`
-	LastEndpointProbeAt       *time.Time `json:"last_endpoint_probe_at,omitempty"`
-	LastDeepMeasurementAt     *time.Time `json:"last_deep_measurement_at,omitempty"`
-	ResidualFingerprint       string     `json:"residual_fingerprint,omitempty" gorm:"index;size:64"`
-	ResidualRevokedAt         *time.Time `json:"residual_revoked_at,omitempty"`
-	ResidualFirstSeenAt       *time.Time `json:"residual_first_seen_at,omitempty"`
-	ResidualLastSeenAt        *time.Time `json:"residual_last_seen_at,omitempty"`
-	ResidualNextCheckAt       *time.Time `json:"residual_next_check_at,omitempty" gorm:"index"`
-	ResidualObservationCount  int        `json:"residual_observation_count"`
+	// LastEndpointIP is the address whose handshake produced the currently
+	// recorded certificate. Comparing it with the next scan's address is what
+	// separates "this server now serves a different certificate" from "a
+	// different server answered this time".
+	LastEndpointIP      string     `json:"last_endpoint_ip,omitempty" gorm:"size:64"`
+	LastEndpointProbeAt *time.Time `json:"last_endpoint_probe_at,omitempty"`
+
+	LastDeepMeasurementAt    *time.Time `json:"last_deep_measurement_at,omitempty"`
+	ResidualFingerprint      string     `json:"residual_fingerprint,omitempty" gorm:"index;size:64"`
+	ResidualRevokedAt        *time.Time `json:"residual_revoked_at,omitempty"`
+	ResidualFirstSeenAt      *time.Time `json:"residual_first_seen_at,omitempty"`
+	ResidualLastSeenAt       *time.Time `json:"residual_last_seen_at,omitempty"`
+	ResidualNextCheckAt      *time.Time `json:"residual_next_check_at,omitempty" gorm:"index"`
+	ResidualObservationCount int        `json:"residual_observation_count"`
 
 	// ARI (ACME Renewal Information) — the CA-side recommended renewal window.
 	ARISupported      bool       `json:"ari_supported"`
@@ -244,8 +287,18 @@ type CertObservation struct {
 	ScanDurationMs          int64      `json:"scan_duration_ms"`
 	ARIWindowStart          *time.Time `json:"ari_window_start,omitempty"`
 	ARIWindowEnd            *time.Time `json:"ari_window_end,omitempty"`
-	Notes                   string     `json:"notes,omitempty"`
-	CreatedAt               time.Time  `json:"created_at"`
+	// DetectorVersion is the detection-rule generation that produced this row.
+	DetectorVersion string `json:"detector_version,omitempty" gorm:"index;size:8"`
+	// ChangeClass is set on ObsChange rows and records whether the fingerprint
+	// difference was proven to be a replacement in time, proven to be two
+	// concurrently deployed leaves, or left undetermined by the sampling.
+	ChangeClass string `json:"change_class,omitempty" gorm:"index;size:24"`
+	// PreviousIPAddress is the endpoint that served the predecessor leaf. With
+	// IPAddress it makes the same-endpoint comparison reproducible after the
+	// fact instead of only at detection time.
+	PreviousIPAddress string    `json:"previous_ip_address,omitempty" gorm:"size:64"`
+	Notes             string    `json:"notes,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
 }
 
 // DailyScanStat is one row per day with counters incremented in place, so we
@@ -391,14 +444,15 @@ type ARIInfo struct {
 
 // ConnectionInfo holds TCP/TLS connection metadata.
 type ConnectionInfo struct {
-	Protocol           string   `json:"protocol"`
-	TLSVersion         string   `json:"tls_version"`
-	CipherSuite        string   `json:"cipher_suite"`
-	NegotiatedProtocol string   `json:"negotiated_protocol,omitempty"`
-	ALPN               string   `json:"alpn,omitempty"`
-	ConnectionTime     int64    `json:"connection_time_ms"`
-	IPAddress          string   `json:"ip_address,omitempty"`
-	ResolvedIPs        []string `json:"resolved_ips,omitempty"`
+	Protocol           string           `json:"protocol"`
+	TLSVersion         string           `json:"tls_version"`
+	CipherSuite        string           `json:"cipher_suite"`
+	NegotiatedProtocol string           `json:"negotiated_protocol,omitempty"`
+	ALPN               string           `json:"alpn,omitempty"`
+	ConnectionTime     int64            `json:"connection_time_ms"`
+	IPAddress          string           `json:"ip_address,omitempty"`
+	ResolvedIPs        []string         `json:"resolved_ips,omitempty"`
+	SCTs               []SCTObservation `json:"scts,omitempty"`
 }
 
 // EndpointProbe is a candidate-only direct TLS check against one previously
@@ -415,7 +469,22 @@ type EndpointProbe struct {
 	CipherSuite     string       `json:"cipher_suite,omitempty"`
 	IssuerCN        string       `json:"issuer_cn,omitempty"`
 	CommonName      string       `json:"common_name,omitempty"`
-	NotAfter        *time.Time   `json:"not_after,omitempty"`
+	// KeyAlgorithm and KeySize separate an intentional RSA+ECDSA dual-certificate
+	// deployment from a genuinely inconsistent one: the former serves different
+	// keys for the same names on purpose.
+	KeyAlgorithm string `json:"key_algorithm,omitempty"`
+	KeySize      int    `json:"key_size,omitempty"`
+	// SerialNumber and SANs are the leaf identity fields needed to compare two
+	// certificates that share an issuer and validity window. SANsHash remains
+	// the compact equality check; SANs is the human-readable name set.
+	SerialNumber string   `json:"serial_number,omitempty"`
+	SANs         []string `json:"sans,omitempty"`
+	// SANsHash is a stable digest of the sorted SAN set. Endpoints whose
+	// certificates cover exactly the same names are functionally interchangeable
+	// even when the leaves differ.
+	SANsHash  string     `json:"sans_hash,omitempty"`
+	NotBefore *time.Time `json:"not_before,omitempty"`
+	NotAfter  *time.Time `json:"not_after,omitempty"`
 }
 
 // EndpointState is the per-address longitudinal state used to tell a stable
@@ -449,7 +518,10 @@ type DNSResolverObservation struct {
 	A        []string `json:"a,omitempty"`
 	AAAA     []string `json:"aaaa,omitempty"`
 	CNAME    []string `json:"cname,omitempty"`
+	HTTPS    []string `json:"https,omitempty"`
+	NS       []string `json:"ns,omitempty"`
 	TTL      int      `json:"ttl,omitempty"`
+	DNSSEC   bool     `json:"dnssec,omitempty"`
 	Success  bool     `json:"success"`
 	Error    string   `json:"error,omitempty"`
 }
@@ -459,8 +531,11 @@ type TopologySnapshot struct {
 	PublicIPs         []string                 `json:"public_ips,omitempty"`
 	ConsensusIPs      []string                 `json:"consensus_ips,omitempty"`
 	CNAMEChain        []string                 `json:"cname_chain,omitempty"`
+	HTTPSTargets      []string                 `json:"https_targets,omitempty"`
+	NSHosts           []string                 `json:"ns_hosts,omitempty"`
 	ResolverQuorum    int                      `json:"resolver_quorum"`
 	ResolverAgreement float64                  `json:"resolver_agreement"`
+	DNSSECValidated   int                      `json:"dnssec_validated,omitempty"`
 	TopologyHash      string                   `json:"topology_hash,omitempty"`
 }
 
@@ -476,10 +551,76 @@ type CTObservation struct {
 	ID             int64      `json:"id,omitempty"`
 	IssuerName     string     `json:"issuer_name,omitempty"`
 	SerialNumber   string     `json:"serial_number,omitempty"`
+	SHA256         string     `json:"sha256,omitempty"`
 	NotBefore      *time.Time `json:"not_before,omitempty"`
 	NotAfter       *time.Time `json:"not_after,omitempty"`
 	EntryTimestamp *time.Time `json:"entry_timestamp,omitempty"`
 	Names          []string   `json:"names,omitempty"`
+	Source         string     `json:"source,omitempty"`
+}
+
+// SCTObservation is a Signed Certificate Timestamp presented on the TLS
+// handshake. It is a direct measurement that the served leaf was submitted to
+// a CT log; it is not an independent issuance census the way crt.sh is.
+type SCTObservation struct {
+	Version      int        `json:"version,omitempty"`
+	LogID        string     `json:"log_id,omitempty"`
+	LogURL       string     `json:"log_url,omitempty"`
+	Operator     string     `json:"operator,omitempty"`
+	LogState     string     `json:"log_state,omitempty"`
+	Qualified    bool       `json:"qualified,omitempty"`
+	ChromeListed bool       `json:"chrome_listed,omitempty"`
+	AppleListed  bool       `json:"apple_listed,omitempty"`
+	TimestampMS  uint64     `json:"timestamp_ms,omitempty"`
+	Timestamp    *time.Time `json:"timestamp,omitempty"`
+	Extensions   []byte     `json:"-"`
+	Inclusion    string     `json:"inclusion,omitempty"`
+	LeafIndex    uint64     `json:"leaf_index,omitempty"`
+	TreeSize     uint64     `json:"tree_size,omitempty"`
+}
+
+// RDAPNameRecord is the public registration record for the queried name.
+type RDAPNameRecord struct {
+	Handle        string     `json:"handle,omitempty"`
+	LDHName       string     `json:"ldh_name,omitempty"`
+	Status        []string   `json:"status,omitempty"`
+	Registrar     string     `json:"registrar,omitempty"`
+	RegistrarIANA string     `json:"registrar_iana,omitempty"`
+	Registrant    string     `json:"registrant,omitempty"`
+	Nameservers   []string   `json:"nameservers,omitempty"`
+	RegisteredAt  *time.Time `json:"registered_at,omitempty"`
+	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+	UpdatedAt     *time.Time `json:"updated_at,omitempty"`
+	Source        string     `json:"source,omitempty"`
+}
+
+// IPDirectoryRecord is the public numbering-authority and routing identity of
+// one answering address. ASN/netname/org are independent of the TLS leaf.
+type IPDirectoryRecord struct {
+	IPAddress       string   `json:"ip_address"`
+	ASN             int      `json:"asn,omitempty"`
+	ASNName         string   `json:"asn_name,omitempty"`
+	Prefix          string   `json:"prefix,omitempty"`
+	Registry        string   `json:"registry,omitempty"`
+	Country         string   `json:"country,omitempty"`
+	NetName         string   `json:"net_name,omitempty"`
+	OrgName         string   `json:"org_name,omitempty"`
+	Handle          string   `json:"handle,omitempty"`
+	CIDRs           []string `json:"cidrs,omitempty"`
+	Source          string   `json:"source,omitempty"`
+	Vendor          string   `json:"vendor,omitempty"`
+	ASNSources      []string `json:"asn_sources,omitempty"`
+	ConflictingASNs []int    `json:"conflicting_asns,omitempty"`
+	SourceAgreement string   `json:"source_agreement,omitempty"`
+}
+
+// DirectoryObservation retains RDAP and ASN lookups collected in one deep
+// round. It never replaces the certificate-to-endpoint assignment.
+type DirectoryObservation struct {
+	CollectedAt time.Time           `json:"collected_at"`
+	Domain      *RDAPNameRecord     `json:"domain,omitempty"`
+	Endpoints   []IPDirectoryRecord `json:"endpoints,omitempty"`
+	Status      string              `json:"status,omitempty"`
 }
 
 type HTTPFingerprint struct {
@@ -493,14 +634,16 @@ type HTTPFingerprint struct {
 }
 
 type DeepEvidence struct {
-	CollectedAt    time.Time         `json:"collected_at"`
-	Topology       *TopologySnapshot `json:"topology,omitempty"`
-	CAA            []CAARecord       `json:"caa,omitempty"`
-	CT             []CTObservation   `json:"ct,omitempty"`
-	HTTP           *HTTPFingerprint  `json:"http,omitempty"`
-	EndpointProbes []EndpointProbe   `json:"endpoint_probes,omitempty"`
-	Errors         []string          `json:"errors,omitempty"`
-	Status         string            `json:"status"`
+	CollectedAt    time.Time             `json:"collected_at"`
+	Topology       *TopologySnapshot     `json:"topology,omitempty"`
+	CAA            []CAARecord           `json:"caa,omitempty"`
+	CT             []CTObservation       `json:"ct,omitempty"`
+	SCTs           []SCTObservation      `json:"scts,omitempty"`
+	HTTP           *HTTPFingerprint      `json:"http,omitempty"`
+	Directory      *DirectoryObservation `json:"directory,omitempty"`
+	EndpointProbes []EndpointProbe       `json:"endpoint_probes,omitempty"`
+	Errors         []string              `json:"errors,omitempty"`
+	Status         string                `json:"status"`
 }
 
 // MeasurementSnapshot deliberately retains unchanged deep rounds. This makes
@@ -522,7 +665,9 @@ type MeasurementSnapshot struct {
 	EndpointFingerprintsJSON string    `json:"endpoint_fingerprints_json,omitempty" gorm:"type:text"`
 	CAAJSON                  string    `json:"caa_json,omitempty" gorm:"type:text"`
 	CTJSON                   string    `json:"ct_json,omitempty" gorm:"type:text"`
+	SCTJSON                  string    `json:"sct_json,omitempty" gorm:"type:text"`
 	HTTPJSON                 string    `json:"http_json,omitempty" gorm:"type:text"`
+	DirectoryJSON            string    `json:"directory_json,omitempty" gorm:"type:text"`
 	ErrorsJSON               string    `json:"errors_json,omitempty" gorm:"type:text"`
 	CreatedAt                time.Time `json:"created_at"`
 }
@@ -598,7 +743,9 @@ type Anomaly struct {
 	LastObservedAt            *time.Time      `json:"last_observed_at,omitempty"`
 	DetectedAt                time.Time       `json:"detected_at"`
 	Diagnosis                 *CauseDiagnosis `json:"diagnosis,omitempty"`
-	Cost                      *CostBreakdown  `json:"cost,omitempty"`
+	// FindingClass is how the diagnosis treats this row in the issue register:
+	// a real incident, an expected deployment property, or not enough evidence.
+	FindingClass string `json:"finding_class,omitempty"`
 }
 
 // CauseHypothesis is a ranked mechanism explanation. Scores are comparative
@@ -624,86 +771,409 @@ type CauseDiagnosis struct {
 	MeasurementPlan      []string          `json:"measurement_plan,omitempty"`
 	MeasuredRounds       int               `json:"measured_rounds"`
 	TransitionRounds     int               `json:"transition_rounds"`
+	// ChurnShape is populated for certificate-churn findings. It separates
+	// replacement in time from concurrent multi-certificate deployment, which
+	// the raw change counter cannot do.
+	ChurnShape *ChurnShape `json:"churn_shape,omitempty"`
+	// Divergence is populated for multi-endpoint certificate findings. It
+	// separates an intentional multi-CDN or dual-certificate arrangement from a
+	// genuinely inconsistent deployment.
+	Divergence *EndpointDivergence `json:"endpoint_divergence,omitempty"`
+	// Provenance reports how much of the underlying evidence was produced by the
+	// current detection rules rather than by a superseded generation.
+	Provenance *EvidenceProvenance `json:"provenance,omitempty"`
+	// Corroboration reports which independent evidence channels were actually
+	// available. Confidence is capped by this, not by the volume of samples.
+	Corroboration *EvidenceCorroboration `json:"corroboration,omitempty"`
+	// BenignExplanation is set when the discriminating evidence shows the
+	// finding is an expected property of the deployment rather than a defect.
+	BenignExplanation string `json:"benign_explanation,omitempty"`
+	// EvidenceCase is the auditable round-by-round record behind a causal
+	// interpretation. It is intentionally separate from the ranked hypotheses:
+	// a score can rank explanations, while this case records what was observed,
+	// what is missing, and what would falsify the reading.
+	EvidenceCase *EvidenceCase `json:"evidence_case,omitempty"`
+	// Investigation is the operator-facing case file: the measured problem, the
+	// evidence that supports it, and the inferred cause. It is derived from the
+	// same measurements as the ranked hypotheses, but is written so a reader can
+	// see problem, evidence and cause without decoding scoring internals.
+	Investigation *Investigation `json:"investigation,omitempty"`
+	// CauseStatus is established when same-endpoint replacement plus issuance
+	// remaining-life name the process; inferred when those fields are present
+	// but endpoint identity is missing; unestablished when neither holds.
+	CauseStatus string `json:"cause_status,omitempty"`
 }
 
-// CostEvidence is the measured input used by the cost
-// comparison. It is deliberately not serialized: the API exposes only the
-// resulting breakdown, while the source rows stay behind the database layer.
-type CostEvidence struct {
-	ScanJobs     []ScanJob
-	Domain       *DomainCertificate
-	Certificate  *Certificate
-	Observations []CertObservation
+// Finding classes for the issue register.
+const (
+	FindingIncident     = "incident"
+	FindingExpected     = "expected"
+	FindingInsufficient = "insufficient"
+)
+
+// Investigation is the operator-facing case file for one finding. For the
+// three issue-register types that still need a proof (certificate diversity,
+// frequent change, stale after topology change) Proof is the numbered
+// measurement chain and Inference is the reversible operational reading.
+type Investigation struct {
+	FindingClass    string                  `json:"finding_class"`
+	Problem         string                  `json:"problem"`
+	WhyProblem      string                  `json:"why_this_is_a_problem,omitempty"`
+	Cause           string                  `json:"cause"`
+	CauseLabel      string                  `json:"cause_label"`
+	CauseCode       string                  `json:"cause_code,omitempty"`
+	CauseStatus     string                  `json:"cause_status,omitempty"` // established, inferred, or unestablished
+	Confidence      string                  `json:"confidence"`
+	WhyThisCause    []string                `json:"why_this_cause,omitempty"`
+	RuledOut        []InvestigationRuledOut `json:"ruled_out,omitempty"`
+	Facts           []string                `json:"facts,omitempty"`
+	MissingEvidence []string                `json:"missing_evidence,omitempty"`
+	Reversal        []string                `json:"reversal_conditions,omitempty"`
+	// ProofKind is proven when every retained step is a direct measurement,
+	// inferred when the operational reading still needs a missing comparison,
+	// and mixed when some steps are proven and the mechanism is inferred.
+	ProofKind      string                   `json:"proof_kind,omitempty"`
+	Proof          []InvestigationProofStep `json:"proof,omitempty"`
+	Inference      []InvestigationProofStep `json:"inference,omitempty"`
+	ProviderGroups []ProviderExhibit        `json:"provider_groups,omitempty"`
+	ChangeSequence []ChangeExhibit          `json:"change_sequence,omitempty"`
+	Certificates   []CertificateExhibit     `json:"certificates,omitempty"`
+	CDN            *CDNEvidence             `json:"cdn,omitempty"`
 }
 
-// CostLineItem explains one additive component of a cost total.
-type CostLineItem struct {
-	Lower        float64  `json:"lower"`
-	Upper        float64  `json:"upper"`
-	IntervalKind string   `json:"interval_kind"`
-	Method       string   `json:"method"`
-	Probability  *float64 `json:"probability,omitempty"`
-	SampleCount  int      `json:"sample_count,omitempty"`
-	Code         string   `json:"code"`
-	Label        string   `json:"label"`
-	Amount       float64  `json:"amount"`
-	Basis        string   `json:"basis"`
-	Evidence     []string `json:"evidence,omitempty"`
+// InvestigationProofStep is one numbered claim in the operator-facing proof.
+// Claim is a single assertion; Evidence is the retained measurements that
+// prove or support it, listed immediately after. Kind is proven for a direct
+// measurement and inferred for a best-supported reading that a later round
+// can still overturn. Basis is how the measurements were taken, not the proof.
+type InvestigationProofStep struct {
+	Kind     string   `json:"kind"` // proven or inferred
+	Label    string   `json:"label"`
+	Claim    string   `json:"claim"`
+	Evidence []string `json:"evidence,omitempty"`
+	Basis    string   `json:"basis,omitempty"`
 }
 
-// CostBreakdown compares waiting for the next active measurement with issuing
-// and deploying a replacement certificate. Conditional exposure costs and
-// probability-weighted additional measurement costs retain their provenance.
-type CostBreakdown struct {
-	MethodVersion     string               `json:"method_version"`
-	DeltaLower        float64              `json:"delta_lower"`
-	DeltaUpper        float64              `json:"delta_upper"`
-	DeltaBasis        string               `json:"delta_basis"`
-	ObservationRuns   []CostObservationRun `json:"observation_runs,omitempty"`
-	WaitLower         float64              `json:"wait_lower"`
-	WaitUpper         float64              `json:"wait_upper"`
-	RotateLower       float64              `json:"rotate_lower"`
-	RotateUpper       float64              `json:"rotate_upper"`
-	Comparison        string               `json:"comparison"`
-	Sensitivity       []string             `json:"sensitivity"`
-	Validation        *CostValidation      `json:"validation,omitempty"`
-	Applicable        bool                 `json:"applicable"`
-	Scope             string               `json:"scope"`
-	Basis             string               `json:"basis"`
-	Currency          string               `json:"currency"`
-	IssueTypes        []string             `json:"issue_types,omitempty"`
-	EvidenceStatus    string               `json:"evidence_status"`
-	Confidence        string               `json:"confidence"`
-	WaitHorizonHours  float64              `json:"wait_horizon_hours"`
-	NextMeasurementAt *time.Time           `json:"next_measurement_at,omitempty"`
-	WaitCost          float64              `json:"wait_cost"`
-	RotateCost        float64              `json:"rotate_cost"`
-	Decision          string               `json:"decision"`
-	HardConstraint    bool                 `json:"hard_constraint"`
-	Unknowns          []string             `json:"unknowns,omitempty"`
-	WaitItems         []CostLineItem       `json:"wait_items,omitempty"`
-	RotateItems       []CostLineItem       `json:"rotate_items,omitempty"`
+type InvestigationRuledOut struct {
+	Label  string `json:"label"`
+	Reason string `json:"reason"`
 }
 
-type CostValidation struct {
-	FailureCount     int     `json:"failure_count"`
-	PersistenceBrier float64 `json:"persistence_brier"`
-	Samples          int     `json:"samples"`
-	BrierScore       float64 `json:"brier_score"`
-	BaselineBrier    float64 `json:"baseline_brier"`
-	Basis            string  `json:"basis"`
+// ProviderExhibit is one provider-network allocation from the latest endpoint
+// survey, with every answering address and the certificate it served.
+type ProviderExhibit struct {
+	Group     string            `json:"group"`
+	Vendor    string            `json:"vendor,omitempty"`
+	Conflict  bool              `json:"conflict"`
+	LeafCount int               `json:"leaf_count"`
+	Endpoints []EndpointExhibit `json:"endpoints"`
 }
 
-// These are sampled condition runs, not continuously observed outages.
-type CostObservationRun struct {
-	Condition     string     `json:"condition"`
-	FirstObserved time.Time  `json:"first_observed"`
-	LastObserved  time.Time  `json:"last_observed"`
-	FirstClear    *time.Time `json:"first_clear,omitempty"`
-	LeftTruncated bool       `json:"left_truncated"`
-	RightCensored bool       `json:"right_censored"`
-	EvidenceGap   bool       `json:"evidence_gap"`
+type EndpointExhibit struct {
+	IPAddress       string `json:"ip_address"`
+	ActiveDNS       bool   `json:"active_dns"`
+	Success         bool   `json:"success"`
+	Fingerprint     string `json:"fingerprint,omitempty"`
+	SPKIFingerprint string `json:"spki_fingerprint,omitempty"`
+	IssuerCN        string `json:"issuer_cn,omitempty"`
+	KeyAlgorithm    string `json:"key_algorithm,omitempty"`
+	Error           string `json:"error,omitempty"`
 }
+
+// ChangeExhibit is one counted certificate-difference event, with the endpoint
+// comparison that decides whether it was a replacement in time or sampling.
+type ChangeExhibit struct {
+	ObservedAt              time.Time `json:"observed_at"`
+	PreviousFingerprint     string    `json:"previous_fingerprint,omitempty"`
+	Fingerprint             string    `json:"fingerprint,omitempty"`
+	PreviousIP              string    `json:"previous_ip,omitempty"`
+	IPAddress               string    `json:"ip_address,omitempty"`
+	Relation                string    `json:"endpoint_relation"`
+	Coexisting              bool      `json:"coexisting"`
+	ChangeClass             string    `json:"change_class,omitempty"`
+	DaysUntilExpiry         int       `json:"days_until_expiry,omitempty"`
+	PreviousSPKIFingerprint string    `json:"previous_spki_fingerprint,omitempty"`
+	SPKIFingerprint         string    `json:"spki_fingerprint,omitempty"`
+}
+
+type CertificateExhibit struct {
+	Fingerprint     string     `json:"fingerprint"`
+	SPKIFingerprint string     `json:"spki_fingerprint,omitempty"`
+	SerialNumber    string     `json:"serial_number,omitempty"`
+	IssuerCN        string     `json:"issuer_cn,omitempty"`
+	CommonName      string     `json:"common_name,omitempty"`
+	SANs            []string   `json:"sans,omitempty"`
+	KeyAlgorithm    string     `json:"key_algorithm,omitempty"`
+	ValidityDays    int        `json:"validity_days,omitempty"`
+	NotBefore       *time.Time `json:"not_before,omitempty"`
+	NotAfter        *time.Time `json:"not_after,omitempty"`
+}
+
+// EvidenceCase is a bounded, source-grounded evidence chain for one domain and
+// finding type. It contains only retained measurements and never implies full
+// global edge coverage.
+type EvidenceCase struct {
+	Domain             string          `json:"domain"`
+	AnomalyType        string          `json:"anomaly_type"`
+	Status             string          `json:"status"`
+	GeneratedAt        time.Time       `json:"generated_at"`
+	ConfidenceCeiling  string          `json:"confidence_ceiling"`
+	Rounds             []EvidenceRound `json:"rounds"`
+	SupportingEvidence []string        `json:"supporting_evidence"`
+	Contradictions     []string        `json:"contradictions"`
+	MissingEvidence    []string        `json:"missing_evidence"`
+	ReversalConditions []string        `json:"reversal_conditions"`
+}
+
+// EvidenceRound preserves the DNS view and endpoint results for one active
+// measurement. ActiveDNS is false when an address was probed only as a
+// historical/retired candidate and was not in that round's consensus answer.
+type EvidenceRound struct {
+	ObservedAt        time.Time          `json:"observed_at"`
+	Trigger           string             `json:"trigger,omitempty"`
+	ResolverQuorum    int                `json:"resolver_quorum"`
+	ResolverAgreement float64            `json:"resolver_agreement"`
+	EndpointCoverage  float64            `json:"endpoint_coverage"`
+	ConsensusIPs      []string           `json:"consensus_ips,omitempty"`
+	TopologyChanged   bool               `json:"topology_changed"`
+	Endpoints         []EvidenceEndpoint `json:"endpoints"`
+}
+
+type EvidenceEndpoint struct {
+	IPAddress       string `json:"ip_address"`
+	ProviderGroup   string `json:"provider_group,omitempty"`
+	Fingerprint     string `json:"fingerprint,omitempty"`
+	SPKIFingerprint string `json:"spki_fingerprint,omitempty"`
+	IssuerCN        string `json:"issuer_cn,omitempty"`
+	KeyAlgorithm    string `json:"key_algorithm,omitempty"`
+	SANsHash        string `json:"sans_hash,omitempty"`
+	Success         bool   `json:"success"`
+	ActiveDNS       bool   `json:"active_dns"`
+	Error           string `json:"error,omitempty"`
+}
+
+// ChurnShape describes the *shape* of a certificate-change sequence.
+//
+// A renewal sequence is monotone: once a leaf is replaced it never comes back.
+// A load-balanced pool of concurrently deployed certificates produces the
+// opposite signature — the same leaves recur, often alternating — because each
+// scan samples whichever server answered, not a new point in time. Counting
+// "changes" without this test conflates the two, and every downstream signal
+// derived from consecutive pairs (same-key fraction, cadence, issuer churn)
+// inherits the error.
+type ChurnShape struct {
+	ChangeEvents   int `json:"change_events"`
+	DistinctLeaves int `json:"distinct_leaves"`
+	DistinctSPKIs  int `json:"distinct_spkis"`
+	// RevisitEvents counts changes that landed on a leaf already seen earlier in
+	// the sequence. Renewal cannot revisit a retired certificate.
+	RevisitEvents int     `json:"revisit_events"`
+	RevisitRatio  float64 `json:"revisit_ratio"`
+	// AlternationEvents counts A->B->A patterns, the signature of two endpoints
+	// being sampled in turn.
+	AlternationEvents int `json:"alternation_events"`
+	// CoexistenceProofs counts change rows whose own endpoint survey observed the
+	// predecessor and the successor in the same round. This is direct evidence,
+	// not an inference.
+	CoexistenceProofs int `json:"coexistence_proofs"`
+	// SameEndpointChanges counts changes where the address that served the new
+	// leaf is the address that served the previous one. Only these can establish
+	// replacement in time.
+	SameEndpointChanges    int `json:"same_endpoint_changes"`
+	CrossEndpointChanges   int `json:"cross_endpoint_changes"`
+	UnknownEndpointChanges int `json:"unknown_endpoint_changes"`
+	// EffectiveReplacements is a lower bound on real replacements: visiting N
+	// distinct leaves requires at least N-1 of them.
+	EffectiveReplacements int     `json:"effective_replacements"`
+	MeanIntervalHours     float64 `json:"mean_interval_hours"`
+	CadenceRegularity     float64 `json:"cadence_regularity"`
+	MedianValidityDays    int     `json:"median_validity_days"`
+	ObservedSpanDays      float64 `json:"observed_span_days"`
+	// ReplacementsPerValidityPeriod normalizes churn by certificate lifetime. A
+	// 90-day certificate replaced every 60 days is not frequent change.
+	ReplacementsPerValidityPeriod float64 `json:"replacements_per_validity_period"`
+	// Remaining life and issuance dates are what separate a pre-issued rolling
+	// pipeline from issuing a new certificate at replacement time. A different
+	// public key is the default output of new issuance, not a cause.
+	MedianRemainingDays   int     `json:"median_remaining_days"`
+	RemainingSpreadDays   float64 `json:"remaining_spread_days"`
+	MedianIssuanceAgeDays int     `json:"median_issuance_age_days"`
+	DistinctIssuanceDays  int     `json:"distinct_issuance_days"`
+	IssuanceCadenceDays   float64 `json:"issuance_cadence_days"`
+	SameIssuerFraction    float64 `json:"same_issuer_fraction"`
+	SameNameFraction      float64 `json:"same_name_fraction"`
+	IssuanceMonotone      bool    `json:"issuance_monotone"`
+	// RecoveredEndpointChanges counts comparisons whose serving address was
+	// filled in from a retained round snapshot rather than from the change row.
+	RecoveredEndpointChanges int `json:"recovered_endpoint_changes,omitempty"`
+	// Interpretation is the discriminating verdict.
+	Interpretation string `json:"interpretation"`
+}
+
+// Churn interpretations.
+const (
+	ChurnTemporalReplacement = "temporal_replacement"
+	ChurnSpatialMultiplexing = "spatial_multiplexing"
+	ChurnMixed               = "mixed"
+	ChurnUndetermined        = "undetermined"
+)
+
+// EndpointDivergence describes the *structure* of certificate diversity across
+// the sampled endpoints of one domain.
+//
+// Mixed certificates are the normal steady state of a multi-CDN or dual
+// certificate deployment. What separates that from a real inconsistency is not
+// the presence of diversity but its structure: whether each certificate maps
+// cleanly onto its own provider/network partition, whether every endpoint's
+// certificate is functionally valid for the name, and whether the split is
+// stable or is a replacement that failed to propagate.
+type EndpointDivergence struct {
+	EndpointsProbed   int `json:"endpoints_probed"`
+	EndpointsAnswered int `json:"endpoints_answered"`
+	DistinctLeaves    int `json:"distinct_leaves"`
+	DistinctIssuers   int `json:"distinct_issuers"`
+	DistinctKeyAlgos  int `json:"distinct_key_algorithms"`
+	DistinctSANSets   int `json:"distinct_san_sets"`
+	// NetworkGroups counts the distinct network partitions (IPv4 /16, IPv6 /32)
+	// that answered. Different partitions are usually different providers.
+	NetworkGroups int `json:"network_groups"`
+	// CleanPartition is true when no single network partition served two
+	// different leaves. A clean partition means each provider is internally
+	// consistent and the diversity is a between-provider property.
+	CleanPartition bool `json:"clean_partition"`
+	// IntraGroupConflicts counts partitions that served more than one leaf.
+	// Those cannot be explained by multi-CDN: it is one operator's own fleet
+	// disagreeing with itself.
+	IntraGroupConflicts int `json:"intra_group_conflicts"`
+	// DualCertificateSplit is true when the leaves differ only by public-key
+	// algorithm while covering the same names from the same issuer, which is a
+	// deliberate RSA+ECDSA arrangement.
+	DualCertificateSplit bool `json:"dual_certificate_split"`
+	// FunctionallyEquivalent is true when every answering endpoint served a
+	// certificate that is currently valid and covers the queried name.
+	FunctionallyEquivalent bool `json:"functionally_equivalent"`
+	// DefectiveEndpoints lists endpoints whose certificate is expired, not yet
+	// valid, name-mismatched or fails local chain validation.
+	DefectiveEndpoints []string `json:"defective_endpoints,omitempty"`
+	// PredecessorEndpoints lists endpoints still serving the leaf that was
+	// replaced elsewhere.
+	PredecessorEndpoints []string `json:"predecessor_endpoints,omitempty"`
+	// ResidueHours is how long the predecessor has remained after the
+	// replacement was first observed.
+	ResidueHours float64 `json:"residue_hours"`
+	// StableRounds counts consecutive earlier rounds with the same
+	// partition-to-certificate assignment, compared by network partition rather
+	// than by exact address so that CDN address rotation does not reset it.
+	StableRounds int `json:"stable_rounds"`
+	// Strong-rollout gates are deliberately explicit. A non-zero predecessor
+	// count alone is not enough: it may be a retired IP or a legitimate second
+	// CDN. StrongEvidence is true only after all gates pass.
+	ConsecutivePredecessorRounds int      `json:"consecutive_predecessor_rounds"`
+	PredecessorSpanHours         float64  `json:"predecessor_span_hours"`
+	ResolverConsistentRounds     int      `json:"resolver_consistent_rounds"`
+	ActiveEndpointCoverage       float64  `json:"active_endpoint_coverage"`
+	ActivePredecessorEndpoints   []string `json:"active_predecessor_endpoints,omitempty"`
+	RetiredPredecessorEndpoints  []string `json:"retired_predecessor_endpoints,omitempty"`
+	StrongEvidence               bool     `json:"strong_evidence"`
+	MissingEvidence              []string `json:"missing_evidence,omitempty"`
+	ReversalConditions           []string `json:"reversal_conditions,omitempty"`
+	// CDN is the vendor reading from DNS control-plane records and published
+	// CDN prefixes. Completeness decides whether the multi-CDN verdict may use
+	// named vendors or must stay on the /16 and /32 partition.
+	CDN *CDNEvidence `json:"cdn,omitempty"`
+	// Verdict is the discriminating result.
+	Verdict string `json:"verdict"`
+}
+
+// Endpoint divergence verdicts.
+const (
+	DivergenceIntentionalMultiCDN = "intentional_multi_cdn"
+	DivergenceDualCertificate     = "intentional_dual_certificate"
+	DivergenceStuckRollout        = "stuck_partial_rollout"
+	DivergencePropagating         = "rollout_in_progress"
+	DivergenceIntraFleet          = "intra_fleet_inconsistency"
+	DivergenceDefectiveEndpoint   = "defective_endpoint_certificate"
+	DivergenceUndetermined        = "insufficient_endpoint_coverage"
+)
+
+// EvidenceProvenance separates rows produced by the current detection rules
+// from rows produced by a superseded generation.
+type EvidenceProvenance struct {
+	TotalEvents   int     `json:"total_events"`
+	CurrentEvents int     `json:"current_rule_events"`
+	LegacyEvents  int     `json:"legacy_rule_events"`
+	CurrentShare  float64 `json:"current_rule_share"`
+	// LegacyDominated is true when most of the supporting rows predate the
+	// current rules and therefore cannot carry the current rules' guarantees.
+	LegacyDominated bool `json:"legacy_dominated"`
+}
+
+// EvidenceCorroboration reports which independent channels were available.
+// Confidence is a function of these, not of how many samples were taken.
+type EvidenceCorroboration struct {
+	CTCoverage float64 `json:"ct_coverage"`
+	CTEntries  int     `json:"ct_entries"`
+	// CTIssuanceEvents counts distinct certificates that Certificate
+	// Transparency records as issued for this name inside the observation
+	// window. It is the independent upper bound on how many replacements can
+	// have happened.
+	CTIssuanceEvents int `json:"ct_issuance_events"`
+	// CTStatus is corroborated, contradicted or unavailable.
+	CTStatus           string  `json:"ct_status"`
+	CTNote             string  `json:"ct_note,omitempty"`
+	SCTPresented       bool    `json:"sct_presented"`
+	SCTCount           int     `json:"sct_count"`
+	SCTLogCount        int     `json:"sct_log_count"`
+	SCTQualifiedLogs   int     `json:"sct_qualified_logs"`
+	SCTAppleLogs       int     `json:"sct_apple_logs"`
+	SCTInclusionProofs int     `json:"sct_inclusion_proofs"`
+	SCTNote            string  `json:"sct_note,omitempty"`
+	CAACoverage        float64 `json:"caa_coverage"`
+	CAAStatus          string  `json:"caa_status,omitempty"`
+	CAANote            string  `json:"caa_note,omitempty"`
+	HTTPCoverage       float64 `json:"http_coverage"`
+	EndpointCoverage   float64 `json:"endpoint_coverage"`
+	ResolverAgreement  float64 `json:"resolver_agreement"`
+	DirectoryCoverage  float64 `json:"directory_coverage"`
+	DirectoryStatus    string  `json:"directory_status,omitempty"`
+	DirectoryNote      string  `json:"directory_note,omitempty"`
+	NSCoverage         float64 `json:"ns_coverage"`
+	NSRDAPAgreement    string  `json:"ns_rdap_agreement,omitempty"`
+	DNSSECValidated    bool    `json:"dnssec_validated,omitempty"`
+	DNSSECNote         string  `json:"dnssec_note,omitempty"`
+	TimingNote         string  `json:"timing_note,omitempty"`
+	// ConfidenceCeiling is the highest confidence the available corroboration
+	// can support, regardless of how strongly a hypothesis scores.
+	ConfidenceCeiling string `json:"confidence_ceiling"`
+}
+
+// CT corroboration states.
+const (
+	CTCorroborated = "corroborated"
+	CTContradicted = "contradicted"
+	CTUnavailable  = "unavailable"
+)
+
+// Directory corroboration states.
+const (
+	DirectoryIdentified  = "identified"
+	DirectoryPartial     = "partial"
+	DirectoryUnavailable = "unavailable"
+)
+
+const (
+	SCTInclusionProven    = "proven"
+	SCTInclusionMissing   = "missing"
+	SCTInclusionUnchecked = "unchecked"
+	SCTInclusionError     = "error"
+)
+
+const (
+	CAAAuthorized   = "authorized"
+	CAAUnauthorized = "unauthorized"
+	CAAAbsent       = "absent"
+	CAAUnknown      = "unknown"
+)
 
 // ScanQueue represents the current scanning queue state.
 type ScanQueue struct {
@@ -817,7 +1287,6 @@ type Config struct {
 	Database   DatabaseConfig   `mapstructure:"database"`
 	Scanner    ScannerConfig    `mapstructure:"scanner"`
 	Scheduler  SchedulerConfig  `mapstructure:"scheduler"`
-	Cost       CostConfig       `mapstructure:"cost"`
 	Tranco     TrancoConfig     `mapstructure:"tranco"`
 	LocalLists LocalListsConfig `mapstructure:"local_lists"`
 	Alerts     AlertsConfig     `mapstructure:"alerts"`
@@ -874,6 +1343,26 @@ type ScannerConfig struct {
 	CTTimeout                 time.Duration       `mapstructure:"ct_timeout"`
 	CTEndpoint                string              `mapstructure:"ct_endpoint"`
 	CheckHTTPFingerprint      bool                `mapstructure:"check_http_fingerprint"`
+	CheckRDAP                 bool                `mapstructure:"check_rdap"`
+	RDAPTimeout               time.Duration       `mapstructure:"rdap_timeout"`
+	RDAPEndpoint              string              `mapstructure:"rdap_endpoint"`
+	CheckASN                  bool                `mapstructure:"check_asn"`
+	CheckRIPEstat             bool                `mapstructure:"check_ripestat"`
+	RIPEstatEndpoint          string              `mapstructure:"ripestat_endpoint"`
+	CheckOfficialPrefixes     bool                `mapstructure:"check_official_prefixes"`
+	CloudflareIPv4URL         string              `mapstructure:"cloudflare_ipv4_url"`
+	CloudflareIPv6URL         string              `mapstructure:"cloudflare_ipv6_url"`
+	FastlyPublicIPURL         string              `mapstructure:"fastly_public_ip_url"`
+	CloudfrontIPURL           string              `mapstructure:"cloudfront_ip_url"`
+	CheckChromeLogList        bool                `mapstructure:"check_chrome_log_list"`
+	ChromeLogListURL          string              `mapstructure:"chrome_log_list_url"`
+	CheckAppleLogList         bool                `mapstructure:"check_apple_log_list"`
+	AppleLogListURL           string              `mapstructure:"apple_log_list_url"`
+	AWSIPRangesURL            string              `mapstructure:"aws_ip_ranges_url"`
+	BunnyEdgeListURL          string              `mapstructure:"bunny_edge_list_url"`
+	CheckSCTInclusion         bool                `mapstructure:"check_sct_inclusion"`
+	CheckCertSpotter          bool                `mapstructure:"check_certspotter"`
+	CertSpotterEndpoint       string              `mapstructure:"certspotter_endpoint"`
 }
 
 // ARIProviderConfig identifies a CA's ACME directory using configured issuer
@@ -902,29 +1391,6 @@ type SchedulerConfig struct {
 	NearExpiryWindow       time.Duration `mapstructure:"near_expiry_window"`
 	ARIChangeThreshold     time.Duration `mapstructure:"ari_change_threshold"`
 	ARIPollDueTolerance    time.Duration `mapstructure:"ari_poll_due_tolerance"`
-}
-
-// CostConfig contains operator-supplied unit costs. The default configuration
-// uses normalized units until an operator replaces them with measured values.
-type CostConfig struct {
-	WeightLowerMultiplier     float64 `mapstructure:"weight_lower_multiplier"`
-	WeightUpperMultiplier     float64 `mapstructure:"weight_upper_multiplier"`
-	Currency                  string  `mapstructure:"currency"`
-	IssuanceCost              float64 `mapstructure:"issuance_cost"`
-	CTPerCertificateCost      float64 `mapstructure:"ct_per_certificate_cost"`
-	DeploymentCost            float64 `mapstructure:"deployment_cost"`
-	VerificationCost          float64 `mapstructure:"verification_cost"`
-	ActiveMeasurementCost     float64 `mapstructure:"active_measurement_cost"`
-	ManualReviewCost          float64 `mapstructure:"manual_review_cost"`
-	RetryCost                 float64 `mapstructure:"retry_cost"`
-	RollbackCost              float64 `mapstructure:"rollback_cost"`
-	RevokedServicePerHour     float64 `mapstructure:"revoked_service_per_hour"`
-	ResidualExposurePerHour   float64 `mapstructure:"residual_exposure_per_hour"`
-	ExpiredServicePerHour     float64 `mapstructure:"expired_service_per_hour"`
-	PartialDeploymentPerHour  float64 `mapstructure:"partial_deployment_per_hour"`
-	StaleCertificatePerHour   float64 `mapstructure:"stale_certificate_per_hour"`
-	UnreachableServicePerHour float64 `mapstructure:"unreachable_service_per_hour"`
-	ExpiryIncidentCost        float64 `mapstructure:"expiry_incident_cost"`
 }
 
 type TrancoConfig struct {
@@ -1044,6 +1510,38 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("scanner.ct_endpoint must be an absolute HTTPS URL")
 		}
 	}
+	if c.Scanner.CheckRDAP && c.Scanner.RDAPTimeout <= 0 {
+		return fmt.Errorf("scanner.rdap_timeout is required when RDAP checking is enabled")
+	}
+	if c.Scanner.RDAPEndpoint != "" {
+		parsed, err := url.Parse(strings.TrimSpace(c.Scanner.RDAPEndpoint))
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+			return fmt.Errorf("scanner.rdap_endpoint must be an absolute HTTPS URL")
+		}
+	}
+	for _, item := range []struct {
+		name  string
+		value string
+	}{
+		{"ripestat_endpoint", c.Scanner.RIPEstatEndpoint},
+		{"cloudflare_ipv4_url", c.Scanner.CloudflareIPv4URL},
+		{"cloudflare_ipv6_url", c.Scanner.CloudflareIPv6URL},
+		{"fastly_public_ip_url", c.Scanner.FastlyPublicIPURL},
+		{"cloudfront_ip_url", c.Scanner.CloudfrontIPURL},
+		{"chrome_log_list_url", c.Scanner.ChromeLogListURL},
+		{"apple_log_list_url", c.Scanner.AppleLogListURL},
+		{"aws_ip_ranges_url", c.Scanner.AWSIPRangesURL},
+		{"bunny_edge_list_url", c.Scanner.BunnyEdgeListURL},
+		{"certspotter_endpoint", c.Scanner.CertSpotterEndpoint},
+	} {
+		if strings.TrimSpace(item.value) == "" {
+			continue
+		}
+		parsed, err := url.Parse(strings.TrimSpace(item.value))
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+			return fmt.Errorf("scanner.%s must be an absolute HTTPS URL", item.name)
+		}
+	}
 	for _, resolver := range c.Scanner.DNSResolvers {
 		parsed, err := url.Parse(strings.TrimSpace(resolver))
 		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
@@ -1066,31 +1564,6 @@ func (c *Config) Validate() error {
 	for _, days := range append(append([]int{}, c.Scheduler.Milestones...), c.Scheduler.PostExpiryChecks...) {
 		if days < 0 {
 			return fmt.Errorf("scheduler milestone values must not be negative")
-		}
-	}
-
-	if strings.TrimSpace(c.Cost.Currency) == "" {
-		return fmt.Errorf("cost.currency is required")
-	}
-	for name, value := range map[string]float64{
-		"issuance_cost":                c.Cost.IssuanceCost,
-		"ct_per_certificate_cost":      c.Cost.CTPerCertificateCost,
-		"deployment_cost":              c.Cost.DeploymentCost,
-		"verification_cost":            c.Cost.VerificationCost,
-		"active_measurement_cost":      c.Cost.ActiveMeasurementCost,
-		"manual_review_cost":           c.Cost.ManualReviewCost,
-		"retry_cost":                   c.Cost.RetryCost,
-		"rollback_cost":                c.Cost.RollbackCost,
-		"revoked_service_per_hour":     c.Cost.RevokedServicePerHour,
-		"residual_exposure_per_hour":   c.Cost.ResidualExposurePerHour,
-		"expired_service_per_hour":     c.Cost.ExpiredServicePerHour,
-		"partial_deployment_per_hour":  c.Cost.PartialDeploymentPerHour,
-		"stale_certificate_per_hour":   c.Cost.StaleCertificatePerHour,
-		"unreachable_service_per_hour": c.Cost.UnreachableServicePerHour,
-		"expiry_incident_cost":         c.Cost.ExpiryIncidentCost,
-	} {
-		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
-			return fmt.Errorf("cost.%s must be a finite non-negative number", name)
 		}
 	}
 
@@ -1151,22 +1624,7 @@ func FromX509Cert(c *x509.Certificate, seenAt time.Time) *Certificate {
 	}
 	sansJSON, _ := json.Marshal(sans)
 
-	keyAlg, pubKeyType := "Unknown", "Unknown"
-	keySize := 0
-	switch pub := c.PublicKey.(type) {
-	case *rsa.PublicKey:
-		keyAlg, pubKeyType = "RSA", "RSA"
-		keySize = pub.N.BitLen()
-	case *ecdsa.PublicKey:
-		keyAlg, pubKeyType = "ECDSA", "ECDSA"
-		keySize = pub.Curve.Params().BitSize
-	case ed25519.PublicKey:
-		keyAlg, pubKeyType = "Ed25519", "Ed25519"
-		keySize = 256
-	default:
-		keyAlg = c.PublicKeyAlgorithm.String()
-		pubKeyType = keyAlg
-	}
+	keyAlg, pubKeyType, keySize := PublicKeyProfile(c)
 
 	return &Certificate{
 		Fingerprint:     Fingerprint(c),
@@ -1196,6 +1654,101 @@ func FromX509Cert(c *x509.Certificate, seenAt time.Time) *Certificate {
 func Fingerprint(c *x509.Certificate) string {
 	h := sha256.Sum256(c.Raw)
 	return hex.EncodeToString(h[:])
+}
+
+// PublicKeyProfile reports the public-key algorithm, type and size. The
+// endpoint survey needs the same derivation as the stored certificate so an
+// RSA plus ECDSA pair can be recognized from probe data alone.
+func PublicKeyProfile(c *x509.Certificate) (algorithm, keyType string, size int) {
+	if c == nil || c.PublicKey == nil {
+		return "Unknown", "Unknown", 0
+	}
+	switch pub := c.PublicKey.(type) {
+	case *rsa.PublicKey:
+		return "RSA", "RSA", pub.N.BitLen()
+	case *ecdsa.PublicKey:
+		return "ECDSA", "ECDSA", pub.Curve.Params().BitSize
+	case ed25519.PublicKey:
+		return "Ed25519", "Ed25519", 256
+	default:
+		name := c.PublicKeyAlgorithm.String()
+		return name, name, 0
+	}
+}
+
+// PublicKeySize is the key size alone, for callers that already know the
+// algorithm.
+func PublicKeySize(c *x509.Certificate) int {
+	_, _, size := PublicKeyProfile(c)
+	return size
+}
+
+// SANSetHash digests the sorted, case-normalized DNS name set. Endpoints whose
+// certificates hash to the same value cover exactly the same names and are
+// therefore interchangeable for the queried host, whatever else differs.
+func SANSetHash(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	normalized := make([]string, 0, len(names))
+	for _, name := range names {
+		trimmed := strings.ToLower(strings.TrimSpace(name))
+		if trimmed != "" {
+			normalized = append(normalized, trimmed)
+		}
+	}
+	if len(normalized) == 0 {
+		return ""
+	}
+	sort.Strings(normalized)
+	h := sha256.Sum256([]byte(strings.Join(normalized, "\x00")))
+	return hex.EncodeToString(h[:])
+}
+
+// ProviderGroup maps an address to the allocation that usually belongs to one
+// operator or CDN: an IPv4 /16 or an IPv6 /32.
+//
+// Comparing endpoint surveys by exact address is why a permanently stable CDN
+// arrangement never looked stable: edge addresses rotate on every query, so the
+// map keys changed every round and the stability test could never accumulate.
+// The provider allocation is stable exactly where the individual address is not.
+func ProviderGroup(address string) string {
+	ip := net.ParseIP(strings.TrimSpace(address))
+	if ip == nil {
+		return "unparsed:" + strings.TrimSpace(address)
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return (&net.IPNet{IP: v4.Mask(net.CIDRMask(16, 32)), Mask: net.CIDRMask(16, 32)}).String()
+	}
+	return (&net.IPNet{IP: ip.Mask(net.CIDRMask(32, 128)), Mask: net.CIDRMask(32, 128)}).String()
+}
+
+// ProviderAssignmentSignature reduces an address-to-certificate map to
+// "which provider network served which certificates", discarding the individual
+// addresses that a CDN rotates.
+func ProviderAssignmentSignature(assignment map[string]string) string {
+	byGroup := make(map[string]map[string]struct{})
+	for address, fingerprint := range assignment {
+		if fingerprint == "" {
+			continue
+		}
+		group := ProviderGroup(address)
+		if byGroup[group] == nil {
+			byGroup[group] = make(map[string]struct{})
+		}
+		byGroup[group][fingerprint] = struct{}{}
+	}
+	parts := make([]string, 0, len(byGroup))
+	for group, fingerprints := range byGroup {
+		values := make([]string, 0, len(fingerprints))
+		for fingerprint := range fingerprints {
+			values = append(values, fingerprint)
+		}
+		sort.Strings(values)
+		parts = append(parts, group+"=>"+strings.Join(values, ","))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "|")
 }
 
 // SPKIFingerprint identifies the public key independently of the certificate

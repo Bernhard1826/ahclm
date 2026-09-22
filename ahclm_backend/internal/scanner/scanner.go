@@ -30,6 +30,7 @@ type Scanner struct {
 	client    *http.Client
 	checker   *revocation.Checker
 	ari       *ari.Checker
+	datasets  *datasetFetcher
 	rateLimit chan struct{}
 	wg        sync.WaitGroup
 }
@@ -66,6 +67,42 @@ func NewScanner(cfg *models.ScannerConfig, cacheStore PersistentCacheStore) (*Sc
 	if strings.TrimSpace(cfg.CTEndpoint) == "" {
 		cfg.CTEndpoint = "https://crt.sh/"
 	}
+	if cfg.RDAPTimeout <= 0 {
+		cfg.RDAPTimeout = 8 * time.Second
+	}
+	if strings.TrimSpace(cfg.RDAPEndpoint) == "" {
+		cfg.RDAPEndpoint = "https://rdap.org"
+	}
+	if strings.TrimSpace(cfg.RIPEstatEndpoint) == "" {
+		cfg.RIPEstatEndpoint = defaultRIPEstatPrefixURL
+	}
+	if strings.TrimSpace(cfg.CloudflareIPv4URL) == "" {
+		cfg.CloudflareIPv4URL = defaultCloudflareIPv4URL
+	}
+	if strings.TrimSpace(cfg.CloudflareIPv6URL) == "" {
+		cfg.CloudflareIPv6URL = defaultCloudflareIPv6URL
+	}
+	if strings.TrimSpace(cfg.FastlyPublicIPURL) == "" {
+		cfg.FastlyPublicIPURL = defaultFastlyPublicIPURL
+	}
+	if strings.TrimSpace(cfg.CloudfrontIPURL) == "" {
+		cfg.CloudfrontIPURL = defaultCloudfrontIPURL
+	}
+	if strings.TrimSpace(cfg.ChromeLogListURL) == "" {
+		cfg.ChromeLogListURL = defaultChromeLogListURL
+	}
+	if strings.TrimSpace(cfg.AppleLogListURL) == "" {
+		cfg.AppleLogListURL = defaultAppleLogListURL
+	}
+	if strings.TrimSpace(cfg.AWSIPRangesURL) == "" {
+		cfg.AWSIPRangesURL = defaultAWSIPRangesURL
+	}
+	if strings.TrimSpace(cfg.BunnyEdgeListURL) == "" {
+		cfg.BunnyEdgeListURL = defaultBunnyEdgeListURL
+	}
+	if strings.TrimSpace(cfg.CertSpotterEndpoint) == "" {
+		cfg.CertSpotterEndpoint = defaultCertSpotterURL
+	}
 	rl := make(chan struct{}, cfg.RateLimit)
 	for i := 0; i < cfg.RateLimit; i++ {
 		rl <- struct{}{}
@@ -89,13 +126,18 @@ func NewScanner(cfg *models.ScannerConfig, cacheStore PersistentCacheStore) (*Sc
 	if err != nil {
 		return nil, err
 	}
-	return &Scanner{
+	scan := &Scanner{
 		config:    cfg,
 		client:    &http.Client{Transport: transport, Timeout: cfg.Timeout},
 		checker:   revocation.NewChecker(cfg.RevocationTimeout, cfg.CheckCRL, cfg.CRLCacheTTL, cacheStore),
 		ari:       ariChecker,
 		rateLimit: rl,
-	}, nil
+	}
+	if cfg.CheckOfficialPrefixes || cfg.CheckChromeLogList || cfg.CheckAppleLogList || cfg.CheckRIPEstat {
+		scan.datasets = newDatasetFetcher(cfg)
+		scan.datasets.Start(context.Background())
+	}
+	return scan, nil
 }
 
 // Scan performs a complete scan. It is retained for callers that explicitly
@@ -169,6 +211,7 @@ func (s *Scanner) scan(ctx context.Context, domain string, enrich bool) (*models
 	result.Success = true
 	result.ConnectionInfo = connInfo
 	if connInfo != nil {
+		connInfo.SCTs = mergeSCTObservations(append(append([]models.SCTObservation(nil), connInfo.SCTs...), parseEmbeddedSCTs(chain[0])...))
 		connInfo.ResolvedIPs = append([]string(nil), result.ResolvedIPs...)
 		// Keep the resolver snapshot pure. The dialled address can be a local
 		// transparent-egress endpoint and is already retained separately in
@@ -229,9 +272,17 @@ type dohPayload struct {
 // raw RRset. It deliberately accepts both Google's /resolve endpoint and the
 // RFC 8484 JSON endpoint used by Cloudflare/Quad9.
 func (s *Scanner) queryDoH(ctx context.Context, resolver, domain, recordType string) ([]dohAnswer, error) {
+	payload, err := s.queryDoHPayload(ctx, resolver, domain, recordType)
+	if err != nil {
+		return nil, err
+	}
+	return append(payload.Answer, payload.Authority...), nil
+}
+
+func (s *Scanner) queryDoHPayload(ctx context.Context, resolver, domain, recordType string) (dohPayload, error) {
 	endpoint, err := url.Parse(strings.TrimSpace(resolver))
 	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" {
-		return nil, fmt.Errorf("invalid DoH resolver %q", resolver)
+		return dohPayload{}, fmt.Errorf("invalid DoH resolver %q", resolver)
 	}
 	query := endpoint.Query()
 	query.Set("name", domain)
@@ -239,26 +290,26 @@ func (s *Scanner) queryDoH(ctx context.Context, resolver, domain, recordType str
 	endpoint.RawQuery = query.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
 	if err != nil {
-		return nil, err
+		return dohPayload{}, err
 	}
 	req.Header.Set("Accept", "application/dns-json")
 	client := &http.Client{Timeout: s.config.Timeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return dohPayload{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("DoH resolver returned HTTP %d", resp.StatusCode)
+		return dohPayload{}, fmt.Errorf("DoH resolver returned HTTP %d", resp.StatusCode)
 	}
 	var payload dohPayload
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
-		return nil, err
+		return dohPayload{}, err
 	}
 	if payload.Status != 0 && payload.Status != 3 { // NOERROR or NXDOMAIN
-		return nil, fmt.Errorf("DNS status %d", payload.Status)
+		return dohPayload{}, fmt.Errorf("DNS status %d", payload.Status)
 	}
-	return append(payload.Answer, payload.Authority...), nil
+	return payload, nil
 }
 
 // resolveTopology captures A/AAAA/CNAME answers from independent public
@@ -282,12 +333,19 @@ func (s *Scanner) resolveTopology(ctx context.Context, domain string) *models.To
 			obs := models.DNSResolverObservation{Resolver: resolver}
 			resolverCtx, cancel := context.WithTimeout(ctx, s.config.Timeout)
 			defer cancel()
-			for _, typ := range []string{"A", "AAAA", "CNAME"} {
-				answers, err := s.queryDoH(resolverCtx, resolver, domain, typ)
+			dnssecHits := 0
+			dnssecChecks := 0
+			for _, typ := range []string{"A", "AAAA", "CNAME", "HTTPS", "NS"} {
+				payload, err := s.queryDoHPayload(resolverCtx, resolver, domain, typ)
 				if err != nil {
 					obs.Error = err.Error()
 					continue
 				}
+				dnssecChecks++
+				if payload.AD {
+					dnssecHits++
+				}
+				answers := append(payload.Answer, payload.Authority...)
 				for _, answer := range answers {
 					if answer.TTL > 0 && (obs.TTL == 0 || answer.TTL < obs.TTL) {
 						obs.TTL = answer.TTL
@@ -306,12 +364,41 @@ func (s *Scanner) resolveTopology(ctx context.Context, domain string) *models.To
 						if name != "" {
 							obs.CNAME = addUniqueIP(obs.CNAME, name)
 						}
+					case 2:
+						name := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(answer.Data)), ".")
+						if name != "" {
+							obs.NS = addUniqueIP(obs.NS, name)
+						}
+					case 65:
+						for _, target := range models.ParseHTTPSTargets(answer.Data) {
+							if target != "" {
+								obs.HTTPS = addUniqueIP(obs.HTTPS, target)
+							}
+						}
+					}
+				}
+			}
+			if len(obs.NS) == 0 {
+				if parent := parentDomain(domain); parent != "" && parent != domain {
+					if answers, err := s.queryDoH(resolverCtx, resolver, parent, "NS"); err == nil {
+						for _, answer := range answers {
+							if answer.Type != 2 {
+								continue
+							}
+							name := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(answer.Data)), ".")
+							if name != "" {
+								obs.NS = addUniqueIP(obs.NS, name)
+							}
+						}
 					}
 				}
 			}
 			sort.Strings(obs.A)
 			sort.Strings(obs.AAAA)
 			sort.Strings(obs.CNAME)
+			sort.Strings(obs.HTTPS)
+			sort.Strings(obs.NS)
+			obs.DNSSEC = dnssecChecks > 0 && dnssecHits == dnssecChecks
 			// A CNAME-only response is useful control-plane evidence, but it is
 			// not an address answer and must not increase the address resolver
 			// quorum used for topology transitions.
@@ -335,13 +422,27 @@ func (s *Scanner) resolveTopology(ctx context.Context, domain string) *models.To
 	snapshot := &models.TopologySnapshot{Resolvers: ordered}
 	addressResolvers := make(map[string]int)
 	successful := 0
+	dnssecValidated := 0
 	for _, obs := range ordered {
+		if obs.DNSSEC {
+			dnssecValidated++
+		}
 		// Keep CNAME evidence even when the resolver did not return an address.
 		// This lets the diagnosis explain a control-plane change without turning
 		// a CNAME-only view into a false address quorum.
 		for _, cname := range obs.CNAME {
 			if !containsString(snapshot.CNAMEChain, cname) {
 				snapshot.CNAMEChain = append(snapshot.CNAMEChain, cname)
+			}
+		}
+		for _, target := range obs.HTTPS {
+			if !containsString(snapshot.HTTPSTargets, target) {
+				snapshot.HTTPSTargets = append(snapshot.HTTPSTargets, target)
+			}
+		}
+		for _, ns := range obs.NS {
+			if !containsString(snapshot.NSHosts, ns) {
+				snapshot.NSHosts = append(snapshot.NSHosts, ns)
 			}
 		}
 		if !obs.Success {
@@ -386,11 +487,16 @@ func (s *Scanner) resolveTopology(ctx context.Context, domain string) *models.To
 	sort.Strings(snapshot.PublicIPs)
 	sort.Strings(snapshot.ConsensusIPs)
 	sort.Strings(snapshot.CNAMEChain)
+	sort.Strings(snapshot.HTTPSTargets)
+	sort.Strings(snapshot.NSHosts)
+	snapshot.DNSSECValidated = dnssecValidated
 	canonical, _ := json.Marshal(struct {
 		IPs       []string `json:"ips"`
 		Consensus []string `json:"consensus"`
 		CNAME     []string `json:"cname"`
-	}{snapshot.PublicIPs, snapshot.ConsensusIPs, snapshot.CNAMEChain})
+		HTTPS     []string `json:"https"`
+		NS        []string `json:"ns"`
+	}{snapshot.PublicIPs, snapshot.ConsensusIPs, snapshot.CNAMEChain, snapshot.HTTPSTargets, snapshot.NSHosts})
 	digest := sha256.Sum256(canonical)
 	snapshot.TopologyHash = hex.EncodeToString(digest[:])
 	return snapshot
@@ -503,6 +609,16 @@ func (s *Scanner) ProbeEndpoints(ctx context.Context, domain string, ips []strin
 			probe.SPKIFingerprint = models.SPKIFingerprint(chain[0])
 			probe.IssuerCN = chain[0].Issuer.CommonName
 			probe.CommonName = chain[0].Subject.CommonName
+			probe.SerialNumber = chain[0].SerialNumber.Text(16)
+			probe.SANs = append([]string(nil), chain[0].DNSNames...)
+			// The key algorithm and the covered name set are what separate a
+			// deliberate RSA plus ECDSA pair from endpoints that disagree: the
+			// pair serves the same names from the same issuer on purpose.
+			probe.KeyAlgorithm = chain[0].PublicKeyAlgorithm.String()
+			probe.KeySize = models.PublicKeySize(chain[0])
+			probe.SANsHash = models.SANSetHash(chain[0].DNSNames)
+			nb := chain[0].NotBefore.UTC()
+			probe.NotBefore = &nb
 			na := chain[0].NotAfter.UTC()
 			probe.NotAfter = &na
 			if info != nil {
@@ -549,6 +665,11 @@ func (s *Scanner) enrichResult(ctx context.Context, result *models.ScanResult) {
 	attempted := false
 	var pending []string
 	deep := &models.DeepEvidence{CollectedAt: time.Now().UTC(), Topology: result.Topology, EndpointProbes: result.EndpointProbes, Status: models.EvidenceStatusPending}
+	deep.SCTs = collectResultSCTs(result)
+	if s.config.CheckSCTInclusion && len(deep.SCTs) > 0 {
+		attempted = true
+		deep.SCTs = s.verifySCTInclusions(ctx, result.RawChain, deep.SCTs)
+	}
 	if s.config.CheckCAA {
 		attempted = true
 		if records, err := s.fetchCAA(ctx, result.Domain); err != nil {
@@ -560,11 +681,20 @@ func (s *Scanner) enrichResult(ctx context.Context, result *models.ScanResult) {
 	}
 	if s.config.CheckCT {
 		attempted = true
-		if entries, err := s.fetchCT(ctx, result.Domain); err != nil {
+		if entries, err := s.fetchCT(ctx, result); err != nil {
 			deep.Errors = append(deep.Errors, "CT: "+err.Error())
 			pending = append(pending, "certificate-transparency lookup failed")
 		} else {
 			deep.CT = entries
+		}
+	}
+	if s.config.CheckCertSpotter {
+		attempted = true
+		if entries, err := s.fetchCertSpotter(ctx, result); err != nil {
+			deep.Errors = append(deep.Errors, "CertSpotter: "+err.Error())
+			pending = append(pending, "independent CT index lookup failed")
+		} else {
+			deep.CT = mergeCTObservations(append(deep.CT, entries...))
 		}
 	}
 	if s.config.CheckHTTPFingerprint {
@@ -574,6 +704,19 @@ func (s *Scanner) enrichResult(ctx context.Context, result *models.ScanResult) {
 			pending = append(pending, "HTTP/CDN fingerprint lookup failed")
 		} else {
 			deep.HTTP = fp
+		}
+	}
+	if s.config.CheckRDAP || s.config.CheckASN || s.config.CheckRIPEstat {
+		attempted = true
+		addresses := directoryAddresses(result)
+		if directory, err := s.fetchDirectory(ctx, result.Domain, addresses); err != nil {
+			deep.Errors = append(deep.Errors, "directory: "+err.Error())
+			if directory != nil {
+				deep.Directory = directory
+			}
+			pending = append(pending, "RDAP/ASN lookup failed")
+		} else {
+			deep.Directory = directory
 		}
 	}
 
@@ -660,15 +803,53 @@ func (s *Scanner) fetchCAA(ctx context.Context, domain string) ([]models.CAAReco
 	return nil, firstErr
 }
 
-func (s *Scanner) fetchCT(ctx context.Context, domain string) ([]models.CTObservation, error) {
+func (s *Scanner) fetchCT(ctx context.Context, result *models.ScanResult) ([]models.CTObservation, error) {
+	if result == nil {
+		return nil, fmt.Errorf("CT lookup has no scan result")
+	}
+	queries := make([]string, 0, 3)
+	if result.Cert != nil && result.Cert.Fingerprint != "" {
+		queries = append(queries, result.Cert.Fingerprint)
+	}
+	if result.Cert != nil && result.Cert.SerialNumber != "" {
+		queries = append(queries, result.Cert.SerialNumber)
+	}
+	if result.Domain != "" {
+		queries = append(queries, result.Domain)
+	}
+	var firstErr error
+	merged := make([]models.CTObservation, 0)
+	for _, query := range queries {
+		entries, err := s.fetchCTQuery(ctx, query)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		merged = append(merged, entries...)
+		if result.Cert != nil && ctContainsLeaf(entries, result.Cert.Fingerprint, result.Cert.SerialNumber) {
+			return mergeCTObservations(merged), nil
+		}
+		if len(merged) >= 40 {
+			break
+		}
+	}
+	if len(merged) == 0 && firstErr != nil {
+		return nil, firstErr
+	}
+	return mergeCTObservations(merged), nil
+}
+
+func (s *Scanner) fetchCTQuery(ctx context.Context, query string) ([]models.CTObservation, error) {
 	endpoint := strings.TrimRight(strings.TrimSpace(s.config.CTEndpoint), "/")
 	if endpoint == "" {
 		return nil, fmt.Errorf("CT endpoint is empty")
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, s.config.CTTimeout)
 	defer cancel()
-	query := endpoint + "/?q=" + url.QueryEscape(domain) + "&output=json"
-	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, query, nil)
+	queryURL := endpoint + "/?q=" + url.QueryEscape(query) + "&output=json"
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, queryURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -686,6 +867,7 @@ func (s *Scanner) fetchCT(ctx context.Context, domain string) ([]models.CTObserv
 		ID             int64  `json:"id"`
 		IssuerName     string `json:"issuer_name"`
 		SerialNumber   string `json:"serial_number"`
+		SHA256         string `json:"sha256"`
 		NotBefore      string `json:"not_before"`
 		NotAfter       string `json:"not_after"`
 		EntryTimestamp string `json:"entry_timestamp"`
@@ -696,7 +878,14 @@ func (s *Scanner) fetchCT(ctx context.Context, domain string) ([]models.CTObserv
 	}
 	entries := make([]models.CTObservation, 0, len(raw))
 	for _, item := range raw {
-		entry := models.CTObservation{ID: item.ID, IssuerName: item.IssuerName, SerialNumber: item.SerialNumber, Names: strings.Fields(strings.ReplaceAll(item.NameValue, "\n", " "))}
+		entry := models.CTObservation{
+			ID:           item.ID,
+			IssuerName:   item.IssuerName,
+			SerialNumber: normalizeSerial(item.SerialNumber),
+			SHA256:       strings.ToLower(strings.TrimSpace(item.SHA256)),
+			Names:        strings.Fields(strings.ReplaceAll(item.NameValue, "\n", " ")),
+			Source:       "crt.sh",
+		}
 		for rawValue, target := range map[string]**time.Time{item.NotBefore: &entry.NotBefore, item.NotAfter: &entry.NotAfter, item.EntryTimestamp: &entry.EntryTimestamp} {
 			if strings.TrimSpace(rawValue) == "" {
 				continue
@@ -709,6 +898,50 @@ func (s *Scanner) fetchCT(ctx context.Context, domain string) ([]models.CTObserv
 		entries = append(entries, entry)
 	}
 	return entries, nil
+}
+
+func mergeCTObservations(values []models.CTObservation) []models.CTObservation {
+	seen := make(map[string]int, len(values))
+	out := make([]models.CTObservation, 0, len(values))
+	for _, value := range values {
+		key := value.SHA256
+		if key == "" {
+			key = normalizeSerial(value.SerialNumber) + "|" + value.IssuerName
+		}
+		if key == "|" || key == "" {
+			key = fmt.Sprintf("%d", value.ID)
+		}
+		if index, ok := seen[key]; ok {
+			if out[index].Source != "" && value.Source != "" && !strings.Contains(out[index].Source, value.Source) {
+				out[index].Source = out[index].Source + "+" + value.Source
+			}
+			continue
+		}
+		seen[key] = len(out)
+		out = append(out, value)
+	}
+	return out
+}
+
+func ctContainsLeaf(entries []models.CTObservation, fingerprint, serial string) bool {
+	fingerprint = strings.ToLower(strings.TrimSpace(fingerprint))
+	serial = normalizeSerial(serial)
+	for _, entry := range entries {
+		if fingerprint != "" && strings.ToLower(strings.TrimSpace(entry.SHA256)) == fingerprint {
+			return true
+		}
+		if serial != "" && normalizeSerial(entry.SerialNumber) == serial {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeSerial(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.ReplaceAll(value, ":", "")
+	value = strings.TrimPrefix(value, "0x")
+	return strings.TrimLeft(value, "0")
 }
 
 func (s *Scanner) fetchHTTPFingerprint(ctx context.Context, domain string, info *models.ConnectionInfo) (*models.HTTPFingerprint, error) {
@@ -797,6 +1030,7 @@ func (s *Scanner) handshakeHTTPS(ctx context.Context, domain string, addresses [
 		TLSVersion:  models.GetTLSVersionName(resp.TLS.Version),
 		CipherSuite: models.GetCipherSuiteName(resp.TLS.CipherSuite),
 		IPAddress:   address,
+		SCTs:        handshakeSCTs(resp.TLS),
 	}
 	return resp.TLS.PeerCertificates, resp.TLS.OCSPResponse, connInfo, nil
 }
@@ -864,8 +1098,55 @@ func (s *Scanner) handshakeTLSAt(ctx context.Context, domain, address string) ([
 		ALPN:               state.NegotiatedProtocol,
 		ConnectionTime:     time.Since(start).Milliseconds(),
 		IPAddress:          remoteIP,
+		SCTs:               handshakeSCTs(&state),
 	}
 	return state.PeerCertificates, state.OCSPResponse, connInfo, nil
+}
+
+func handshakeSCTs(state *tls.ConnectionState) []models.SCTObservation {
+	if state == nil {
+		return nil
+	}
+	return parseHandshakeSCTs(state.SignedCertificateTimestamps)
+}
+
+func collectResultSCTs(result *models.ScanResult) []models.SCTObservation {
+	if result == nil {
+		return nil
+	}
+	out := make([]models.SCTObservation, 0, 4)
+	if result.ConnectionInfo != nil {
+		out = append(out, result.ConnectionInfo.SCTs...)
+	}
+	if len(result.RawChain) > 0 {
+		out = append(out, parseEmbeddedSCTs(result.RawChain[0])...)
+	}
+	return mergeSCTObservations(out)
+}
+
+func directoryAddresses(result *models.ScanResult) []string {
+	if result == nil {
+		return nil
+	}
+	out := append([]string(nil), result.ResolvedIPs...)
+	if result.ConnectionInfo != nil && result.ConnectionInfo.IPAddress != "" {
+		out = addUniqueIP(out, result.ConnectionInfo.IPAddress)
+	}
+	for _, probe := range result.EndpointProbes {
+		if probe.IPAddress != "" {
+			out = addUniqueIP(out, probe.IPAddress)
+		}
+	}
+	return out
+}
+
+func parentDomain(domain string) string {
+	domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
+	labels := strings.Split(domain, ".")
+	if len(labels) < 3 {
+		return ""
+	}
+	return strings.Join(labels[1:], ".")
 }
 
 type scanAttemptFunc func(context.Context, string) (*models.ScanResult, error)
@@ -957,6 +1238,9 @@ func classifyFailure(errs ...error) string {
 
 // Close waits for in-flight work and releases resources.
 func (s *Scanner) Close() error {
+	if s.datasets != nil {
+		s.datasets.Stop()
+	}
 	s.wg.Wait()
 	return nil
 }

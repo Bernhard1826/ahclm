@@ -136,14 +136,6 @@ scheduler:
   near_expiry_interval: 6h              # within ~1 day of expiry
   ari_poll_interval: 24h                # fallback when ARI omits Retry-After
   max_daily_scans: 100000
-cost:
-  currency: normalized_unit             # replace with a measured money/resource unit
-  issuance_cost: 1.0
-  ct_per_certificate_cost: 0.25        # CT monitoring overhead per new certificate
-  deployment_cost: 2.0
-  verification_cost: 0.5
-  active_measurement_cost: 0.1
-  expiry_incident_cost: 20.0
 tranco:    { enabled: true, max_domains: 10000, fetch_on_start: true }
 local_lists:
   enabled: true
@@ -153,13 +145,6 @@ local_lists:
     - { name: secrank-topdomain1m, path: ../analysis/secrank-topdomain1M-domainonly-20240722.txt, format: lines, max_domains: 0 }
     - { name: secrank-icp, path: ../analysis/domains_secrank-icp-out.txt, format: jsonl, max_domains: 0 }
 ```
-
-Cost values are applied only after AHCLM active measurement records a problem
-for the currently deployed certificate. They are shown only in the Anomalies
-view. Clients can load them on demand with
-`/api/analysis/anomalies/cost?domain=`; `include_cost=true` remains available on
-the anomalies index for compatibility. Clean domains and historical-only
-findings receive no cost calculation.
 
 Environment overrides: `AHCLM_CONFIG_FILE`, `AHCLM_BACKEND_HOST`, `AHCLM_BACKEND_PORT`,
 `AHCLM_DB_HOST/PORT/USER/PASSWORD/NAME`, and `AHCLM_WORKERS`. Tranco remains fixed at
@@ -182,7 +167,6 @@ the corresponding environment override; no executable contains a fallback port. 
 | GET | `/api/certificates/expiring?days=`, `/expired` | expiry views |
 | GET | `/api/revocations` | revoked deployments |
 | GET | `/api/analysis/anomalies` | fast explainable finding index with cause and monitoring evidence |
-| GET | `/api/analysis/anomalies/cost?domain=` | on-demand current-problem cost comparison for the selected anomaly domain |
 | GET | `/api/schedule/upcoming` | upcoming adaptive scans |
 | POST | `/api/scan`, `/api/scan/batch` | on-demand scans for current monitored domains |
 | GET | `/api/scan/jobs` | recent scan-job audit trail |

@@ -45,9 +45,29 @@ scanner:
   endpoint_probe_concurrency: 4
   check_caa: true
   check_ct: true
-  ct_timeout: 8s
+  ct_timeout: 30s        # crt.sh round-trips measured at 3-12s; 8s timed out on most rounds and left 96% of findings with no independent issuance record
   ct_endpoint: "https://crt.sh"
   check_http_fingerprint: true
+  check_rdap: true
+  rdap_timeout: 8s
+  rdap_endpoint: "https://rdap.org"
+  check_asn: true
+  check_ripestat: true
+  ripestat_endpoint: "https://stat.ripe.net/data/prefix-overview/data.json"
+  check_official_prefixes: true
+  cloudflare_ipv4_url: "https://www.cloudflare.com/ips-v4"
+  cloudflare_ipv6_url: "https://www.cloudflare.com/ips-v6"
+  fastly_public_ip_url: "https://api.fastly.com/public-ip-list"
+  cloudfront_ip_url: "https://d7uri8nf7uskq.cloudfront.net/tools/list-cloudfront-ips"
+  aws_ip_ranges_url: "https://ip-ranges.amazonaws.com/ip-ranges.json"
+  bunny_edge_list_url: "https://api.bunny.net/system/edgeserverlist/plain"
+  check_chrome_log_list: true
+  chrome_log_list_url: "https://www.gstatic.com/ct/log_list/v3/log_list.json"
+  check_apple_log_list: true
+  apple_log_list_url: "https://valid.apple.com/ct/log_list/current_log_list.json"
+  check_sct_inclusion: true
+  check_certspotter: true
+  certspotter_endpoint: "https://api.certspotter.com/v1/issuances"
   ari_providers:
     - name: "Let's Encrypt"
       directory_url: "https://acme-v02.api.letsencrypt.org/directory"
@@ -77,30 +97,6 @@ scheduler:
   near_expiry_window: 48h
   ari_change_threshold: 1h
   ari_poll_due_tolerance: 1m
-
-# Deterministic cost basis for actively measured problem certificates.
-# The shipped values are normalized units, not claims about monetary prices.
-# Replace them with measured internal costs before interpreting totals as money.
-cost:
-  # Sensitivity assumptions around normalized weights, not confidence bounds.
-  weight_lower_multiplier: 1.0
-  weight_upper_multiplier: 1.0
-  currency: "normalized_unit"
-  issuance_cost: 1.0
-  ct_per_certificate_cost: 0.25
-  deployment_cost: 2.0
-  verification_cost: 0.5
-  active_measurement_cost: 0.1
-  manual_review_cost: 1.0
-  retry_cost: 1.0
-  rollback_cost: 2.0
-  revoked_service_per_hour: 8.0
-  residual_exposure_per_hour: 6.0
-  expired_service_per_hour: 10.0
-  partial_deployment_per_hour: 4.0
-  stale_certificate_per_hour: 3.0
-  unreachable_service_per_hour: 5.0
-  expiry_incident_cost: 20.0
 
 tranco:
   enabled: true

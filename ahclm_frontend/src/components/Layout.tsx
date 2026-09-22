@@ -76,18 +76,20 @@ export default function Layout() {
         </div>
       )}
 
-      {/* Desktop sidebar */}
-      <div className="hidden lg:fixed lg:inset-y-0 lg:flex lg:w-64 lg:flex-col">
+      {/* Desktop sidebar. Anomalies collapses to an icon rail so evidence/cause can own the viewport. */}
+      <div className={`hidden lg:fixed lg:inset-y-0 lg:flex lg:flex-col ${isAnomalyRoute ? 'lg:w-16' : 'lg:w-64'}`}>
         <div className="flex flex-col flex-1 bg-slate-900 border-r border-slate-700">
-          <div className="flex items-center gap-3 px-6 py-5 border-b border-slate-700">
-            <Activity className="h-8 w-8 text-primary-500" />
-            <div>
-              <h1 className="font-bold text-lg">AHCLM</h1>
-              <p className="text-xs text-slate-400">Certificate Lifecycle Monitor</p>
-            </div>
+          <div className={`flex items-center border-b border-slate-700 ${isAnomalyRoute ? 'justify-center px-2 py-4' : 'gap-3 px-6 py-5'}`}>
+            <Activity className={`${isAnomalyRoute ? 'h-7 w-7' : 'h-8 w-8'} text-primary-500`} />
+            {!isAnomalyRoute && (
+              <div>
+                <h1 className="font-bold text-lg">AHCLM</h1>
+                <p className="text-xs text-slate-400">Certificate Lifecycle Monitor</p>
+              </div>
+            )}
           </div>
 
-          <nav className="flex-1 px-4 py-4 space-y-1">
+          <nav className={`flex-1 py-4 space-y-1 ${isAnomalyRoute ? 'px-2' : 'px-4'}`}>
             {navigation.map((item) => {
               const isActive = location.pathname === item.href || location.pathname.startsWith(item.href + '/');
               const Icon = item.icon;
@@ -95,31 +97,37 @@ export default function Layout() {
                 <Link
                   key={item.name}
                   to={item.href}
-                  className={`flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${
+                  title={item.name}
+                  aria-label={item.name}
+                  className={`flex items-center rounded-lg transition-colors ${
+                    isAnomalyRoute ? 'justify-center px-2 py-3' : 'gap-3 px-4 py-3'
+                  } ${
                     isActive
                       ? 'bg-primary-600 text-white'
                       : 'text-slate-300 hover:bg-slate-800'
                   }`}
                 >
                   <Icon className="h-5 w-5" />
-                  {item.name}
+                  {!isAnomalyRoute && item.name}
                 </Link>
               );
             })}
           </nav>
 
-          <div className="p-4 border-t border-slate-700">
-            <p className="text-xs text-slate-500 text-center">
-              Adaptive HTTPS Certificate<br />
-              Lifecycle Monitoring System
-            </p>
-          </div>
+          {!isAnomalyRoute && (
+            <div className="p-4 border-t border-slate-700">
+              <p className="text-xs text-slate-500 text-center">
+                Adaptive HTTPS Certificate<br />
+                Lifecycle Monitoring System
+              </p>
+            </div>
+          )}
         </div>
       </div>
 
       {/* Main content */}
-      <div className="lg:pl-64 pt-16 lg:pt-0">
-        <main className="min-h-screen p-4 lg:p-8">
+      <div className={`${isAnomalyRoute ? 'lg:pl-16' : 'lg:pl-64'} pt-16 lg:pt-0`}>
+        <main className={`min-h-screen ${isAnomalyRoute ? 'p-3 lg:p-4' : 'p-4 lg:p-8'}`}>
           <Outlet />
         </main>
       </div>
