@@ -98,7 +98,7 @@ func TestUpdateEndpointStatesRetainsPerIPHistory(t *testing.T) {
 // replacement is what inflates the change counter on load-balanced domains.
 func TestSameIPReplacementsCountsOnlyOverlappingAddresses(t *testing.T) {
 	previous := map[string]models.EndpointState{
-		"192.0.2.1":   {IPAddress: "192.0.2.1", Fingerprint: "a"},
+		"192.0.2.1":    {IPAddress: "192.0.2.1", Fingerprint: "a"},
 		"198.51.100.1": {IPAddress: "198.51.100.1", Fingerprint: "b"},
 	}
 	got := sameIPReplacements(previous, map[string]string{"192.0.2.1": "c", "203.0.113.1": "d"})
@@ -119,7 +119,7 @@ func TestSameIPReplacementsCountsOnlyOverlappingAddresses(t *testing.T) {
 
 func TestCurrentEndpointLeavesPrefersProbeMap(t *testing.T) {
 	result := &models.ScanResult{
-		Cert: &models.Certificate{Fingerprint: "baseline"},
+		Cert:           &models.Certificate{Fingerprint: "baseline"},
 		ConnectionInfo: &models.ConnectionInfo{IPAddress: "192.0.2.1"},
 		EndpointProbes: []models.EndpointProbe{
 			{IPAddress: "192.0.2.1", Success: true, Fingerprint: "a"},

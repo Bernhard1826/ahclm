@@ -21,12 +21,16 @@ import type {
   TrancoList,
   RuntimeConfig,
   CauseDiagnosis,
-  EvidenceCase,
+  PublicKeyDeploymentCycle,
+  DeepDiagnosisReport,
+  MechanismReport,
   MeasurementSnapshot,
+  CDNPropagationConfig,
+  CDNPropagationExperiment,
+  CDNPropagationReport,
 } from '@/types';
 
-const apiURL = String(import.meta.env.VITE_API_URL || '').trim();
-if (!apiURL) throw new Error('VITE_API_URL must be set to the AHCLM API base URL');
+const apiURL = String(import.meta.env.VITE_API_URL || '/api').trim();
 
 const api = axios.create({
   baseURL: apiURL,
@@ -38,7 +42,9 @@ api.interceptors.response.use(
   (r) => r,
   (error: AxiosError<APIResponse<unknown>>) => {
     if (error.response?.data?.error) throw new Error(error.response.data.error);
-    throw error;
+    if (error.code === 'ECONNABORTED') throw new Error('请求超时，请稍后重试。');
+    if (!error.response) throw new Error('无法连接后端，请检查服务状态。');
+    throw new Error(`请求失败（HTTP ${error.response.status}）。`);
   }
 );
 
@@ -98,9 +104,24 @@ export const getExpiredCertificates = () =>
 export const getRevocations = () =>
   api.get<APIResponse<{ count: number; domains: DomainView[] }>>('/revocations').then((r) => r.data);
 
-export const getAnomalies = (limit = 100, page = 1) =>
+export const getAnomalies = (
+  limit = 100,
+  page = 1,
+  summary = false,
+  options?: { compact?: boolean; type?: string; domain?: string },
+) =>
   api
-    .get<APIResponse<{ count: number; page?: number; per_page?: number; total_pages?: number; anomalies: Anomaly[] }>>(`/analysis/anomalies?${qs({ per_page: limit, page })}`)
+    .get<APIResponse<{ count: number; page?: number; per_page?: number; total_pages?: number; anomalies: Anomaly[] }>>(
+      `/analysis/anomalies?${qs({
+        per_page: limit,
+        page,
+        summary: summary ? 1 : undefined,
+        compact: options?.compact ? 1 : undefined,
+        type: options?.type,
+        domain: options?.domain,
+      })}`,
+      { timeout: 300000 },
+    )
     .then((r) => r.data);
 
 export const getDiagnosis = (domain: string, type?: string) =>
@@ -108,13 +129,21 @@ export const getDiagnosis = (domain: string, type?: string) =>
     .get<APIResponse<{ domain: string; type?: string; diagnosis: CauseDiagnosis }>>(`/analysis/diagnosis?${qs({ domain, type })}`)
     .then((r) => r.data);
 
-export const getAnomalyEvidence = (domain: string, type?: string) =>
-  api
-    .get<APIResponse<{ domain: string; type?: string; diagnosis: CauseDiagnosis; investigation?: CauseDiagnosis['investigation']; evidence_case?: EvidenceCase; measurements: MeasurementSnapshot[] }>>(`/analysis/evidence?${qs({ domain, type })}`)
-    .then((r) => r.data);
-
 export const getPatterns = () =>
   api.get<APIResponse<Patterns>>('/analysis/patterns').then((r) => r.data);
+
+export const getMechanismInference = (domain: string) =>
+  api
+    .get<APIResponse<{ domain: string; mechanism_inference: MechanismReport }>>(`/analysis/mechanism-inference?${qs({ domain })}`)
+    .then((r) => r.data);
+
+export const getKeyCycle = (domain: string) =>
+  api
+    .get<APIResponse<{ domain: string; key_cycle: PublicKeyDeploymentCycle }>>(`/analysis/key-cycle?${qs({ domain })}`)
+    .then((r) => r.data);
+
+export const runDeepDiagnosis = (request: { domain: string; experiment: string; addresses?: string[] }) =>
+  api.post<APIResponse<DeepDiagnosisReport>>('/analysis/deep-probes', request, { timeout: 330000 }).then((r) => r.data);
 
 // Scanning
 export const scanDomain = (domain: string) =>
@@ -131,6 +160,33 @@ export const scanBatch = (domains: string[], workers: number) =>
 export const getScanStatus = () => api.get<APIResponse<ScanQueue>>('/scan/status').then((r) => r.data);
 export const getScanJobs = (limit = 20) =>
   api.get<APIResponse<{ count: number; jobs: ScanJob[] }>>(`/scan/jobs?limit=${limit}`).then((r) => r.data);
+
+export const getCDNPropagationConfig = () =>
+  api.get<APIResponse<CDNPropagationConfig>>('/cdn-propagation/config').then((r) => r.data);
+export const getCDNPropagationExperiments = (domain?: string) =>
+  api.get<APIResponse<{ count: number; experiments: CDNPropagationExperiment[] }>>(`/cdn-propagation?${qs({ domain })}`).then((r) => r.data);
+export const getCDNPropagationReport = (id: number) =>
+  api.get<APIResponse<CDNPropagationReport>>(`/cdn-propagation/experiments/${id}`).then((r) => r.data);
+export const startCDNPropagation = (request: {
+  domain: string;
+  vendor?: string;
+  certificate_layer?: 'edge' | 'origin' | 'origin_via_cdn';
+  probe_target?: string;
+  probe_host?: string;
+  probe_path?: string;
+  expected_http_status?: number;
+  watch_changes?: boolean;
+  previous_fingerprint?: string;
+  target_fingerprint?: string;
+  source_updated_at?: string;
+  source_time_basis?: string;
+  poll_interval_seconds?: number;
+  max_duration_seconds?: number;
+  stable_rounds?: number;
+  locations?: string[];
+}) => api.post<APIResponse<CDNPropagationReport>>('/cdn-propagation', request).then((r) => r.data);
+export const cancelCDNPropagation = (id: number) =>
+  api.post<APIResponse<{ status: string }>>(`/cdn-propagation/experiments/${id}/cancel`).then((r) => r.data);
 
 // Scheduler
 export const getSchedulerStatus = () =>

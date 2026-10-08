@@ -154,10 +154,130 @@ export interface MeasurementSnapshot {
   fingerprint_count: number;
   topology_json?: string;
   endpoint_fingerprints_json?: string;
+  endpoint_probes_json?: string;
   caa_json?: string;
   ct_json?: string;
   http_json?: string;
   errors_json?: string;
+}
+
+export interface CDNPropagationConfig {
+  enabled: boolean;
+  auto_start_on_change: boolean;
+  cdn_only: boolean;
+  watch_window_seconds: number;
+  poll_interval_seconds: number;
+  max_duration_seconds: number;
+  stable_rounds: number;
+  locations: string[];
+  certificate_layers?: string[];
+  provider: string;
+  origin_probe_target_required?: boolean;
+  origin_probe_target_type?: string;
+  origin_probe_host_role?: string;
+  probe_path_cache_busting?: boolean;
+  requires_monitored_domain: boolean;
+}
+
+export interface CDNPropagationExperiment {
+  created_at: string;
+  id: number;
+  domain: string;
+  vendor?: string;
+  certificate_layer: 'edge' | 'origin' | 'origin_via_cdn' | string;
+  probe_target: string;
+  probe_host?: string;
+  probe_path?: string;
+  expected_http_status?: number;
+  watch_changes: boolean;
+  status: 'queued' | 'running' | 'complete' | 'timeout' | 'canceled' | 'failed' | string;
+  previous_fingerprint?: string;
+  target_fingerprint: string;
+  source_updated_at: string;
+  source_time_basis: string;
+  started_at: string;
+  last_attempted_at?: string;
+  last_measured_at?: string;
+  next_measure_at: string;
+  completed_at?: string;
+  completion_reason?: string;
+  poll_interval_seconds: number;
+  max_duration_seconds: number;
+  stable_rounds_required: number;
+  stable_rounds: number;
+  expected_locations: number;
+  observed_locations: number;
+  target_locations: number;
+  rounds: number;
+  last_error?: string;
+  locations_json?: string;
+}
+
+export interface CDNPropagationRound {
+  id: number;
+  experiment_id: number;
+  round_number: number;
+  observed_at: string;
+  measurement_id?: string;
+  status: string;
+  answered_count: number;
+  target_count: number;
+  previous_count: number;
+  expected_count: number;
+  complete: boolean;
+  error?: string;
+}
+
+export interface CDNPropagationLocation {
+  location_key: string;
+  baseline_fingerprint?: string;
+  continent?: string;
+  region?: string;
+  country?: string;
+  city?: string;
+  asn?: number;
+  network?: string;
+  first_observed_at?: string;
+  first_target_at?: string;
+  last_previous_at?: string;
+  last_observed_at?: string;
+  latest_fingerprint?: string;
+  last_tls_observed: boolean;
+  last_origin_fingerprint?: string;
+  last_origin_verified: boolean;
+  last_error?: string;
+  last_request_succeeded: boolean;
+  last_http_status?: number;
+  first_request_success_at?: string;
+  target_seen: boolean;
+  previous_seen: boolean;
+  answered_rounds: number;
+  latency_lower_seconds?: number;
+  latency_seconds?: number;
+  state: string;
+}
+
+export interface CDNPropagationReport {
+  experiment: CDNPropagationExperiment;
+  rounds: CDNPropagationRound[];
+  locations: CDNPropagationLocation[];
+  changes?: Array<{
+    previous_fingerprint: string;
+    fingerprint: string;
+    first_seen_at: string;
+    last_seen_at: string;
+    regions: string[];
+    first_seen_spread_seconds: number;
+  }>;
+  first_target_at?: string;
+  all_regions_target_at?: string;
+  completed_at?: string;
+  source_to_first_seconds?: number;
+  source_to_all_regions_seconds?: number;
+  source_to_complete_seconds?: number;
+  synchronization_spread_seconds?: number;
+  sync_state: string;
+  interpretation: string;
 }
 
 export interface ScheduleEntry {
@@ -184,6 +304,7 @@ export interface Anomaly {
   inferred_evidence: string[];
   evidence_scope?: string;
   evidence_status?: string;
+  evidence_class?: 'deterministic' | 'speculative' | string;
   evidence_pending_reason?: string;
   fingerprint?: string;
   occurrence_count: number;
@@ -216,6 +337,8 @@ export interface ChurnShape {
   alternation_events: number;
   coexistence_proofs: number;
   same_endpoint_changes: number;
+  proven_successors?: number;
+  undated_endpoint_changes?: number;
   cross_endpoint_changes: number;
   unknown_endpoint_changes: number;
   effective_replacements: number;
@@ -251,6 +374,15 @@ export interface EndpointDivergence {
   predecessor_endpoints?: string[];
   residue_hours: number;
   stable_rounds: number;
+  stable_address_rounds?: number;
+  stable_address_span_hours?: number;
+  independent_lineages?: boolean;
+  address_pools?: number;
+  pooled_endpoints?: string[];
+  unobservable_endpoints?: string[];
+  predecessor_issued_at?: string;
+  successor_issued_at?: string;
+  address_returns?: number;
   consecutive_predecessor_rounds: number;
   predecessor_span_hours: number;
   resolver_consistent_rounds: number;
@@ -258,6 +390,10 @@ export interface EndpointDivergence {
   active_predecessor_endpoints?: string[];
   retired_predecessor_endpoints?: string[];
   strong_evidence: boolean;
+  reference_completed?: number;
+  reference_finished_within?: number;
+  reference_share?: number;
+  alert_share?: number;
   missing_evidence?: string[];
   reversal_conditions?: string[];
   cdn?: CDNEvidence | null;
@@ -283,11 +419,14 @@ export interface CDNEvidence {
 export interface EvidenceEndpoint {
   ip_address: string;
   provider_group?: string;
+  requested_sni?: string;
   fingerprint?: string;
+  default_fingerprint?: string;
   spki_fingerprint?: string;
   issuer_cn?: string;
   key_algorithm?: string;
   sans_hash?: string;
+  selection_interpretation?: string;
   success: boolean;
   active_dns: boolean;
   error?: string;
@@ -368,6 +507,72 @@ export interface CauseDiagnosis {
   evidence_case?: EvidenceCase | null;
   investigation?: Investigation | null;
   cause_status?: string;
+  internal_evidence?: InternalEvidenceSummary | null;
+}
+
+export interface InternalEvidenceSummary {
+  status: 'absent' | 'partial' | 'complete' | string;
+  determination: string;
+  root_cause_code?: string;
+  root_cause_label?: string;
+  conclusion?: string;
+  confidence: string;
+  event_count: number;
+  correlated_events: number;
+  source_systems?: string[];
+  event_types?: string[];
+  evidence?: string[];
+  missing?: string[];
+  next_required_events?: string[];
+  last_event_at?: string;
+}
+
+export interface PublicKeyDeploymentEvent {
+  at: string;
+  kind: string;
+  fingerprint?: string;
+  spki?: string;
+  previous?: string;
+  ip_address?: string;
+  region?: string;
+  source: string;
+  lower_bound?: boolean;
+  evidence_id?: number;
+  detail?: string;
+}
+
+export interface PublicKeyCycleMetrics {
+  issuance_to_first_public_basis?: 'exact_issuance' | 'not_before';
+  first_issued_at?: string;
+  first_issued_exact_at?: string;
+  first_deployed_at?: string;
+  first_retired_at?: string;
+  first_public_observed_at?: string;
+  last_change_at?: string;
+  issuance_to_first_public_seconds?: number;
+  deployment_to_first_public_seconds?: number;
+  first_public_to_stable_seconds?: number;
+  successor_to_previous_retirement_seconds?: number;
+  observed_span_seconds?: number;
+  address_count: number;
+  address_coverage: number;
+  stable_round_count: number;
+}
+
+export interface PublicKeyDeploymentCycle {
+  domain: string;
+  generated_at: string;
+  status: 'complete' | 'partial' | 'external_only' | string;
+  determination: string;
+  current_fingerprint?: string;
+  current_spki?: string;
+  certificate_count: number;
+  public_key_count: number;
+  same_key_replacements: number;
+  events: PublicKeyDeploymentEvent[];
+  metrics: PublicKeyCycleMetrics;
+  missing_evidence?: string[];
+  internal_evidence?: InternalEvidenceSummary | null;
 }
 
 export interface InvestigationRuledOut {
@@ -387,10 +592,13 @@ export interface EndpointExhibit {
   ip_address: string;
   active_dns: boolean;
   success: boolean;
+  requested_sni?: string;
   fingerprint?: string;
+  default_fingerprint?: string;
   spki_fingerprint?: string;
   issuer_cn?: string;
   key_algorithm?: string;
+  selection_interpretation?: string;
   error?: string;
 }
 
@@ -414,19 +622,40 @@ export interface ChangeExhibit {
   days_until_expiry?: number;
   previous_spki_fingerprint?: string;
   spki_fingerprint?: string;
+  previous_issuer_cn?: string;
+  issuer_cn?: string;
+  previous_common_name?: string;
+  common_name?: string;
+  previous_key_algorithm?: string;
+  key_algorithm?: string;
+  sans_added?: string[];
+  sans_removed?: string[];
+  issuer_changed?: boolean;
+  common_name_changed?: boolean;
+  key_algorithm_changed?: boolean;
+  public_key_changed?: boolean;
 }
 
 export interface CertificateExhibit {
   fingerprint: string;
   spki_fingerprint?: string;
   serial_number?: string;
+  issuer?: string;
   issuer_cn?: string;
+  subject?: string;
   common_name?: string;
   sans?: string[];
+  signature_algorithm?: string;
   key_algorithm?: string;
+  key_size?: number;
+  public_key_type?: string;
+  is_ca?: boolean;
+  self_signed?: boolean;
   validity_days?: number;
   not_before?: string;
   not_after?: string;
+  chain?: ChainEntry[];
+  pem?: string;
 }
 
 export interface Investigation {
@@ -448,18 +677,90 @@ export interface Investigation {
   inference?: InvestigationProofStep[];
   provider_groups?: ProviderExhibit[];
   change_sequence?: ChangeExhibit[];
+  related_names?: RelatedNameProbe[];
   certificates?: CertificateExhibit[];
   cdn?: CDNEvidence | null;
+  internal_evidence?: InternalEvidenceSummary | null;
+  impact?: FindingImpact | null;
+}
+
+export interface ImpactEffect {
+  kind: 'proven' | 'inferred' | string;
+  code: string;
+  label: string;
+  claim: string;
+  audience?: string;
+  evidence?: string[];
+}
+
+export interface FindingImpact {
+  summary: string;
+  severity_ceiling: string;
+  effects?: ImpactEffect[];
+  not_established?: string[];
 }
 
 
 export interface EndpointProbe {
   ip_address: string;
+  requested_sni?: string;
   success: boolean;
   fingerprint?: string;
   spki_fingerprint?: string;
   issuer_cn?: string;
   common_name?: string;
+  key_algorithm?: string;
+  key_size?: number;
+  serial_number?: string;
+  sans?: string[];
+  sans_hash?: string;
+  chain_fingerprints?: string[];
+  covers_requested_name?: boolean;
+  not_before?: string;
+  not_after?: string;
+  tls_version?: string;
+  cipher_suite?: string;
+  handshakes?: number;
+  other_fingerprints?: string[];
+  earliest_sct?: string;
+  error?: string;
+  selection_probes?: EndpointSelectionProbe[];
+  selection_analysis?: EndpointSelectionAnalysis;
+}
+
+export interface EndpointSelectionProbe {
+  variant: string;
+  requested_sni?: string;
+  success: boolean;
+  fingerprint?: string;
+  spki_fingerprint?: string;
+  issuer_cn?: string;
+  common_name?: string;
+  key_algorithm?: string;
+  key_size?: number;
+  serial_number?: string;
+  sans?: string[];
+  chain_fingerprints?: string[];
+  not_before?: string;
+  not_after?: string;
+  tls_version?: string;
+  cipher_suite?: string;
+  negotiated_protocol?: string;
+  covers_requested_name?: boolean;
+  error?: string;
+}
+
+export interface EndpointSelectionAnalysis {
+  requested_sni?: string;
+  selected_fingerprint?: string;
+  default_fingerprint?: string;
+  certificate_changed: boolean;
+  chain_changed?: boolean;
+  san_set_changed?: boolean;
+  selected_covers_requested_name: boolean;
+  default_covers_requested_name: boolean;
+  interpretation: string;
+  evidence?: string[];
   error?: string;
 }
 
@@ -487,12 +788,125 @@ export interface Patterns {
 
 export interface ConnectionInfo {
   protocol: string;
+  requested_sni?: string;
+  http_host?: string;
   tls_version: string;
   cipher_suite: string;
   negotiated_protocol?: string;
   alpn?: string;
   connection_time_ms: number;
   ip_address?: string;
+}
+
+export interface HTTPFingerprint {
+  ip_address?: string;
+  requested_sni?: string;
+  host_header?: string;
+  tls_fingerprint?: string;
+  tls_version?: string;
+  negotiated_protocol?: string;
+  status_code?: number;
+  server?: string;
+  via?: string;
+  cache?: string;
+  provider_signals?: string[];
+  redirect?: string;
+}
+
+export interface MechanismScore {
+  id: string;
+  name: string;
+  score: number;
+  ranked: boolean;
+  verdict?: string;
+}
+
+export interface MechanismColumn {
+  id: string;
+  name: string;
+}
+
+export interface MechanismMatrixEffect {
+  mechanism: string;
+  effect: 'support' | 'exclude' | string;
+  weight: number;
+}
+
+export interface MechanismMatrixRow {
+  id: string;
+  label: string;
+  observed: boolean;
+  effects: MechanismMatrixEffect[];
+}
+
+export interface MechanismEvidence {
+  id: string;
+  summary: string;
+  weights: Record<string, number>;
+}
+
+export interface MechanismReport {
+  domain: string;
+  status: 'supported' | 'ambiguous' | 'insufficient' | string;
+  most_supported?: string;
+  limitation: string;
+  columns?: MechanismColumn[];
+  matrix?: MechanismMatrixRow[];
+  scores: MechanismScore[];
+  evidence?: MechanismEvidence[];
+  counterexamples?: string[];
+  missing?: string[];
+}
+
+export interface DeepDiagnosisReport {
+  domain: string;
+  experiment: 'sni_selection' | 'repeat_handshake' | 'http_route' | string;
+  started_at: string;
+  question: string;
+  limitation: string;
+  probes?: EndpointProbe[];
+  http?: HTTPFingerprint;
+  observations?: string[];
+}
+
+export interface RelatedNameProbe {
+  name: string;
+  first_observed_at?: string;
+  last_observed_at?: string;
+  added_count: number;
+  removed_count: number;
+  branch_like_label?: boolean;
+  probed_at: string;
+  dns_status: 'active' | 'no_public_address' | 'inconclusive' | string;
+  resolver_quorum?: number;
+  resolved_ips?: string[];
+  cname_chain?: string[];
+  tls_answered: boolean;
+  fingerprint?: string;
+  issuer_cn?: string;
+  common_name?: string;
+  sans?: string[];
+  covers_own_name?: boolean;
+  covers_root_name?: boolean;
+  shares_root_ip?: boolean;
+  shares_root_cname?: boolean;
+  shares_root_leaf?: boolean;
+  http?: HTTPFingerprint;
+  error?: string;
+}
+
+export interface DeepEvidence {
+  collected_at: string;
+  topology?: unknown;
+  caa?: unknown[];
+  ct?: unknown[];
+  scts?: unknown[];
+  http?: HTTPFingerprint;
+  directory?: unknown;
+  endpoint_probes?: EndpointProbe[];
+  related_names?: RelatedNameProbe[];
+  errors?: string[];
+  status: string;
 }
 
 export interface ScanResult {
@@ -514,7 +928,7 @@ export interface ScanResult {
   resolved_ips?: string[];
   endpoint_probes?: EndpointProbe[];
   topology?: unknown;
-  deep_evidence?: unknown;
+  deep_evidence?: DeepEvidence;
   measurement_trigger?: string;
 }
 
@@ -616,8 +1030,9 @@ export interface SchedulerStatus {
 export interface RuntimeConfig {
   server: { host: string; port: number; cors: boolean; cors_origins: string[] };
   database: { host: string; port: number; database: string; sslmode: string; max_open_connections: number; max_idle_connections: number; conn_max_lifetime: string };
-  scanner: { tls_port: number; timeout: string; workers: number; rate_limit: number; check_revocation: boolean; check_crl: boolean; check_ari: boolean; dns_resolvers?: string[]; max_endpoint_samples?: number; endpoint_probe_concurrency?: number; check_caa?: boolean; check_ct?: boolean; ct_endpoint?: string; check_http_fingerprint?: boolean; check_rdap?: boolean; rdap_endpoint?: string; check_asn?: boolean; check_ripestat?: boolean; check_official_prefixes?: boolean; check_chrome_log_list?: boolean; check_apple_log_list?: boolean; check_sct_inclusion?: boolean; check_certspotter?: boolean; official_cdn_prefixes?: number; chrome_ct_logs?: number; apple_ct_logs?: number };
+  scanner: { tls_port: number; timeout: string; workers: number; rate_limit: number; check_revocation: boolean; check_crl: boolean; check_ari: boolean; dns_resolvers?: string[]; max_endpoint_samples?: number; endpoint_probe_concurrency?: number; related_name_probe_limit?: number; related_name_probe_timeout?: string; check_caa?: boolean; check_ct?: boolean; ct_endpoint?: string; check_http_fingerprint?: boolean; check_rdap?: boolean; rdap_endpoint?: string; check_asn?: boolean; check_ripestat?: boolean; check_official_prefixes?: boolean; check_chrome_log_list?: boolean; check_apple_log_list?: boolean; check_sct_inclusion?: boolean; check_certspotter?: boolean; official_cdn_prefixes?: number; chrome_ct_logs?: number; apple_ct_logs?: number };
   scheduler: { enabled: boolean; milestones: number[]; post_expiry_checks: number[]; baseline_interval: string; near_expiry_interval: string; min_gap: string; ari_poll_interval: string; revocation_poll_interval: string; max_daily_scans: number };
+  propagation?: { enabled: boolean; auto_start_on_change: boolean; cdn_only: boolean; poll_interval: string; max_duration: string; stable_rounds: number; locations: string[]; timeout: string; max_active: number };
   tranco: { enabled: boolean; source_url: string; max_domains: number; refresh_interval: string; fetch_on_start: boolean };
   local_lists: { enabled: boolean; refresh_interval: string; fetch_on_start: boolean; sources: { name: string; path: string; format: string; max_domains: number }[] };
 }

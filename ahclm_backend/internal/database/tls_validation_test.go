@@ -161,6 +161,38 @@ func TestHostnameMismatchProofCitesVerifyHostnameDetail(t *testing.T) {
 	}
 }
 
+func TestHostnameMismatchProofShowsSNIBindingEvidence(t *testing.T) {
+	checkedAt := time.Date(2026, 9, 20, 2, 19, 31, 0, time.UTC)
+	fp := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	findings, _ := json.Marshal([]models.TLSFinding{{
+		Code:        "hostname_mismatch",
+		Detail:      "x509: certificate is valid for *.platform.example, not requested.example",
+		IPAddress:   "192.0.2.10",
+		Fingerprint: fp,
+	}})
+	probes, _ := json.Marshal([]models.EndpointProbe{{
+		IPAddress: "192.0.2.10", RequestedSNI: "requested.example", Success: true, Fingerprint: fp, CoversRequestedName: false,
+		SelectionAnalysis: &models.EndpointSelectionAnalysis{
+			RequestedSNI: "requested.example", SelectedFingerprint: fp, DefaultFingerprint: fp,
+			SelectedCoversRequestedName: false, DefaultCoversRequestedName: false,
+			Interpretation: "same_default_certificate_name_mismatch",
+		},
+	}})
+	item := models.Anomaly{Domain: "requested.example", Type: "hostname_mismatch", DetectedAt: checkedAt}
+	context := diagnosisContext{
+		state:        &models.DomainCertificate{Domain: "requested.example", TLSFindings: string(findings), TLSCheckedAt: &checkedAt},
+		observations: []models.CertObservation{{ObservationType: "hostname_mismatch", ObservedAt: checkedAt, EndpointProbes: string(probes)}},
+	}
+	diagnosis := inferTLSValidationDiagnosis(item, context)
+	investigation := buildInvestigation(item, context, diagnosis)
+	if !hasProofLabel(investigation.Proof, "SNI selection control") {
+		t.Fatalf("missing SNI selection proof: %#v", investigation.Proof)
+	}
+	if !proofEvidenceContains(investigation.Proof, "selected_covers_requested_name=false") || !proofEvidenceContains(investigation.Proof, "same_default_certificate_name_mismatch") {
+		t.Fatalf("SNI selection evidence missing: %#v", investigation.Proof)
+	}
+}
+
 func TestNonHTTPSIdentityNameMismatchIsWithdrawn(t *testing.T) {
 	checkedAt := time.Date(2026, 9, 19, 2, 19, 31, 0, time.UTC)
 	cases := []struct {

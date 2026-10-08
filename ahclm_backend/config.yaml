@@ -5,7 +5,7 @@ server:
   cors_origins: ["http://127.0.0.1:25173", "http://localhost:25173"]
   cors_max_age: 12h
   read_timeout: 30s
-  write_timeout: 60s
+  write_timeout: 300s
   idle_timeout: 120s
   shutdown_timeout: 20s
 
@@ -42,7 +42,30 @@ scanner:
   # a real topology transition.
   dns_resolvers: ["https://cloudflare-dns.com/dns-query", "https://dns.google/resolve", "https://dns.quad9.net/dns-query"]
   max_endpoint_samples: 16
+  # TLS handshakes per address in an endpoint survey. More than one proves, within
+  # one round, when an address fronts servers holding different certificates.
+  endpoint_handshakes: 3
+  # Every sampled address also receives one no-SNI control handshake. The result
+  # is retained separately so SNI-selected and default certificates are not
+  # confused with endpoint-to-endpoint diversity.
   endpoint_probe_concurrency: 4
+  # Per deep round, actively recheck this many SAN names that were added or
+  # removed during recent certificate replacements. Rounds rotate candidates.
+  related_name_probe_limit: 8
+  # Separate bounded budget: root CT/OCSP checks cannot cancel this follow-up.
+  related_name_probe_timeout: 90s
+  # Deep/manual scans also obtain a bounded independent DNS trace and HTTPS
+  # handshake from three continents. This distinguishes a globally published
+  # bad endpoint from a location-specific CDN/edge symptom.
+  check_global_probes: true
+  global_probe_endpoint: "https://api.globalping.io"
+  # Set AHCLM_GLOBALPING_TOKEN in the environment for Globalping access.
+  global_probe_token: ""
+  global_probe_timeout: 45s
+  global_probe_locations: ["NA", "EU", "AS"]
+  # Keep routine anomaly/deep-scan enrichment from consuming the full
+  # Globalping account allowance needed by the CDN propagation worker.
+  global_probe_scan_tests_per_hour: 100
   check_caa: true
   check_ct: true
   ct_timeout: 30s        # crt.sh round-trips measured at 3-12s; 8s timed out on most rounds and left 96% of findings with no independent issuance record
@@ -98,6 +121,21 @@ scheduler:
   ari_change_threshold: 1h
   ari_poll_due_tolerance: 1m
 
+# A separate, bounded worker measures how quickly a newly observed leaf reaches
+# independent Globalping locations. The source timestamp can also be supplied
+# explicitly through the propagation API for controlled certificate rotations.
+propagation:
+  enabled: true
+  auto_start_on_change: true
+  cdn_only: true
+  watch_window: 24h
+  poll_interval: 15m
+  max_duration: 72h
+  stable_rounds: 2
+  locations: ["NA", "EU", "AS"]
+  timeout: 45s
+  max_active: 32
+
 tranco:
   enabled: true
   source_url: "https://tranco-list.eu/top-1m.csv.zip"
@@ -135,3 +173,13 @@ alerts:
   email_to: ""
   email_user: ""
   email_password: ""
+
+# Operator standards applied by the diagnosis (not measurements).
+analysis:
+  # An open certificate rollout is reported as stuck when the time both the old
+  # and the new leaf were proven live is longer than this share of the
+  # completed rollouts in the reference distribution certainly took. The
+  # distribution is measured from retained snapshots (see
+  # ahclm_rollout_duration_statistics.md); 0 disables the stuck verdict.
+  rollout_alert_share: 0.99
+  rollout_reference_refresh: 6h

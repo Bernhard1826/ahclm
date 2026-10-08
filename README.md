@@ -48,6 +48,18 @@ addresses that with two ideas:
   scan pipeline.
 - **Persisted scan-job audit trail** — records why every scheduled/manual scan
   ran, its timing, result, certificate fingerprint, revocation and ARI status.
+- **CDN certificate propagation experiments** — after an observed same-endpoint
+  replacement, independently poll configured Globalping regions and retain each TLS
+  leaf fingerprint, answering address, first target time, the last predecessor
+  observation before that target, regional spread, and separate all-regions and
+  stable-confirmation bounds. Operators can also start a controlled experiment
+  with the source-side update time and known predecessor/successor leaves.
+  This measures public regional observations, not the CDN's private deployment logs.
+  Controlled origin rotations additionally verify per-region fresh responses and
+  the certificate on the actual origin TLS connection; HTTP 200 alone cannot
+  complete a rotation. Overflow experiments are persisted in a restart-safe queue.
+  See [受控源站换证实验](docs/origin-certificate-experiment.md) for the origin
+  endpoint, reload event, submission script, measurement bounds, and tests.
 - **Change / revocation / anomaly detection** with a lifecycle timeline per domain.
 - **Alerts** — log + webhook + SMTP on expiring / changed / revoked / expired.
 - **React dashboard** — domains, per-domain timeline, adaptive schedule, anomalies,
@@ -87,6 +99,9 @@ ahclm/
 | `crl_cache_entries` | persisted CRL payloads keyed by distribution-point URL |
 | `tranco_lists` | fetched-list metadata |
 | `certificate_alerts` | alert rules (API CRUD) |
+| `cdn_propagation_experiments` | source/update timing, target leaf, cadence, region coverage, and completion state |
+| `cdn_propagation_rounds` | immutable per-poll aggregate results |
+| `cdn_propagation_observations` | per-region leaf fingerprint, address, and handshake result |
 
 ## Quick start
 
@@ -100,6 +115,18 @@ ahclm/
 ```bash
 docker compose --env-file .env up -d
 ```
+
+### Linux (frontend + backend)
+
+```bash
+./start.sh          # start Postgres (if needed), backend, and frontend
+./start.sh status
+./start.sh stop
+```
+
+The script reads optional `.env` overrides, builds `bin/ahclm-backend`, and writes
+timestamped logs plus pid files under `logs/`. UI: `http://127.0.0.1:25173`.
+API: `http://127.0.0.1:28000/api/health`.
 
 ### Backend (PowerShell)
 ```powershell
@@ -136,6 +163,16 @@ scheduler:
   near_expiry_interval: 6h              # within ~1 day of expiry
   ari_poll_interval: 24h                # fallback when ARI omits Retry-After
   max_daily_scans: 100000
+propagation:
+  enabled: true
+  auto_start_on_change: true
+  cdn_only: true
+  poll_interval: 15m
+  max_duration: 72h
+  stable_rounds: 2
+  locations: ["NA", "EU", "AS"]
+  timeout: 45s
+  max_active: 32
 tranco:    { enabled: true, max_domains: 10000, fetch_on_start: true }
 local_lists:
   enabled: true
@@ -147,13 +184,18 @@ local_lists:
 ```
 
 Environment overrides: `AHCLM_CONFIG_FILE`, `AHCLM_BACKEND_HOST`, `AHCLM_BACKEND_PORT`,
-`AHCLM_DB_HOST/PORT/USER/PASSWORD/NAME`, and `AHCLM_WORKERS`. Tranco remains fixed at
+`AHCLM_DB_HOST/PORT/USER/PASSWORD/NAME`, `AHCLM_WORKERS`, and `AHCLM_GLOBALPING_TOKEN`.
+Keep the Globalping token in the local `.env` file (copy `.env.example` first); the
+environment value overrides the empty `scanner.global_probe_token` config default.
+Tranco remains fixed at
 its first 10,000 entries; local lists are additional and refreshed as a union.
 
-The frontend requires `AHCLM_FRONTEND_HOST`, `AHCLM_FRONTEND_PORT`, `AHCLM_API_PROXY` and
-`VITE_API_URL`. The backend and database ports are read from the explicit configuration or
-the corresponding environment override; no executable contains a fallback port. See
-`.env.example`.
+The frontend accepts `AHCLM_FRONTEND_HOST`, `AHCLM_FRONTEND_PORT`, `AHCLM_API_PROXY` and
+`VITE_API_URL`; when omitted, the Vite development defaults are `127.0.0.1:25173`,
+`http://127.0.0.1:28000`, and `/api`. When the Vite proxy cannot reach the backend through
+the listener address, set `AHCLM_API_PROXY_TARGET` to the backend's reachable network
+address. The backend and database ports are read from the explicit configuration or the
+corresponding environment override. See `.env.example`.
 
 ## API
 
@@ -166,10 +208,15 @@ the corresponding environment override; no executable contains a fallback port. 
 | GET | `/api/certificates` | distinct-certificate inventory |
 | GET | `/api/certificates/expiring?days=`, `/expired` | expiry views |
 | GET | `/api/revocations` | revoked deployments |
-| GET | `/api/analysis/anomalies` | fast explainable finding index with cause and monitoring evidence |
+| GET | `/api/analysis/anomalies` | observed finding index with deterministic/speculative class, certificate evidence, and monitoring rounds |
+| GET | `/api/analysis/diagnosis?domain=&type=` | on-demand longitudinal diagnosis for one observed finding |
 | GET | `/api/schedule/upcoming` | upcoming adaptive scans |
 | POST | `/api/scan`, `/api/scan/batch` | on-demand scans for current monitored domains |
 | GET | `/api/scan/jobs` | recent scan-job audit trail |
+| GET | `/api/cdn-propagation/config` | propagation cadence and configured regions |
+| GET/POST | `/api/cdn-propagation` | list experiments / start a controlled experiment |
+| GET | `/api/cdn-propagation/experiments/:id` | regional rollout report and observation rounds |
+| POST | `/api/cdn-propagation/experiments/:id/cancel` | stop an active experiment |
 | GET/POST | `/api/scheduler/status`, `/pause`, `/resume`, `/tranco`, `/local-lists` | scheduler control and population refresh |
 | GET | `/api/statistics/daily` | daily counters |
 | GET/POST/PUT/DELETE | `/api/alerts` | alert rules |

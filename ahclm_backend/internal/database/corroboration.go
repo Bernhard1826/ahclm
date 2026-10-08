@@ -13,6 +13,13 @@ func attachIndependentCorroboration(corroboration *models.EvidenceCorroboration,
 	}
 	snapshots := context.snapshots
 	corroboration.SCTPresented, corroboration.SCTCount, corroboration.SCTLogCount, corroboration.SCTQualifiedLogs, corroboration.SCTAppleLogs, corroboration.SCTInclusionProofs, corroboration.SCTNote = analyzeSCTCorroboration(snapshots)
+	for _, snapshot := range snapshots {
+		for _, observation := range snapshotSCTs(snapshot) {
+			if observation.SignatureVerified {
+				corroboration.SCTVerified = true
+			}
+		}
+	}
 	corroboration.DirectoryCoverage, corroboration.DirectoryStatus, corroboration.DirectoryNote = analyzeDirectoryCorroboration(snapshots)
 	corroboration.NSCoverage = nsCoverage(snapshots)
 	corroboration.NSRDAPAgreement, corroboration.DirectoryNote = analyzeNSRDAPAgreement(snapshots, corroboration.DirectoryNote)
@@ -22,6 +29,29 @@ func attachIndependentCorroboration(corroboration *models.EvidenceCorroboration,
 	}
 	if corroboration.TimingNote == "" {
 		corroboration.TimingNote = analyzeTimingCorroboration(snapshots, context)
+	}
+}
+
+// attachGlobalProbeCorroboration records only remote observations that match
+// an already established local leaf. A different remote fingerprint is useful
+// for later inspection but is not silently treated as evidence of the local
+// predecessor or defect.
+func attachGlobalProbeCorroboration(corroboration *models.EvidenceCorroboration, divergence models.EndpointDivergence) {
+	if corroboration == nil {
+		return
+	}
+	corroboration.GlobalProbeRegions = len(divergence.GlobalHTTPSRegions)
+	corroboration.GlobalPredecessorRegions = len(divergence.GlobalPredecessorRegions)
+	corroboration.GlobalDefectiveRegions = len(divergence.GlobalDefectiveRegions)
+	switch {
+	case divergence.GlobalProbeRounds == 0:
+		corroboration.GlobalProbeNote = "No retained multi-region HTTPS round corroborates this finding."
+	case len(divergence.GlobalPredecessorRegions) > 0:
+		corroboration.GlobalProbeNote = "Remote HTTPS probes also reached the locally established predecessor from " + itoa(len(divergence.GlobalPredecessorRegions)) + " region(s)."
+	case len(divergence.GlobalDefectiveRegions) > 0:
+		corroboration.GlobalProbeNote = "Remote HTTPS probes also rejected the locally validated defective leaf from " + itoa(len(divergence.GlobalDefectiveRegions)) + " region(s)."
+	default:
+		corroboration.GlobalProbeNote = "Multi-region HTTPS probes were retained, but none matched the locally established predecessor or defective leaf in the latest retained global round."
 	}
 }
 
@@ -53,7 +83,7 @@ func analyzeSCTCorroboration(snapshots []models.MeasurementSnapshot) (presented 
 			if observation.AppleListed {
 				appleIDs[observation.LogID] = struct{}{}
 			}
-			if observation.Inclusion == models.SCTInclusionProven {
+			if observation.Inclusion == models.SCTInclusionProven && observation.SignatureVerified && observation.STHVerified {
 				includedIDs[observation.LogID] = struct{}{}
 			}
 			if observation.Operator != "" {
@@ -84,7 +114,7 @@ func analyzeSCTCorroboration(snapshots []models.MeasurementSnapshot) (presented 
 	if included > 0 {
 		note += ", proving the served leaf was logged."
 	} else {
-		note += ", proving the served leaf was submitted to Certificate Transparency."
+		note += "; SCT presence alone does not prove submission: a valid log signature is required."
 	}
 	return true, count, logs, qualified, apple, included, note
 }

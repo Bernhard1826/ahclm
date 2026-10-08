@@ -2,23 +2,19 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
 
-function requiredPort(name: string): number {
-	const value = Number.parseInt(process.env[name] || '', 10);
+function configuredPort(name: string, fallback: number): number {
+	const raw = process.env[name];
+	if (!raw) return fallback;
+	const value = Number.parseInt(raw, 10);
 	if (!Number.isInteger(value) || value < 1 || value > 65535) {
 		throw new Error(`${name} must be set to a port in 1..65535`);
 	}
 	return value;
 }
 
-const frontendPort = requiredPort('AHCLM_FRONTEND_PORT');
-const apiProxy = (process.env.AHCLM_API_PROXY || '').trim();
-if (!apiProxy) {
-	throw new Error('AHCLM_API_PROXY must be set; the frontend has no implicit backend address');
-}
-const frontendHost = (process.env.AHCLM_FRONTEND_HOST || '').trim();
-if (!frontendHost) {
-	throw new Error('AHCLM_FRONTEND_HOST must be set');
-}
+const frontendPort = configuredPort('AHCLM_FRONTEND_PORT', 25173);
+const apiProxy = (process.env.AHCLM_API_PROXY_TARGET || process.env.AHCLM_API_PROXY || 'http://127.0.0.1:28000').trim();
+const frontendHost = (process.env.AHCLM_FRONTEND_HOST || '127.0.0.1').trim();
 
 export default defineConfig({
   plugins: [react()],

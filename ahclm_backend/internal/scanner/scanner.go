@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -26,13 +27,39 @@ import (
 // Scanner performs TLS handshakes to capture the deployed certificate chain and
 // (optionally) its revocation status. It behaves like a lightweight zgrab.
 type Scanner struct {
-	config    *models.ScannerConfig
-	client    *http.Client
-	checker   *revocation.Checker
-	ari       *ari.Checker
-	datasets  *datasetFetcher
-	rateLimit chan struct{}
-	wg        sync.WaitGroup
+	config         *models.ScannerConfig
+	client         *http.Client
+	evidenceClient *http.Client
+	checker        *revocation.Checker
+	ari            *ari.Checker
+	datasets       *datasetFetcher
+	rateLimit      chan struct{}
+	wg             sync.WaitGroup
+	// External CT services are paced and back off after HTTP 429; results
+	// for the same query are reused instead of asked for again.
+	crtsh                 *serviceGate
+	certSpotter           *serviceGate
+	globalPing            *serviceGate
+	globalProbeScanBudget *globalProbeScanBudget
+	// ipv6Route is false when this vantage has no route to IPv6 addresses;
+	// such addresses are recorded as unobservable instead of being dialled.
+	ipv6Route bool
+	// probeHandshake replaces the endpoint handshake in legacy tests. The
+	// SNI-aware hook below is used by selection-matrix tests and production
+	// probes when the requested SNI must be varied.
+	probeHandshake        func(ctx context.Context, domain, address string) ([]*x509.Certificate, []byte, *models.ConnectionInfo, error)
+	probeHandshakeWithSNI func(ctx context.Context, domain, address, serverName string) ([]*x509.Certificate, []byte, *models.ConnectionInfo, error)
+}
+
+type freshGlobalProbeContextKey struct{}
+
+func withFreshGlobalProbes(ctx context.Context) context.Context {
+	return context.WithValue(ctx, freshGlobalProbeContextKey{}, true)
+}
+
+func requestsFreshGlobalProbes(ctx context.Context) bool {
+	fresh, _ := ctx.Value(freshGlobalProbeContextKey{}).(bool)
+	return fresh
 }
 
 // PersistentCacheStore combines the optional ARI and CRL persistence
@@ -58,8 +85,29 @@ func NewScanner(cfg *models.ScannerConfig, cacheStore PersistentCacheStore) (*Sc
 	if cfg.MaxEndpointSamples <= 0 {
 		cfg.MaxEndpointSamples = 16
 	}
+	if cfg.EndpointHandshakes <= 0 {
+		cfg.EndpointHandshakes = 3
+	}
 	if cfg.EndpointProbeConcurrency <= 0 {
 		cfg.EndpointProbeConcurrency = 4
+	}
+	if cfg.RelatedNameProbeLimit <= 0 {
+		cfg.RelatedNameProbeLimit = 8
+	}
+	if cfg.RelatedNameProbeTimeout <= 0 {
+		cfg.RelatedNameProbeTimeout = 90 * time.Second
+	}
+	if strings.TrimSpace(cfg.GlobalProbeEndpoint) == "" {
+		cfg.GlobalProbeEndpoint = "https://api.globalping.io"
+	}
+	if cfg.GlobalProbeTimeout <= 0 {
+		cfg.GlobalProbeTimeout = 45 * time.Second
+	}
+	if cfg.GlobalProbeScanTestsPerHour <= 0 {
+		cfg.GlobalProbeScanTestsPerHour = 100
+	}
+	if len(cfg.GlobalProbeLocations) == 0 {
+		cfg.GlobalProbeLocations = []string{"NA", "EU", "AS"}
 	}
 	if cfg.CTTimeout <= 0 {
 		cfg.CTTimeout = 5 * time.Second
@@ -127,11 +175,19 @@ func NewScanner(cfg *models.ScannerConfig, cacheStore PersistentCacheStore) (*Sc
 		return nil, err
 	}
 	scan := &Scanner{
-		config:    cfg,
-		client:    &http.Client{Transport: transport, Timeout: cfg.Timeout},
-		checker:   revocation.NewChecker(cfg.RevocationTimeout, cfg.CheckCRL, cfg.CRLCacheTTL, cacheStore),
-		ari:       ariChecker,
-		rateLimit: rl,
+		config:         cfg,
+		client:         &http.Client{Transport: transport, Timeout: cfg.Timeout},
+		evidenceClient: &http.Client{Timeout: cfg.Timeout},
+		checker:        revocation.NewChecker(cfg.RevocationTimeout, cfg.CheckCRL, cfg.CRLCacheTTL, cacheStore),
+		ari:            ariChecker,
+		rateLimit:      rl,
+		// crt.sh and the unauthenticated CertSpotter API throttle aggressively:
+		// one request every few seconds, reused for a day per query.
+		crtsh:                 newServiceGate("crt.sh", 3*time.Second, 24*time.Hour, 20000),
+		certSpotter:           newServiceGate("CertSpotter", 2*time.Second, 24*time.Hour, 20000),
+		globalPing:            newServiceGate("Globalping", time.Second, 30*time.Minute, 2000),
+		globalProbeScanBudget: newGlobalProbeScanBudget(cfg.GlobalProbeScanTestsPerHour),
+		ipv6Route:             hasIPv6Route(),
 	}
 	if cfg.CheckOfficialPrefixes || cfg.CheckChromeLogList || cfg.CheckAppleLogList || cfg.CheckRIPEstat {
 		scan.datasets = newDatasetFetcher(cfg)
@@ -145,6 +201,13 @@ func NewScanner(cfg *models.ScannerConfig, cacheStore PersistentCacheStore) (*Sc
 // by Enrich so routine TLS monitoring does not fan out to external services.
 func (s *Scanner) Scan(ctx context.Context, domain string) (*models.ScanResult, error) {
 	return s.scan(ctx, domain, true)
+}
+
+// ScanFresh performs a complete scan while bypassing cached Globalping probe
+// results. It uses one cross-region HTTPS measurement so repeated manual
+// remeasurement does not spend a second API measurement on a DNS trace.
+func (s *Scanner) ScanFresh(ctx context.Context, domain string) (*models.ScanResult, error) {
+	return s.scan(withFreshGlobalProbes(ctx), domain, true)
 }
 
 // ScanBaseline captures only the endpoint's TLS state and certificate chain.
@@ -212,6 +275,9 @@ func (s *Scanner) scan(ctx context.Context, domain string, enrich bool) (*models
 	result.ConnectionInfo = connInfo
 	if connInfo != nil {
 		connInfo.SCTs = mergeSCTObservations(append(append([]models.SCTObservation(nil), connInfo.SCTs...), parseEmbeddedSCTs(chain[0])...))
+		for i := range connInfo.SCTs {
+			connInfo.SCTs[i].SignatureVerified = verifySCTSignature(chain, connInfo.SCTs[i])
+		}
 		connInfo.ResolvedIPs = append([]string(nil), result.ResolvedIPs...)
 		// Keep the resolver snapshot pure. The dialled address can be a local
 		// transparent-egress endpoint and is already retained separately in
@@ -279,7 +345,14 @@ func (s *Scanner) queryDoH(ctx context.Context, resolver, domain, recordType str
 	return append(payload.Answer, payload.Authority...), nil
 }
 
+// wireOnlyResolvers remembers resolvers that rejected the JSON query form, so
+// later queries go straight to RFC 8484 instead of paying two round trips.
+var wireOnlyResolvers sync.Map
+
 func (s *Scanner) queryDoHPayload(ctx context.Context, resolver, domain, recordType string) (dohPayload, error) {
+	if _, wireOnly := wireOnlyResolvers.Load(resolver); wireOnly {
+		return s.queryDoHWire(ctx, resolver, domain, recordType)
+	}
 	endpoint, err := url.Parse(strings.TrimSpace(resolver))
 	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" {
 		return dohPayload{}, fmt.Errorf("invalid DoH resolver %q", resolver)
@@ -300,6 +373,16 @@ func (s *Scanner) queryDoHPayload(ctx context.Context, resolver, domain, recordT
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		// Quad9's /dns-query only speaks RFC 8484 wire format and answers the
+		// JSON name/type query with 400; switch that resolver to wire format.
+		if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnsupportedMediaType {
+			wireOnlyResolvers.Store(resolver, true)
+			payload, wireErr := s.queryDoHWire(ctx, resolver, domain, recordType)
+			if wireErr != nil {
+				return dohPayload{}, fmt.Errorf("DoH resolver returned HTTP %d for JSON; wire format: %w", resp.StatusCode, wireErr)
+			}
+			return payload, nil
+		}
 		return dohPayload{}, fmt.Errorf("DoH resolver returned HTTP %d", resp.StatusCode)
 	}
 	var payload dohPayload
@@ -345,7 +428,15 @@ func (s *Scanner) resolveTopology(ctx context.Context, domain string) *models.To
 				if payload.AD {
 					dnssecHits++
 				}
-				answers := append(payload.Answer, payload.Authority...)
+				// NS records from the authority section of an A/AAAA response are
+				// referral/delegation material, not necessarily the zone's own
+				// authoritative servers. Only the NS answer section is used for
+				// direct authoritative probing; otherwise a recursive referral can
+				// pollute the nameserver set and make the comparison meaningless.
+				answers := payload.Answer
+				if typ != "NS" {
+					answers = append(answers, payload.Authority...)
+				}
 				for _, answer := range answers {
 					if answer.TTL > 0 && (obs.TTL == 0 || answer.TTL < obs.TTL) {
 						obs.TTL = answer.TTL
@@ -380,8 +471,8 @@ func (s *Scanner) resolveTopology(ctx context.Context, domain string) *models.To
 			}
 			if len(obs.NS) == 0 {
 				if parent := parentDomain(domain); parent != "" && parent != domain {
-					if answers, err := s.queryDoH(resolverCtx, resolver, parent, "NS"); err == nil {
-						for _, answer := range answers {
+					if payload, err := s.queryDoHPayload(resolverCtx, resolver, parent, "NS"); err == nil {
+						for _, answer := range payload.Answer {
 							if answer.Type != 2 {
 								continue
 							}
@@ -489,14 +580,17 @@ func (s *Scanner) resolveTopology(ctx context.Context, domain string) *models.To
 	sort.Strings(snapshot.CNAMEChain)
 	sort.Strings(snapshot.HTTPSTargets)
 	sort.Strings(snapshot.NSHosts)
+	s.enrichAuthoritativeTopology(ctx, domain, snapshot)
 	snapshot.DNSSECValidated = dnssecValidated
 	canonical, _ := json.Marshal(struct {
-		IPs       []string `json:"ips"`
-		Consensus []string `json:"consensus"`
-		CNAME     []string `json:"cname"`
-		HTTPS     []string `json:"https"`
-		NS        []string `json:"ns"`
-	}{snapshot.PublicIPs, snapshot.ConsensusIPs, snapshot.CNAMEChain, snapshot.HTTPSTargets, snapshot.NSHosts})
+		IPs        []string `json:"ips"`
+		Consensus  []string `json:"consensus"`
+		CNAME      []string `json:"cname"`
+		HTTPS      []string `json:"https"`
+		NS         []string `json:"ns"`
+		Authority  []string `json:"authority"`
+		AuthorityC []string `json:"authority_cname"`
+	}{snapshot.PublicIPs, snapshot.ConsensusIPs, snapshot.CNAMEChain, snapshot.HTTPSTargets, snapshot.NSHosts, snapshot.AuthoritativeIPs, snapshot.AuthoritativeCNAME})
 	digest := sha256.Sum256(canonical)
 	snapshot.TopologyHash = hex.EncodeToString(digest[:])
 	return snapshot
@@ -550,9 +644,232 @@ func addUniqueIP(values []string, value string) []string {
 // separate from ScanBaseline: the scheduler invokes it only after a candidate
 // certificate/topology event, keeping routine Top-N monitoring lightweight.
 func (s *Scanner) ProbeEndpoints(ctx context.Context, domain string, ips []string) []models.EndpointProbe {
+	return s.ProbeEndpointsRotated(ctx, domain, ips, 0)
+}
+
+// ProbeRelatedNames actively checks the SAN names that recently entered or
+// left a root-domain certificate. It measures the public DNS/TLS/HTTP state
+// now; it never claims to recover a deleted record or a private deployment
+// event. The bounded rotated window prevents a large changing SAN set from
+// becoming an unbounded scan fan-out.
+func (s *Scanner) ProbeRelatedNames(ctx context.Context, root string, candidates []models.RelatedNameCandidate, rotation int, rootTopology *models.TopologySnapshot, rootCert *models.Certificate, rootHTTP *models.HTTPFingerprint) []models.RelatedNameProbe {
+	root = models.GetDomain(root)
+	if root == "" || len(candidates) == 0 || s.config.RelatedNameProbeLimit <= 0 {
+		return nil
+	}
+	selected := selectRelatedNameCandidates(root, candidates, s.config.RelatedNameProbeLimit, rotation)
+	if len(selected) == 0 {
+		return nil
+	}
+
+	probes := make([]models.RelatedNameProbe, len(selected))
+	concurrency := s.config.EndpointProbeConcurrency
+	if concurrency <= 0 {
+		concurrency = 4
+	}
+	if concurrency > len(selected) {
+		concurrency = len(selected)
+	}
+	slots := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for index, candidate := range selected {
+		wg.Add(1)
+		go func(index int, candidate models.RelatedNameCandidate) {
+			defer wg.Done()
+			select {
+			case slots <- struct{}{}:
+				defer func() { <-slots }()
+			case <-ctx.Done():
+				probes[index] = relatedNameCanceledProbe(candidate)
+				return
+			}
+			probes[index] = s.probeRelatedName(ctx, root, candidate, rotation, rootTopology, rootCert, rootHTTP)
+		}(index, candidate)
+	}
+	wg.Wait()
+	return probes
+}
+
+// selectRelatedNameCandidates takes one non-overlapping batch per rotation.
+// For example, with limit=8, rotations 0, 1 and 2 select 0..7, 8..15 and
+// 16..23. This lets repeated deep rounds cover a long history rather than
+// moving a one-name sliding window across it.
+func selectRelatedNameCandidates(root string, candidates []models.RelatedNameCandidate, limit, rotation int) []models.RelatedNameCandidate {
+	root = models.GetDomain(root)
+	if root == "" || limit <= 0 {
+		return nil
+	}
+	unique := make([]models.RelatedNameCandidate, 0, len(candidates))
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		candidate.Name = models.GetDomain(candidate.Name)
+		if candidate.Name == "" || candidate.Name == root {
+			continue
+		}
+		if _, ok := seen[candidate.Name]; ok {
+			continue
+		}
+		seen[candidate.Name] = struct{}{}
+		unique = append(unique, candidate)
+	}
+	if len(unique) == 0 {
+		return nil
+	}
+	if limit > len(unique) {
+		limit = len(unique)
+	}
+	start := 0
+	if rotation > 0 {
+		start = (rotation * limit) % len(unique)
+	}
+	selected := make([]models.RelatedNameCandidate, 0, limit)
+	for index := 0; index < limit; index++ {
+		selected = append(selected, unique[(start+index)%len(unique)])
+	}
+	return selected
+}
+
+func relatedNameCanceledProbe(candidate models.RelatedNameCandidate) models.RelatedNameProbe {
+	return models.RelatedNameProbe{
+		Name: candidate.Name, FirstObservedAt: candidate.FirstObservedAt, LastObservedAt: candidate.LastObservedAt,
+		AddedCount: candidate.AddedCount, RemovedCount: candidate.RemovedCount, BranchLikeLabel: candidate.BranchLikeLabel,
+		ProbedAt: time.Now().UTC(), DNSStatus: "inconclusive", Error: context.Canceled.Error(),
+	}
+}
+
+func (s *Scanner) probeRelatedName(ctx context.Context, root string, candidate models.RelatedNameCandidate, rotation int, rootTopology *models.TopologySnapshot, rootCert *models.Certificate, rootHTTP *models.HTTPFingerprint) models.RelatedNameProbe {
+	probe := models.RelatedNameProbe{
+		Name: candidate.Name, FirstObservedAt: candidate.FirstObservedAt, LastObservedAt: candidate.LastObservedAt,
+		AddedCount: candidate.AddedCount, RemovedCount: candidate.RemovedCount, BranchLikeLabel: candidate.BranchLikeLabel,
+		ProbedAt: time.Now().UTC(), DNSStatus: "inconclusive",
+	}
+	nameCtx, cancel := context.WithTimeout(ctx, s.config.Timeout)
+	topology := s.resolveTopology(nameCtx, candidate.Name)
+	cancel()
+	if topology == nil {
+		probe.Error = "DNS topology was not collected"
+		return probe
+	}
+	probe.ResolverQuorum = topology.ResolverQuorum
+	probe.ResolvedIPs = append([]string(nil), topology.PublicIPs...)
+	probe.CNAMEChain = append([]string(nil), topology.CNAMEChain...)
+	probe.SharesRootIP = overlappingStrings(probe.ResolvedIPs, topologyIPs(rootTopology))
+	probe.SharesRootCNAME = overlappingStrings(probe.CNAMEChain, topologyCNAMEs(rootTopology))
+	if len(probe.ResolvedIPs) == 0 {
+		probe.DNSStatus = relatedNameDNSStatus(topology)
+		return probe
+	}
+	probe.DNSStatus = "active"
+
+	addresses := relatedNameAddresses(probe.ResolvedIPs, 4)
+	handshakeCtx, cancel := context.WithTimeout(ctx, s.config.Timeout)
+	chain, _, info, err := s.endpointHandshake(handshakeCtx, candidate.Name, addresses[0], candidate.Name)
+	cancel()
+	if err != nil || len(chain) == 0 {
+		if err != nil {
+			probe.Error = "TLS: " + err.Error()
+		} else {
+			probe.Error = "TLS: no peer certificate found"
+		}
+		return probe
+	}
+	leaf := chain[0]
+	probe.TLSAnswered = true
+	probe.Fingerprint = models.Fingerprint(leaf)
+	probe.IssuerCN = leaf.Issuer.CommonName
+	probe.CommonName = leaf.Subject.CommonName
+	probe.SANs = append([]string(nil), leaf.DNSNames...)
+	probe.CoversOwnName = leaf.VerifyHostname(candidate.Name) == nil
+	probe.CoversRootName = leaf.VerifyHostname(root) == nil
+	if rootCert != nil && rootCert.Fingerprint != "" {
+		probe.SharesRootLeaf = probe.Fingerprint == rootCert.Fingerprint
+	}
+	if s.config.CheckHTTPFingerprint {
+		httpCtx, cancel := context.WithTimeout(ctx, s.config.Timeout)
+		fingerprint, httpErr := s.fetchHTTPFingerprint(httpCtx, candidate.Name, info)
+		cancel()
+		if httpErr != nil {
+			probe.Error = appendRelatedProbeError(probe.Error, "HTTP: "+httpErr.Error())
+		} else {
+			probe.HTTP = fingerprint
+			_ = rootHTTP // Retain both fingerprints for an operator-side comparison; no header equality is a provider identity proof.
+		}
+	}
+	probe.EndpointProbes = s.ProbeEndpointsRotated(ctx, candidate.Name, addresses, rotation)
+	return probe
+}
+
+func appendRelatedProbeError(existing, next string) string {
+	if existing == "" {
+		return next
+	}
+	return existing + "; " + next
+}
+
+func relatedNameAddresses(values []string, limit int) []string {
+	values = append([]string(nil), values...)
+	sort.Strings(values)
+	if limit > 0 && len(values) > limit {
+		values = values[:limit]
+	}
+	return values
+}
+
+func relatedNameDNSStatus(topology *models.TopologySnapshot) string {
+	if topology == nil || len(topology.Resolvers) == 0 {
+		return "inconclusive"
+	}
+	for _, resolver := range topology.Resolvers {
+		if strings.Contains(resolver.Error, "no usable public") || strings.Contains(resolver.Error, "CNAME but no usable") {
+			continue
+		}
+		return "inconclusive"
+	}
+	return "no_public_address"
+}
+
+func topologyIPs(topology *models.TopologySnapshot) []string {
+	if topology == nil {
+		return nil
+	}
+	return topology.PublicIPs
+}
+
+func topologyCNAMEs(topology *models.TopologySnapshot) []string {
+	if topology == nil {
+		return nil
+	}
+	return topology.CNAMEChain
+}
+
+func overlappingStrings(left, right []string) bool {
+	if len(left) == 0 || len(right) == 0 {
+		return false
+	}
+	seen := make(map[string]struct{}, len(left))
+	for _, value := range left {
+		seen[strings.ToLower(strings.TrimSpace(value))] = struct{}{}
+	}
+	for _, value := range right {
+		if _, ok := seen[strings.ToLower(strings.TrimSpace(value))]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// ProbeEndpointsRotated is ProbeEndpoints with a rotation offset: when more
+// addresses resolve than the sampling cap allows, successive rounds start the
+// sampled window at a different address so that, over rounds, every resolved
+// address is observed instead of always the same sorted prefix.
+func (s *Scanner) ProbeEndpointsRotated(ctx context.Context, domain string, ips []string, rotation int) []models.EndpointProbe {
 	maxEndpoints := s.config.MaxEndpointSamples
 	if maxEndpoints <= 0 {
 		maxEndpoints = 16
+	}
+	handshakes := s.config.EndpointHandshakes
+	if handshakes <= 0 {
+		handshakes = 1
 	}
 	unique := make([]string, 0, len(ips))
 	for _, value := range ips {
@@ -564,7 +881,16 @@ func (s *Scanner) ProbeEndpoints(ctx context.Context, domain string, ips []strin
 	}
 	sort.Strings(unique)
 	if len(unique) > maxEndpoints {
-		unique = unique[:maxEndpoints]
+		offset := 0
+		if rotation > 0 {
+			offset = rotation % len(unique)
+		}
+		window := make([]string, 0, maxEndpoints)
+		for index := 0; index < maxEndpoints; index++ {
+			window = append(window, unique[(offset+index)%len(unique)])
+		}
+		sort.Strings(window)
+		unique = window
 	}
 	probes := make([]models.EndpointProbe, len(unique))
 	var wg sync.WaitGroup
@@ -574,10 +900,17 @@ func (s *Scanner) ProbeEndpoints(ctx context.Context, domain string, ips []strin
 	}
 	slots := make(chan struct{}, concurrency)
 	for index, ip := range unique {
+		if !s.ipv6Route && strings.Contains(ip, ":") {
+			// This vantage has no IPv6 route: dialling would only produce the
+			// local kernel's "network is unreachable". Record the address as
+			// unobservable so it is never read as a server-side failure.
+			probes[index] = models.EndpointProbe{IPAddress: ip, Unobservable: true, Error: "vantage has no IPv6 route; address not observable from this monitor"}
+			continue
+		}
 		wg.Add(1)
 		go func(index int, ip string) {
 			defer wg.Done()
-			probe := models.EndpointProbe{IPAddress: ip}
+			probe := models.EndpointProbe{IPAddress: ip, RequestedSNI: domain}
 			defer func() { probes[index] = probe }()
 			select {
 			case slots <- struct{}{}:
@@ -593,43 +926,237 @@ func (s *Scanner) ProbeEndpoints(ctx context.Context, domain string, ips []strin
 				probe.Error = ctx.Err().Error()
 				return
 			}
+			// Several handshakes to the same address in one round: a second
+			// distinct leaf proves the address fronts servers holding
+			// different certificates, which one handshake per round can only
+			// suggest across rounds.
+			for attempt := 0; attempt < handshakes; attempt++ {
+				probeCtx, cancel := context.WithTimeout(ctx, s.config.Timeout)
+				chain, _, info, err := s.endpointHandshake(probeCtx, domain, ip, domain)
+				cancel()
+				if err != nil || len(chain) == 0 {
+					if !probe.Success {
+						if err != nil {
+							probe.Error = err.Error()
+						} else {
+							probe.Error = "no peer certificate found"
+						}
+						break
+					}
+					continue
+				}
+				probe.Handshakes++
+				fingerprint := models.Fingerprint(chain[0])
+				if probe.Success {
+					if fingerprint != probe.Fingerprint && !containsString(probe.OtherFingerprints, fingerprint) {
+						probe.OtherFingerprints = append(probe.OtherFingerprints, fingerprint)
+						other := models.EndpointProbe{IPAddress: ip, RequestedSNI: domain, Handshakes: 1}
+						fillProbe(&other, domain, ip, chain, info)
+						probe.OtherLeaves = append(probe.OtherLeaves, other)
+						probe.Findings = append(probe.Findings, other.Findings...)
+					}
+					continue
+				}
+				fillProbe(&probe, domain, ip, chain, info)
+			}
+
+			// A no-SNI handshake is a controlled comparison, not another
+			// endpoint fingerprint. It reveals whether the normal domain SNI
+			// selects a different certificate from the endpoint default.
+			selection := models.EndpointSelectionProbe{Variant: "no_sni"}
 			probeCtx, cancel := context.WithTimeout(ctx, s.config.Timeout)
-			chain, _, info, err := s.handshakeTLSAt(probeCtx, domain, ip)
+			chain, _, info, err := s.endpointHandshake(probeCtx, domain, ip, "")
 			cancel()
-			if err != nil {
-				probe.Error = err.Error()
-				return
+			if err != nil || len(chain) == 0 {
+				if err != nil {
+					selection.Error = err.Error()
+				} else {
+					selection.Error = "no peer certificate found"
+				}
+			} else {
+				fillSelectionProbe(&selection, domain, ip, chain, info)
 			}
-			if len(chain) == 0 {
-				probe.Error = "no peer certificate found"
-				return
-			}
-			probe.Success = true
-			probe.Fingerprint = models.Fingerprint(chain[0])
-			probe.SPKIFingerprint = models.SPKIFingerprint(chain[0])
-			probe.IssuerCN = chain[0].Issuer.CommonName
-			probe.CommonName = chain[0].Subject.CommonName
-			probe.SerialNumber = chain[0].SerialNumber.Text(16)
-			probe.SANs = append([]string(nil), chain[0].DNSNames...)
-			// The key algorithm and the covered name set are what separate a
-			// deliberate RSA plus ECDSA pair from endpoints that disagree: the
-			// pair serves the same names from the same issuer on purpose.
-			probe.KeyAlgorithm = chain[0].PublicKeyAlgorithm.String()
-			probe.KeySize = models.PublicKeySize(chain[0])
-			probe.SANsHash = models.SANSetHash(chain[0].DNSNames)
-			nb := chain[0].NotBefore.UTC()
-			probe.NotBefore = &nb
-			na := chain[0].NotAfter.UTC()
-			probe.NotAfter = &na
-			if info != nil {
-				probe.TLSVersion = info.TLSVersion
-				probe.CipherSuite = info.CipherSuite
-			}
-			probe.Findings = validateChain(domain, ip, chain, time.Now())
+			probe.SelectionProbes = append(probe.SelectionProbes, selection)
+			probe.SelectionAnalysis = compareEndpointSelection(&probe, domain, selection)
 		}(index, ip)
 	}
 	wg.Wait()
 	return probes
+}
+
+// endpointHandshake keeps the old test hook working while allowing the
+// selection matrix to vary the TLS ServerName. An empty serverName means that
+// the ClientHello omits SNI.
+func (s *Scanner) endpointHandshake(ctx context.Context, domain, address, serverName string) ([]*x509.Certificate, []byte, *models.ConnectionInfo, error) {
+	if s.probeHandshakeWithSNI != nil {
+		return s.probeHandshakeWithSNI(ctx, domain, address, serverName)
+	}
+	if s.probeHandshake != nil {
+		return s.probeHandshake(ctx, domain, address)
+	}
+	return s.handshakeTLSAtWithSNI(ctx, domain, address, serverName)
+}
+
+// fillProbe records the first answered handshake's leaf on the probe.
+func fillProbe(probe *models.EndpointProbe, domain, ip string, chain []*x509.Certificate, info *models.ConnectionInfo) {
+	leaf := chain[0]
+	probe.Success = true
+	probe.RawCert = base64.StdEncoding.EncodeToString(leaf.Raw)
+	probe.Error = ""
+	probe.Fingerprint = models.Fingerprint(leaf)
+	probe.SPKIFingerprint = models.SPKIFingerprint(leaf)
+	probe.IssuerCN = leaf.Issuer.CommonName
+	probe.CommonName = leaf.Subject.CommonName
+	probe.SerialNumber = leaf.SerialNumber.Text(16)
+	probe.SANs = append([]string(nil), leaf.DNSNames...)
+	probe.CoversRequestedName = leaf.VerifyHostname(domain) == nil
+	for _, cert := range chain {
+		probe.ChainFingerprints = append(probe.ChainFingerprints, models.Fingerprint(cert))
+	}
+	// The key algorithm and the covered name set are what separate a
+	// deliberate RSA plus ECDSA pair from endpoints that disagree: the pair
+	// serves the same names from the same issuer on purpose.
+	probe.KeyAlgorithm = leaf.PublicKeyAlgorithm.String()
+	probe.KeySize = models.PublicKeySize(leaf)
+	probe.SANsHash = models.SANSetHash(leaf.DNSNames)
+	nb := leaf.NotBefore.UTC()
+	probe.NotBefore = &nb
+	na := leaf.NotAfter.UTC()
+	probe.NotAfter = &na
+	for _, sct := range parseEmbeddedSCTs(leaf) {
+		if sct.Timestamp != nil && (probe.EarliestSCT == nil || sct.Timestamp.Before(*probe.EarliestSCT)) {
+			at := sct.Timestamp.UTC()
+			probe.EarliestSCT = &at
+		}
+	}
+	if info != nil {
+		probe.TLSVersion = info.TLSVersion
+		probe.CipherSuite = info.CipherSuite
+	}
+	probe.Findings = validateChain(domain, ip, chain, time.Now())
+}
+
+func fillSelectionProbe(probe *models.EndpointSelectionProbe, domain, ip string, chain []*x509.Certificate, info *models.ConnectionInfo) {
+	leaf := chain[0]
+	probe.Success = true
+	probe.Error = ""
+	probe.Fingerprint = models.Fingerprint(leaf)
+	probe.SPKIFingerprint = models.SPKIFingerprint(leaf)
+	probe.IssuerCN = leaf.Issuer.CommonName
+	probe.CommonName = leaf.Subject.CommonName
+	probe.KeyAlgorithm = leaf.PublicKeyAlgorithm.String()
+	probe.KeySize = models.PublicKeySize(leaf)
+	probe.SerialNumber = leaf.SerialNumber.Text(16)
+	probe.SANs = append([]string(nil), leaf.DNSNames...)
+	probe.SANsHash = models.SANSetHash(leaf.DNSNames)
+	probe.CoversRequestedName = leaf.VerifyHostname(domain) == nil
+	for _, cert := range chain {
+		probe.ChainFingerprints = append(probe.ChainFingerprints, models.Fingerprint(cert))
+	}
+	nb := leaf.NotBefore.UTC()
+	probe.NotBefore = &nb
+	na := leaf.NotAfter.UTC()
+	probe.NotAfter = &na
+	for _, sct := range parseEmbeddedSCTs(leaf) {
+		if sct.Timestamp != nil && (probe.EarliestSCT == nil || sct.Timestamp.Before(*probe.EarliestSCT)) {
+			at := sct.Timestamp.UTC()
+			probe.EarliestSCT = &at
+		}
+	}
+	if info != nil {
+		probe.TLSVersion = info.TLSVersion
+		probe.CipherSuite = info.CipherSuite
+		probe.NegotiatedProtocol = info.NegotiatedProtocol
+	}
+	probe.Findings = validateChain(domain, ip, chain, time.Now())
+}
+
+// compareEndpointSelection turns the two handshakes made against one IP into
+// an auditable, bounded statement. It deliberately distinguishes the
+// certificate-selection fact from the unobservable reason in a hosting or CA
+// control plane.
+func compareEndpointSelection(primary *models.EndpointProbe, domain string, control models.EndpointSelectionProbe) *models.EndpointSelectionAnalysis {
+	analysis := &models.EndpointSelectionAnalysis{RequestedSNI: domain}
+	if primary == nil || !primary.Success {
+		analysis.Interpretation = "primary_sni_probe_failed"
+		analysis.Error = "the domain-SNI handshake did not return a certificate"
+		return analysis
+	}
+	if !control.Success {
+		analysis.SelectedFingerprint = primary.Fingerprint
+		analysis.SelectedCoversRequestedName = primary.CoversRequestedName
+		analysis.Interpretation = "no_sni_control_failed"
+		analysis.Error = control.Error
+		analysis.Evidence = []string{
+			"requested_sni=" + domain,
+			"selected_fingerprint=" + primary.Fingerprint,
+			"selected_covers_requested_name=" + strconv.FormatBool(primary.CoversRequestedName),
+		}
+		return analysis
+	}
+
+	analysis.SelectedFingerprint = primary.Fingerprint
+	analysis.DefaultFingerprint = control.Fingerprint
+	analysis.CertificateChanged = primary.Fingerprint != control.Fingerprint
+	analysis.SelectedCoversRequestedName = primary.CoversRequestedName
+	analysis.DefaultCoversRequestedName = control.CoversRequestedName
+	analysis.SANSetChanged = primary.SANsHash != control.SANsHash
+	analysis.ChainChanged = !sameStrings(primary.ChainFingerprints, control.ChainFingerprints)
+	analysis.Evidence = []string{
+		"requested_sni=" + domain,
+		"selected_fingerprint=" + primary.Fingerprint,
+		"default_fingerprint=" + control.Fingerprint,
+		"certificate_changed=" + strconv.FormatBool(analysis.CertificateChanged),
+		"selected_covers_requested_name=" + strconv.FormatBool(analysis.SelectedCoversRequestedName),
+		"default_covers_requested_name=" + strconv.FormatBool(analysis.DefaultCoversRequestedName),
+	}
+	if analysis.SANSetChanged {
+		analysis.Evidence = append(analysis.Evidence, "san_set_changed=true")
+	}
+	if analysis.ChainChanged {
+		analysis.Evidence = append(analysis.Evidence, "chain_changed=true")
+	}
+
+	switch {
+	case !analysis.CertificateChanged && analysis.SelectedCoversRequestedName:
+		analysis.Interpretation = "same_name_matching_certificate_with_or_without_sni"
+	case !analysis.CertificateChanged:
+		analysis.Interpretation = "same_default_certificate_name_mismatch"
+	case analysis.SelectedCoversRequestedName && !analysis.DefaultCoversRequestedName:
+		analysis.Interpretation = "sni_selects_name_matching_certificate"
+	case analysis.SelectedCoversRequestedName && analysis.DefaultCoversRequestedName:
+		analysis.Interpretation = "sni_selects_alternate_name_matching_certificate"
+	default:
+		analysis.Interpretation = "sni_selects_certificate_not_matching_name"
+	}
+	return analysis
+}
+
+func sameStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+// hasIPv6Route reports whether the host has any route to global IPv6 space.
+// A UDP "connect" sends nothing; it only asks the kernel for a route.
+// certificateLookupTTL keeps CT answers for one certificate (by fingerprint or
+// serial) for a week: the logged entries of an issued certificate do not change.
+const certificateLookupTTL = 7 * 24 * time.Hour
+
+func hasIPv6Route() bool {
+	conn, err := net.Dial("udp6", "[2001:4860:4860::8888]:53")
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 // Enrich performs the configured deep evidence checks against the certificate
@@ -666,6 +1193,23 @@ func (s *Scanner) enrichResult(ctx context.Context, result *models.ScanResult) {
 	var pending []string
 	deep := &models.DeepEvidence{CollectedAt: time.Now().UTC(), Topology: result.Topology, EndpointProbes: result.EndpointProbes, Status: models.EvidenceStatusPending}
 	deep.SCTs = collectResultSCTs(result)
+	// Cross-region DNS/TLS evidence has its own bounded timeout and is needed by
+	// stale/deployment diagnosis. Run it before slower CT and directory lookups
+	// so an otherwise successful manual scan does not consume its entire budget
+	// before reaching the independent network measurement.
+	if s.config.CheckGlobalProbes {
+		attempted = true
+		probeCtx, cancel := context.WithTimeout(ctx, s.config.GlobalProbeTimeout)
+		global, err := s.fetchGlobalProbes(probeCtx, result.Domain)
+		cancel()
+		if global != nil {
+			deep.GlobalProbes = global
+		}
+		if err != nil {
+			deep.Errors = append(deep.Errors, "global probes: "+err.Error())
+			pending = append(pending, "multi-continent DNS/TLS measurement failed")
+		}
+	}
 	if s.config.CheckSCTInclusion && len(deep.SCTs) > 0 {
 		attempted = true
 		deep.SCTs = s.verifySCTInclusions(ctx, result.RawChain, deep.SCTs)
@@ -846,6 +1390,23 @@ func (s *Scanner) fetchCTQuery(ctx context.Context, query string) ([]models.CTOb
 	if endpoint == "" {
 		return nil, fmt.Errorf("CT endpoint is empty")
 	}
+	gate := s.crtsh
+	if gate != nil {
+		if value, ok := gate.cached(query, time.Now()); ok {
+			return value.([]models.CTObservation), nil
+		}
+		wait, gateErr := gate.reserve(time.Now())
+		if gateErr != nil {
+			return nil, gateErr
+		}
+		if wait > 0 {
+			select {
+			case <-time.After(wait):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+	}
 	requestCtx, cancel := context.WithTimeout(ctx, s.config.CTTimeout)
 	defer cancel()
 	queryURL := endpoint + "/?q=" + url.QueryEscape(query) + "&output=json"
@@ -860,6 +1421,9 @@ func (s *Scanner) fetchCTQuery(ctx context.Context, query string) ([]models.CTOb
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if gate != nil {
+		gate.observe(resp, time.Now())
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("CT endpoint returned HTTP %d", resp.StatusCode)
 	}
@@ -896,6 +1460,13 @@ func (s *Scanner) fetchCTQuery(ctx context.Context, query string) ([]models.CTOb
 			}
 		}
 		entries = append(entries, entry)
+	}
+	if gate != nil {
+		ttl := time.Duration(0)
+		if !strings.Contains(query, ".") {
+			ttl = certificateLookupTTL // fingerprint or serial, not a domain
+		}
+		gate.storeFor(query, entries, time.Now(), ttl)
 	}
 	return entries, nil
 }
@@ -944,6 +1515,14 @@ func normalizeSerial(value string) string {
 	return strings.TrimLeft(value, "0")
 }
 
+// ProbeHTTP runs one application-layer route check for a deep-diagnosis
+// experiment. When address is empty the scanner resolves the domain itself.
+// The regular survey keeps using fetchHTTPFingerprint.
+func (s *Scanner) ProbeHTTP(ctx context.Context, domain, address string) (*models.HTTPFingerprint, error) {
+	info := &models.ConnectionInfo{IPAddress: address}
+	return s.fetchHTTPFingerprint(ctx, domain, info)
+}
+
 func (s *Scanner) fetchHTTPFingerprint(ctx context.Context, domain string, info *models.ConnectionInfo) (*models.HTTPFingerprint, error) {
 	requestCtx, cancel := context.WithTimeout(ctx, s.config.Timeout)
 	defer cancel()
@@ -974,6 +1553,9 @@ func (s *Scanner) fetchHTTPFingerprint(ctx context.Context, domain string, info 
 	if err != nil {
 		return nil, err
 	}
+	// Make the application-layer authority explicit. TLS SNI and HTTP Host are
+	// separate routing inputs even when they normally contain the same name.
+	req.Host = domain
 	req.Header.Set("User-Agent", s.config.UserAgent)
 	req.Header.Set("Accept", "*/*")
 	resp, err := client.Do(req)
@@ -981,8 +1563,22 @@ func (s *Scanner) fetchHTTPFingerprint(ctx context.Context, domain string, info 
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.TLS == nil || len(resp.TLS.PeerCertificates) == 0 {
+		return nil, fmt.Errorf("HTTPS response did not expose TLS certificate state")
+	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-	fp := &models.HTTPFingerprint{IPAddress: address, StatusCode: resp.StatusCode, Server: resp.Header.Get("Server"), Via: resp.Header.Get("Via"), Cache: resp.Header.Get("Age")}
+	fp := &models.HTTPFingerprint{
+		IPAddress:          address,
+		RequestedSNI:       domain,
+		HostHeader:         req.Host,
+		StatusCode:         resp.StatusCode,
+		Server:             resp.Header.Get("Server"),
+		Via:                resp.Header.Get("Via"),
+		Cache:              resp.Header.Get("Age"),
+		TLSFingerprint:     models.Fingerprint(resp.TLS.PeerCertificates[0]),
+		TLSVersion:         models.GetTLSVersionName(resp.TLS.Version),
+		NegotiatedProtocol: resp.TLS.NegotiatedProtocol,
+	}
 	fp.Redirect = resp.Header.Get("Location")
 	for _, name := range []string{"cf-ray", "x-cache", "x-served-by", "x-amz-cf-id", "x-akamai-transformed", "x-fastly-request-id", "x-cdn"} {
 		if value := resp.Header.Get(name); value != "" {
@@ -1005,6 +1601,7 @@ func (s *Scanner) handshakeHTTPS(ctx context.Context, domain string, addresses [
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to create request: %w", err)
 	}
+	req.Host = domain
 	req.Header.Set("User-Agent", s.config.UserAgent)
 	req.Header.Set("Accept", "*/*")
 
@@ -1026,11 +1623,15 @@ func (s *Scanner) handshakeHTTPS(ctx context.Context, domain string, addresses [
 	}
 
 	connInfo := &models.ConnectionInfo{
-		Protocol:    "HTTPS",
-		TLSVersion:  models.GetTLSVersionName(resp.TLS.Version),
-		CipherSuite: models.GetCipherSuiteName(resp.TLS.CipherSuite),
-		IPAddress:   address,
-		SCTs:        handshakeSCTs(resp.TLS),
+		Protocol:           "HTTPS",
+		RequestedSNI:       domain,
+		HTTPHost:           domain,
+		TLSVersion:         models.GetTLSVersionName(resp.TLS.Version),
+		CipherSuite:        models.GetCipherSuiteName(resp.TLS.CipherSuite),
+		NegotiatedProtocol: resp.TLS.NegotiatedProtocol,
+		ALPN:               resp.TLS.NegotiatedProtocol,
+		IPAddress:          address,
+		SCTs:               handshakeSCTs(resp.TLS),
 	}
 	return resp.TLS.PeerCertificates, resp.TLS.OCSPResponse, connInfo, nil
 }
@@ -1058,10 +1659,18 @@ func (s *Scanner) handshakeTLS(ctx context.Context, domain string, addresses []s
 // address directly. It is used only with a public DNS address so the TLS
 // endpoint and persisted topology evidence refer to the same network path.
 func (s *Scanner) handshakeTLSAt(ctx context.Context, domain, address string) ([]*x509.Certificate, []byte, *models.ConnectionInfo, error) {
+	return s.handshakeTLSAtWithSNI(ctx, domain, address, domain)
+}
+
+// handshakeTLSAtWithSNI performs a direct TLS handshake while allowing the
+// caller to choose the ClientHello SNI. An empty serverName deliberately omits
+// the SNI extension so the endpoint's default certificate can be compared with
+// the certificate selected for the monitored hostname.
+func (s *Scanner) handshakeTLSAtWithSNI(ctx context.Context, domain, address, serverName string) ([]*x509.Certificate, []byte, *models.ConnectionInfo, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.config.Timeout)
 	defer cancel()
 	tlsConfig := &tls.Config{
-		ServerName:         domain,
+		ServerName:         serverName,
 		InsecureSkipVerify: true, //nolint:gosec // scanner captures untrusted certs by design
 		MinVersion:         tls.VersionTLS10,
 	}
@@ -1092,6 +1701,7 @@ func (s *Scanner) handshakeTLSAt(ctx context.Context, domain, address string) ([
 
 	connInfo := &models.ConnectionInfo{
 		Protocol:           "TLS",
+		RequestedSNI:       serverName,
 		TLSVersion:         models.GetTLSVersionName(state.Version),
 		CipherSuite:        models.GetCipherSuiteName(state.CipherSuite),
 		NegotiatedProtocol: state.NegotiatedProtocol,
@@ -1156,6 +1766,12 @@ type retryAfterFunc func(time.Duration) <-chan time.Time
 // failures still return a ScanResult so callers can persist the failed scan.
 func (s *Scanner) ScanWithRetry(ctx context.Context, domain string) (*models.ScanResult, error) {
 	return scanWithRetryConfig(ctx, domain, s.config.Retries, s.Scan, time.After, s.config.RetryBackoffUnit)
+}
+
+// ScanFreshWithRetry retries an explicit deep scan without reusing a prior
+// Globalping result for the domain.
+func (s *Scanner) ScanFreshWithRetry(ctx context.Context, domain string) (*models.ScanResult, error) {
+	return scanWithRetryConfig(ctx, domain, s.config.Retries, s.ScanFresh, time.After, s.config.RetryBackoffUnit)
 }
 
 // ScanBaselineWithRetry retries only the lightweight TLS baseline operation.

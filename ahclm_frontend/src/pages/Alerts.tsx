@@ -75,8 +75,8 @@ export default function Alerts() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-white">Alerts</h1>
-          <p className="text-slate-400 mt-1">Configure certificate expiration alerts</p>
+          <h1 className="text-2xl font-bold text-white">告警</h1>
+          <p className="text-slate-400 mt-1">配置证书到期告警</p>
         </div>
         <button
           onClick={() => setNewAlert(true)}
@@ -84,7 +84,7 @@ export default function Alerts() {
           disabled={newAlert}
         >
           <Plus className="h-4 w-4 mr-2" />
-          Add Alert
+          添加告警
         </button>
       </div>
 
@@ -92,10 +92,10 @@ export default function Alerts() {
       <div className="card">
         <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
           <Bell className="h-5 w-5 text-primary-500" />
-          Default Alert Intervals
+          默认告警间隔
         </h2>
         <p className="text-sm text-slate-400 mb-4">
-          Configure when to rescan certificates based on days until expiration
+          按距到期天数配置证书复扫时机
         </p>
         <div className="flex flex-wrap gap-2">
           {configuredIntervals.map((days) => (
@@ -108,7 +108,7 @@ export default function Alerts() {
               }`}
             >
               <p className="font-medium">{days}</p>
-              <p className="text-xs">day{days > 1 ? 's' : ''}</p>
+              <p className="text-xs">天</p>
             </div>
           ))}
         </div>
@@ -117,37 +117,37 @@ export default function Alerts() {
       {/* New Alert Form */}
       {newAlert && (
         <div className="card border-primary-500/30">
-          <h2 className="text-lg font-semibold mb-4">Create New Alert</h2>
+          <h2 className="text-lg font-semibold mb-4">新建告警</h2>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
-              <label className="block text-sm text-slate-400 mb-1">Alert Name</label>
+              <label className="block text-sm text-slate-400 mb-1">告警名称</label>
               <input
                 type="text"
                 value={formData.name}
                 onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                placeholder="Alert name"
+                placeholder="告警名称"
                 className="input"
               />
             </div>
             <div>
-              <label className="block text-sm text-slate-400 mb-1">Days Before Expiration</label>
+              <label className="block text-sm text-slate-400 mb-1">到期前天数</label>
               <select
                 value={formData.interval_days}
                 onChange={(e) => setFormData({ ...formData, interval_days: parseInt(e.target.value) })}
                 className="input"
               >
                 {configuredIntervals.map((days) => (
-                  <option key={days} value={days}>{days} days</option>
+                  <option key={days} value={days}>{days} 天</option>
                 ))}
               </select>
             </div>
             <div className="md:col-span-2">
-              <label className="block text-sm text-slate-400 mb-1">Webhook URL (optional)</label>
+              <label className="block text-sm text-slate-400 mb-1">Webhook 地址（可选）</label>
               <input
                 type="url"
                 value={formData.webhook_url || ''}
                 onChange={(e) => setFormData({ ...formData, webhook_url: e.target.value })}
-                placeholder="Optional HTTPS webhook URL"
+                placeholder="HTTPS Webhook 地址（可选）"
                 className="input"
               />
             </div>
@@ -159,7 +159,7 @@ export default function Alerts() {
                   onChange={(e) => setFormData({ ...formData, is_enabled: e.target.checked })}
                   className="w-4 h-4 rounded border-slate-600 bg-slate-700"
                 />
-                <span className="text-sm">Enabled</span>
+                <span className="text-sm">已启用</span>
               </label>
               <label className="flex items-center gap-2">
                 <input
@@ -168,18 +168,18 @@ export default function Alerts() {
                   onChange={(e) => setFormData({ ...formData, email_enabled: e.target.checked })}
                   className="w-4 h-4 rounded border-slate-600 bg-slate-700"
                 />
-                <span className="text-sm">Email Notification</span>
+                <span className="text-sm">邮件通知</span>
               </label>
             </div>
           </div>
           <div className="flex gap-2 mt-4">
             <button onClick={handleSave} className="btn btn-primary" disabled={createMutation.isPending}>
               <Save className="h-4 w-4 mr-2" />
-              {createMutation.isPending ? 'Saving...' : 'Save Alert'}
+              {createMutation.isPending ? "正在保存…" : "保存告警"}
             </button>
             <button onClick={() => setNewAlert(false)} className="btn btn-secondary">
               <XCircle className="h-4 w-4 mr-2" />
-              Cancel
+              取消
             </button>
           </div>
         </div>
@@ -187,7 +187,7 @@ export default function Alerts() {
 
       {/* Alert List */}
       <div className="card">
-        <h2 className="text-lg font-semibold mb-4">Configured Alerts</h2>
+        <h2 className="text-lg font-semibold mb-4">已配置的告警</h2>
         {isLoading ? (
           <div className="flex items-center justify-center py-8">
             <div className="spinner" />
@@ -195,8 +195,8 @@ export default function Alerts() {
         ) : !alerts || alerts.length === 0 ? (
           <div className="text-center py-8">
             <Bell className="h-12 w-12 text-slate-600 mx-auto mb-4" />
-            <p className="text-slate-400">No alerts configured</p>
-            <p className="text-sm text-slate-500 mt-2">Create an alert to get notified when certificates are expiring</p>
+            <p className="text-slate-400">尚未配置告警</p>
+            <p className="text-sm text-slate-500 mt-2">创建告警，在证书即将到期时接收通知</p>
           </div>
         ) : (
           <div className="space-y-4">
@@ -211,7 +211,7 @@ export default function Alerts() {
                   <div className="space-y-4">
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div>
-                        <label className="block text-sm text-slate-400 mb-1">Alert Name</label>
+                        <label className="block text-sm text-slate-400 mb-1">告警名称</label>
                         <input
                           type="text"
                           value={formData.name}
@@ -220,24 +220,24 @@ export default function Alerts() {
                         />
                       </div>
                       <div>
-                        <label className="block text-sm text-slate-400 mb-1">Days Before Expiration</label>
+                        <label className="block text-sm text-slate-400 mb-1">到期前天数</label>
                         <select
                           value={formData.interval_days}
                           onChange={(e) => setFormData({ ...formData, interval_days: parseInt(e.target.value) })}
                           className="input"
                         >
                           {configuredIntervals.map((days) => (
-                            <option key={days} value={days}>{days} days</option>
+                            <option key={days} value={days}>{days} 天</option>
                           ))}
                         </select>
                       </div>
                     </div>
                     <div className="flex gap-2">
                       <button onClick={handleUpdate} className="btn btn-primary btn-sm">
-                        <Save className="h-4 w-4 mr-1" /> Save
+                        <Save className="h-4 w-4 mr-1" /> 保存
                       </button>
                       <button onClick={() => setEditing(null)} className="btn btn-secondary btn-sm">
-                        <XCircle className="h-4 w-4 mr-1" /> Cancel
+                        <XCircle className="h-4 w-4 mr-1" /> 取消
                       </button>
                     </div>
                   </div>
@@ -253,16 +253,16 @@ export default function Alerts() {
                           <span className={`px-2 py-0.5 rounded-full text-xs ${
                             alert.is_enabled ? 'bg-green-500/20 text-green-400' : 'bg-slate-500/20 text-slate-400'
                           }`}>
-                            {alert.is_enabled ? 'Enabled' : 'Disabled'}
+                            {alert.is_enabled ? "已启用" : "已禁用"}
                           </span>
                           {alert.email_enabled && (
                             <span className="px-2 py-0.5 rounded-full text-xs bg-blue-500/20 text-blue-400">
-                              Email
+                              邮件
                             </span>
                           )}
                         </div>
                         <p className="text-sm text-slate-400">
-                          Rescan {alert.interval_days} day{alert.interval_days > 1 ? 's' : ''} before expiration
+                          复扫：到期前 {alert.interval_days} 天
                         </p>
                         {alert.webhook_url && (
                           <p className="text-xs text-slate-500 mt-1">Webhook: {alert.webhook_url}</p>
@@ -297,27 +297,24 @@ export default function Alerts() {
 
       {/* Alerting Strategy */}
       <div className="card">
-        <h2 className="text-lg font-semibold mb-4">Intelligent Alerting Strategy</h2>
+        <h2 className="text-lg font-semibold mb-4">自适应告警策略</h2>
         <div className="space-y-4 text-sm">
           <div className="p-4 bg-slate-700/30 rounded-lg">
-            <h3 className="font-medium text-yellow-400 mb-2">Critical (1-3 days)</h3>
+            <h3 className="font-medium text-yellow-400 mb-2">严重（1–3 天）</h3>
             <p className="text-slate-400">
-              Maximum priority scanning. Certificates expiring within 3 days are flagged immediately.
-              Automatic rescans every hour until renewal or expiration.
+              以最高优先级扫描，立即标记 3 天内到期的证书；每小时自动复扫，直至更新或到期。
             </p>
           </div>
           <div className="p-4 bg-slate-700/30 rounded-lg">
-            <h3 className="font-medium text-orange-400 mb-2">Warning (7-10 days)</h3>
+            <h3 className="font-medium text-orange-400 mb-2">警告（7–10 天）</h3>
             <p className="text-slate-400">
-              Daily rescan schedule. Focus on certificates approaching renewal window.
-              Notify via configured channels.
+              每天复扫，关注接近续签窗口的证书，并通过已配置的渠道通知。
             </p>
           </div>
           <div className="p-4 bg-slate-700/30 rounded-lg">
-            <h3 className="font-medium text-blue-400 mb-2">Notice (30+ days)</h3>
+            <h3 className="font-medium text-blue-400 mb-2">提示（30 天以上）</h3>
             <p className="text-slate-400">
-              Weekly scanning. Maintain baseline monitoring and track any mid-term changes.
-              Useful for trend analysis.
+              每周扫描，保持基线监测并记录期间变更，用于趋势分析。
             </p>
           </div>
         </div>

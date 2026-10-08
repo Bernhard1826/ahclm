@@ -86,6 +86,35 @@ func seedTLSValidationAnomaly(dc models.DomainCertificate, code string, rows []m
 	return withAnomalyCause(item, anomalyCause{confirmedReason: reason, confirmedEvidence: evidence, evidenceStatus: state})
 }
 
+// seedTLSValidationObservation builds the index record without running the
+// cause classifier. The Anomalies endpoint only needs the sampled condition
+// and the direct TLS evidence; the full diagnosis remains on the domain API.
+func seedTLSValidationObservation(dc models.DomainCertificate, code string, rows []models.TLSFinding) models.Anomaly {
+	checkedAt := tlsCheckedAt(&dc, models.Anomaly{})
+	fingerprint := dc.CurrentFingerprint
+	for _, row := range rows {
+		if row.Fingerprint != "" {
+			fingerprint = row.Fingerprint
+			break
+		}
+	}
+	item := models.Anomaly{
+		Domain:          dc.Domain,
+		Type:            code,
+		Severity:        "warning",
+		Fingerprint:     fingerprint,
+		DetectedAt:      checkedAt,
+		OccurrenceCount: 1,
+	}
+	item.Description = tlsValidationProblem(item, models.CauseDiagnosis{}, rows, checkedAt)
+	item.Evidence = tlsFindingEvidence(item, diagnosisContext{}, rows, checkedAt)
+	item.ConfirmedEvidence = append([]string(nil), item.Evidence...)
+	if code == "endpoint_probe_inconclusive" {
+		item.EvidencePendingReason = "The sampled endpoint did not return a certificate for the additional probe."
+	}
+	return item
+}
+
 func inferTLSValidationDiagnosis(item models.Anomaly, context diagnosisContext) models.CauseDiagnosis {
 	findings := parseTLSFindings(context.state)
 	rows := tlsFindingsForCode(findings, item.Type)
@@ -541,7 +570,7 @@ func tlsProviderExhibits(item models.Anomaly, context diagnosisContext) []models
 	if len(rows) == 0 {
 		return providerExhibits(item, context, models.CauseDiagnosis{})
 	}
-	probes, _, _ := latestEndpointSurvey(context.observations)
+	probes := currentEndpointSurvey(context)
 	probeByIP := make(map[string]models.EndpointProbe, len(probes))
 	for _, probe := range probes {
 		if probe.IPAddress != "" {
@@ -578,8 +607,13 @@ func tlsProviderExhibits(item models.Anomaly, context diagnosisContext) []models
 		}
 		if probe, ok := probeByIP[ip]; ok {
 			endpoint.Success = probe.Success
+			endpoint.RequestedSNI = probe.RequestedSNI
 			if probe.Fingerprint != "" {
 				endpoint.Fingerprint = probe.Fingerprint
+			}
+			if probe.SelectionAnalysis != nil {
+				endpoint.DefaultFingerprint = probe.SelectionAnalysis.DefaultFingerprint
+				endpoint.SelectionInterpretation = probe.SelectionAnalysis.Interpretation
 			}
 			endpoint.SPKIFingerprint = probe.SPKIFingerprint
 			endpoint.IssuerCN = probe.IssuerCN
@@ -861,6 +895,14 @@ func tlsValidationProof(item models.Anomaly, context diagnosisContext, diagnosis
 			leafEvidence,
 			"VerifyHostname on the captured leaf.",
 		))
+		if selectionEvidence := tlsNameSelectionEvidence(item.Domain, rows, context); len(selectionEvidence) > 0 {
+			proven = append(proven, provenStep(
+				"SNI selection control",
+				"The endpoint did not select a certificate valid for the queried name after the client supplied the requested SNI.",
+				selectionEvidence,
+				"Same-address TLS handshakes compared the requested-name SNI with an empty-SNI control.",
+			))
+		}
 		if reason := nonHTTPSIdentityReason(item.Domain); reason != "" {
 			proven = append(proven, provenStep(
 				"Queried name",
@@ -923,6 +965,45 @@ func tlsValidationProof(item models.Anomaly, context diagnosisContext, diagnosis
 		)
 	}
 	return proven, inferred
+}
+
+// tlsNameSelectionEvidence narrows a hostname mismatch to the observable TLS
+// selection behaviour at the same address.  It deliberately stops there:
+// DNS intent, virtual-host configuration, and edge propagation remain private
+// control-plane facts unless supplied by the operator.
+func tlsNameSelectionEvidence(domain string, rows []models.TLSFinding, context diagnosisContext) []string {
+	probes := currentEndpointSurvey(context)
+	if len(probes) == 0 {
+		return nil
+	}
+	matched := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		matched[strings.TrimSpace(row.IPAddress)+"|"+strings.TrimSpace(row.Fingerprint)] = struct{}{}
+	}
+	out := make([]string, 0, len(probes))
+	for _, probe := range probes {
+		if probe.SelectionAnalysis == nil || !probe.Success || probe.CoversRequestedName {
+			continue
+		}
+		key := strings.TrimSpace(probe.IPAddress) + "|" + strings.TrimSpace(probe.Fingerprint)
+		if _, ok := matched[key]; !ok {
+			// Older TLS findings may not retain the fingerprint.  Preserve an IP
+			// match only when it is the one mismatching endpoint in this survey.
+			byIP := strings.TrimSpace(probe.IPAddress) + "|"
+			if _, fallback := matched[byIP]; !fallback {
+				continue
+			}
+		}
+		analysis := probe.SelectionAnalysis
+		line := fmt.Sprintf("address=%s requested_sni=%s selected_fingerprint=%s selected_covers_requested_name=%t",
+			probe.IPAddress, domain, probe.Fingerprint, analysis.SelectedCoversRequestedName)
+		if analysis.DefaultFingerprint != "" {
+			line += fmt.Sprintf(" no_sni_fingerprint=%s no_sni_covers_requested_name=%t", analysis.DefaultFingerprint, analysis.DefaultCoversRequestedName)
+		}
+		line += " selection=" + analysis.Interpretation
+		out = append(out, line)
+	}
+	return uniqueEvidenceStrings(out)
 }
 
 func collectTLSFindingFingerprints(states []models.DomainCertificate) []string {

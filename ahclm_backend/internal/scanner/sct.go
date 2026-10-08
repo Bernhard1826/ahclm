@@ -71,16 +71,21 @@ func parseSCTList(payload []byte) []models.SCTObservation {
 
 func parseSCT(raw []byte) (models.SCTObservation, bool) {
 	// RFC 6962 SCT: version(1) + log_id(32) + timestamp_ms(8) + extensions + signature.
-	if len(raw) < 43 {
+	if len(raw) < 48 || raw[0] != 0 {
 		return models.SCTObservation{}, false
 	}
 	timestampMS := binary.BigEndian.Uint64(raw[33:41])
 	observed := time.UnixMilli(int64(timestampMS)).UTC()
 	extLen := int(binary.BigEndian.Uint16(raw[41:43]))
-	if 43+extLen > len(raw) {
+	if 43+extLen+4 > len(raw) {
+		return models.SCTObservation{}, false
+	}
+	sig := raw[43+extLen:]
+	if len(sig) < 5 || int(binary.BigEndian.Uint16(sig[2:4])) != len(sig)-4 {
 		return models.SCTObservation{}, false
 	}
 	observation := models.SCTObservation{
+		Signature:   append([]byte(nil), sig...),
 		Version:     int(raw[0]),
 		LogID:       hex.EncodeToString(raw[1:33]),
 		TimestampMS: timestampMS,

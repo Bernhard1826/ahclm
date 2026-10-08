@@ -174,6 +174,19 @@ func parseOCSP(der []byte, leaf, issuer *x509.Certificate, via string) *Status {
 	if err != nil {
 		return nil
 	}
+	now := time.Now()
+	// A valid signature authenticates the response, not its freshness.
+	const skew = 5 * time.Minute
+	if resp.ThisUpdate.IsZero() || resp.ThisUpdate.After(now.Add(skew)) || resp.ProducedAt.After(now.Add(skew)) {
+		return nil
+	}
+	if !resp.NextUpdate.IsZero() {
+		if !resp.NextUpdate.After(now) || resp.NextUpdate.Before(resp.ThisUpdate) {
+			return nil
+		}
+	} else if now.Sub(resp.ThisUpdate) > 24*time.Hour {
+		return nil
+	}
 	switch resp.Status {
 	case ocsp.Good:
 		return &Status{Status: models.RevocationGood, CheckedVia: via}

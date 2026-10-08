@@ -18,6 +18,7 @@ import (
 	"ahclm/internal/api"
 	"ahclm/internal/database"
 	"ahclm/internal/models"
+	"ahclm/internal/propagation"
 	"ahclm/internal/scanner"
 	"ahclm/internal/scheduler"
 	"ahclm/internal/tranco"
@@ -76,6 +77,8 @@ func main() {
 	trancoFetcher := tranco.NewFetcher(&cfg.Tranco)
 	sched := scheduler.NewScheduler(&cfg.Scheduler, &cfg.Scanner, db, scan, trancoFetcher)
 	sched.SetLocalLists(&cfg.LocalLists)
+	propagationManager := propagation.NewManager(&cfg.Propagation, db, scan)
+	sched.SetPropagationManager(propagationManager)
 
 	notifier := alerts.NewNotifier(&cfg.Alerts, db)
 	sched.SetOnAlert(notifier.Handle)
@@ -93,6 +96,10 @@ func main() {
 
 	appCtx, appCancel := context.WithCancel(context.Background())
 	defer appCancel()
+	// Open rollouts are placed in the measured distribution of completed ones;
+	// the alert share applied to that position is an operator standard.
+	database.SetRolloutAlertShare(cfg.Analysis.RolloutAlertShare)
+	db.StartRolloutReference(appCtx, cfg.Analysis.RolloutReferenceRefresh)
 
 	// Synchronize the population before the scheduler can dispatch anything.
 	// A failed initial fetch is fatal: running with an old or manually seeded
@@ -113,6 +120,14 @@ func main() {
 		}
 		log.Printf("local lists: %d domains registered for scanning", n)
 	}
+	if err := propagationManager.Start(appCtx); err != nil {
+		log.Fatalf("failed to start CDN propagation worker: %v", err)
+	}
+	if cfg.Propagation.Enabled {
+		log.Printf("CDN propagation worker started (locations=%v, interval=%s)", models.NormalizePropagationLocations(cfg.Propagation.Locations), cfg.Propagation.PollInterval)
+	} else {
+		log.Printf("CDN propagation worker ready for manually requested experiments")
+	}
 
 	if err := sched.Start(); err != nil {
 		log.Fatalf("failed to start scheduler: %v", err)
@@ -130,6 +145,7 @@ func main() {
 
 	// HTTP server.
 	handler := api.NewHandler(db, scan, sched, trancoFetcher, cfg)
+	handler.SetPropagationManager(propagationManager)
 	srv := &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port),
 		Handler:      handler.SetupRouter(),
@@ -143,6 +159,17 @@ func main() {
 			log.Fatalf("server error: %v", err)
 		}
 	}()
+	// Build the issue-register snapshot before a user opens the anomaly page.
+	// This work is intentionally asynchronous so it does not delay health checks
+	// or API startup; concurrent page requests share the same cache build.
+	go func() {
+		startedAt := time.Now()
+		if _, _, err := db.GetAnomaliesSummaryPage(1, 1, "", ""); err != nil {
+			log.Printf("anomaly summary cache warm failed: %v", err)
+			return
+		}
+		log.Printf("anomaly summary cache warmed in %s", time.Since(startedAt).Round(time.Millisecond))
+	}()
 
 	// Graceful shutdown.
 	quit := make(chan os.Signal, 1)
@@ -151,6 +178,7 @@ func main() {
 	log.Println("shutting down ...")
 
 	appCancel()
+	propagationManager.Stop()
 	sched.Stop()
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
@@ -248,6 +276,9 @@ func loadConfig() (*models.Config, error) {
 	}
 	if err := setEnvInt(firstEnv("AHCLM_WORKERS"), "AHCLM_WORKERS", &cfg.Scanner.Workers); err != nil {
 		return nil, err
+	}
+	if v := firstEnv("AHCLM_GLOBALPING_TOKEN"); v != "" {
+		cfg.Scanner.GlobalProbeToken = v
 	}
 	return cfg, nil
 }

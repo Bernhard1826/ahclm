@@ -51,7 +51,7 @@ const (
 // from current-rule rows; the diagnosis layer reads this tag to say so.
 const (
 	DetectorLegacy  = "v1"
-	DetectorCurrent = "v2"
+	DetectorCurrent = "v3"
 )
 
 // ChangeClass records what a "the certificate changed" observation actually
@@ -199,6 +199,7 @@ type DomainCertificate struct {
 	EvidenceCheckedAt     *time.Time `json:"evidence_checked_at,omitempty"`
 	FirstSeenAt           time.Time  `json:"first_seen_at"`
 	LastScannedAt         time.Time  `json:"last_scanned_at" gorm:"index"`
+	LastObservationAt     *time.Time `json:"last_observation_at,omitempty"`
 	LastChangedAt         *time.Time `json:"last_changed_at,omitempty"`
 	LastDaysUntilExpiry   int        `json:"last_days_until_expiry"`
 	NextScanAt            time.Time  `json:"next_scan_at" gorm:"index"`
@@ -258,35 +259,36 @@ type DomainCertificate struct {
 // change, milestone crossing, revocation change, expiry) — never once per scan
 // of an unchanged certificate. This is the dataset used for pattern analysis.
 type CertObservation struct {
-	ID                      uint       `json:"id" gorm:"primaryKey"`
-	Domain                  string     `json:"domain" gorm:"index;size:255"`
-	CertificateID           uint       `json:"certificate_id" gorm:"index"`
-	Fingerprint             string     `json:"fingerprint" gorm:"index;size:64"`
-	ObservedAt              time.Time  `json:"observed_at" gorm:"index"`
-	ObservationType         string     `json:"observation_type" gorm:"index"`
-	Milestone               string     `json:"milestone,omitempty" gorm:"index;size:32"`
-	DaysUntilExpiry         int        `json:"days_until_expiry"`
-	RevocationStatus        string     `json:"revocation_status,omitempty"`
-	RevocationCheckedVia    string     `json:"revocation_checked_via,omitempty"`
-	RevocationCheckedAt     *time.Time `json:"revocation_checked_at,omitempty"`
-	RevokedAt               *time.Time `json:"revoked_at,omitempty"`
-	RevocationReason        string     `json:"revocation_reason,omitempty"`
-	EvidenceStatus          string     `json:"evidence_status"`
-	EvidencePendingReason   string     `json:"evidence_pending_reason,omitempty" gorm:"type:text"`
-	PreviousFingerprint     string     `json:"previous_fingerprint,omitempty" gorm:"size:64"`
-	PreviousSPKIFingerprint string     `json:"previous_spki_fingerprint,omitempty" gorm:"size:64"`
-	SPKIFingerprint         string     `json:"spki_fingerprint,omitempty" gorm:"size:64"`
-	ResolvedIPs             string     `json:"resolved_ips,omitempty" gorm:"type:text"`
-	PreviousResolvedIPs     string     `json:"previous_resolved_ips,omitempty" gorm:"type:text"`
-	EndpointProbes          string     `json:"endpoint_probes,omitempty" gorm:"type:text"`
-	DeepEvidence            string     `json:"deep_evidence,omitempty" gorm:"type:text"`
-	ResidualDurationSeconds int64      `json:"residual_duration_seconds,omitempty"`
-	TLSVersion              string     `json:"tls_version,omitempty"`
-	CipherSuite             string     `json:"cipher_suite,omitempty"`
-	IPAddress               string     `json:"ip_address,omitempty"`
-	ScanDurationMs          int64      `json:"scan_duration_ms"`
-	ARIWindowStart          *time.Time `json:"ari_window_start,omitempty"`
-	ARIWindowEnd            *time.Time `json:"ari_window_end,omitempty"`
+	EndpointAttributionUncertain bool       `json:"endpoint_attribution_uncertain,omitempty" gorm:"-"`
+	ID                           uint       `json:"id" gorm:"primaryKey"`
+	Domain                       string     `json:"domain" gorm:"index;size:255"`
+	CertificateID                uint       `json:"certificate_id" gorm:"index"`
+	Fingerprint                  string     `json:"fingerprint" gorm:"index;size:64"`
+	ObservedAt                   time.Time  `json:"observed_at" gorm:"index"`
+	ObservationType              string     `json:"observation_type" gorm:"index"`
+	Milestone                    string     `json:"milestone,omitempty" gorm:"index;size:32"`
+	DaysUntilExpiry              int        `json:"days_until_expiry"`
+	RevocationStatus             string     `json:"revocation_status,omitempty"`
+	RevocationCheckedVia         string     `json:"revocation_checked_via,omitempty"`
+	RevocationCheckedAt          *time.Time `json:"revocation_checked_at,omitempty"`
+	RevokedAt                    *time.Time `json:"revoked_at,omitempty"`
+	RevocationReason             string     `json:"revocation_reason,omitempty"`
+	EvidenceStatus               string     `json:"evidence_status"`
+	EvidencePendingReason        string     `json:"evidence_pending_reason,omitempty" gorm:"type:text"`
+	PreviousFingerprint          string     `json:"previous_fingerprint,omitempty" gorm:"size:64"`
+	PreviousSPKIFingerprint      string     `json:"previous_spki_fingerprint,omitempty" gorm:"size:64"`
+	SPKIFingerprint              string     `json:"spki_fingerprint,omitempty" gorm:"size:64"`
+	ResolvedIPs                  string     `json:"resolved_ips,omitempty" gorm:"type:text"`
+	PreviousResolvedIPs          string     `json:"previous_resolved_ips,omitempty" gorm:"type:text"`
+	EndpointProbes               string     `json:"endpoint_probes,omitempty" gorm:"type:text"`
+	DeepEvidence                 string     `json:"deep_evidence,omitempty" gorm:"type:text"`
+	ResidualDurationSeconds      int64      `json:"residual_duration_seconds,omitempty"`
+	TLSVersion                   string     `json:"tls_version,omitempty"`
+	CipherSuite                  string     `json:"cipher_suite,omitempty"`
+	IPAddress                    string     `json:"ip_address,omitempty"`
+	ScanDurationMs               int64      `json:"scan_duration_ms"`
+	ARIWindowStart               *time.Time `json:"ari_window_start,omitempty"`
+	ARIWindowEnd                 *time.Time `json:"ari_window_end,omitempty"`
 	// DetectorVersion is the detection-rule generation that produced this row.
 	DetectorVersion string `json:"detector_version,omitempty" gorm:"index;size:8"`
 	// ChangeClass is set on ObsChange rows and records whether the fingerprint
@@ -444,7 +446,15 @@ type ARIInfo struct {
 
 // ConnectionInfo holds TCP/TLS connection metadata.
 type ConnectionInfo struct {
-	Protocol           string           `json:"protocol"`
+	Protocol string `json:"protocol"`
+	// RequestedSNI records the exact ClientHello server name. An empty value
+	// means the handshake deliberately omitted SNI; retaining it prevents a
+	// default certificate from being mistaken for the domain-selected one.
+	RequestedSNI string `json:"requested_sni,omitempty"`
+	// HTTPHost records the application-layer Host authority used by an HTTPS
+	// request. It is separate from RequestedSNI because virtual hosting can
+	// route TLS and HTTP independently.
+	HTTPHost           string           `json:"http_host,omitempty"`
 	TLSVersion         string           `json:"tls_version"`
 	CipherSuite        string           `json:"cipher_suite"`
 	NegotiatedProtocol string           `json:"negotiated_protocol,omitempty"`
@@ -459,16 +469,23 @@ type ConnectionInfo struct {
 // resolved address. It distinguishes an observed mixed rollout from a single
 // vantage certificate change and does not imply complete global edge coverage.
 type EndpointProbe struct {
-	Findings        []TLSFinding `json:"findings,omitempty"`
-	IPAddress       string       `json:"ip_address"`
-	Success         bool         `json:"success"`
-	Fingerprint     string       `json:"fingerprint,omitempty"`
-	SPKIFingerprint string       `json:"spki_fingerprint,omitempty"`
-	Error           string       `json:"error,omitempty"`
-	TLSVersion      string       `json:"tls_version,omitempty"`
-	CipherSuite     string       `json:"cipher_suite,omitempty"`
-	IssuerCN        string       `json:"issuer_cn,omitempty"`
-	CommonName      string       `json:"common_name,omitempty"`
+	RawCert string `json:"raw_cert,omitempty"`
+	// OtherLeaves retain the validation and identity of each additional leaf
+	// from repeated correct-SNI handshakes at this address.
+	OtherLeaves []EndpointProbe `json:"other_leaves,omitempty"`
+	Findings    []TLSFinding    `json:"findings,omitempty"`
+	IPAddress   string          `json:"ip_address"`
+	// RequestedSNI records the server name sent in the primary handshake. The
+	// endpoint survey also keeps a no-SNI comparison in SelectionProbes.
+	RequestedSNI    string `json:"requested_sni,omitempty"`
+	Success         bool   `json:"success"`
+	Fingerprint     string `json:"fingerprint,omitempty"`
+	SPKIFingerprint string `json:"spki_fingerprint,omitempty"`
+	Error           string `json:"error,omitempty"`
+	TLSVersion      string `json:"tls_version,omitempty"`
+	CipherSuite     string `json:"cipher_suite,omitempty"`
+	IssuerCN        string `json:"issuer_cn,omitempty"`
+	CommonName      string `json:"common_name,omitempty"`
 	// KeyAlgorithm and KeySize separate an intentional RSA+ECDSA dual-certificate
 	// deployment from a genuinely inconsistent one: the former serves different
 	// keys for the same names on purpose.
@@ -485,6 +502,84 @@ type EndpointProbe struct {
 	SANsHash  string     `json:"sans_hash,omitempty"`
 	NotBefore *time.Time `json:"not_before,omitempty"`
 	NotAfter  *time.Time `json:"not_after,omitempty"`
+	// Handshakes is how many TLS handshakes this address answered in the
+	// round. OtherFingerprints lists leaves other than Fingerprint that the
+	// same address presented in those handshakes: direct proof that the
+	// address fronts servers holding different certificates.
+	Handshakes        int      `json:"handshakes,omitempty"`
+	OtherFingerprints []string `json:"other_fingerprints,omitempty"`
+	// ChainFingerprints preserves the leaf-to-root chain observed with the
+	// primary SNI. A leaf match with a different intermediate is still a
+	// deployment difference and can explain client-specific validation issues.
+	ChainFingerprints []string `json:"chain_fingerprints,omitempty"`
+	// EarliestSCT is the earliest Signed Certificate Timestamp embedded in the
+	// leaf: an issuer-signed bound on when it was issued, taken from the
+	// certificate itself rather than from a CT log API.
+	EarliestSCT *time.Time `json:"earliest_sct,omitempty"`
+	// SelectionProbes are controlled TLS comparisons made against this same IP.
+	// They are deliberately nested so the existing one-record-per-address
+	// endpoint evidence remains usable by rollout and divergence classifiers.
+	SelectionProbes []EndpointSelectionProbe `json:"selection_probes,omitempty"`
+	// SelectionAnalysis is the direct interpretation of the primary SNI probe
+	// versus its no-SNI control. It records the comparison without pretending
+	// that the operator's private configuration is observable.
+	SelectionAnalysis *EndpointSelectionAnalysis `json:"selection_analysis,omitempty"`
+	// CoversRequestedName is evaluated against the queried domain at capture
+	// time, so a later reader does not have to reconstruct wildcard matching.
+	CoversRequestedName bool `json:"covers_requested_name"`
+	// Unobservable is set when this vantage cannot reach the address at all
+	// (no IPv6 route). Nothing is known about what the address serves.
+	Unobservable bool `json:"unobservable,omitempty"`
+}
+
+// EndpointSelectionProbe records one TLS certificate-selection comparison for
+// an already resolved address. RequestedSNI is empty for the no-SNI variant.
+// The certificate fields mirror EndpointProbe so the result is self-contained
+// when it is read from a persisted measurement snapshot.
+type EndpointSelectionProbe struct {
+	Variant            string       `json:"variant"`
+	RequestedSNI       string       `json:"requested_sni"`
+	Success            bool         `json:"success"`
+	Fingerprint        string       `json:"fingerprint,omitempty"`
+	SPKIFingerprint    string       `json:"spki_fingerprint,omitempty"`
+	IssuerCN           string       `json:"issuer_cn,omitempty"`
+	CommonName         string       `json:"common_name,omitempty"`
+	KeyAlgorithm       string       `json:"key_algorithm,omitempty"`
+	KeySize            int          `json:"key_size,omitempty"`
+	SerialNumber       string       `json:"serial_number,omitempty"`
+	SANs               []string     `json:"sans,omitempty"`
+	SANsHash           string       `json:"sans_hash,omitempty"`
+	ChainFingerprints  []string     `json:"chain_fingerprints,omitempty"`
+	NotBefore          *time.Time   `json:"not_before,omitempty"`
+	NotAfter           *time.Time   `json:"not_after,omitempty"`
+	TLSVersion         string       `json:"tls_version,omitempty"`
+	CipherSuite        string       `json:"cipher_suite,omitempty"`
+	NegotiatedProtocol string       `json:"negotiated_protocol,omitempty"`
+	EarliestSCT        *time.Time   `json:"earliest_sct,omitempty"`
+	Findings           []TLSFinding `json:"findings,omitempty"`
+	Error              string       `json:"error,omitempty"`
+	// CoversRequestedName is the certificate's hostname check for the domain
+	// used in this probe. It is false for a default certificate that does not
+	// contain the monitored name.
+	CoversRequestedName bool `json:"covers_requested_name"`
+}
+
+// EndpointSelectionAnalysis is a reproducible comparison between the normal
+// domain-SNI handshake and the no-SNI control on the same IP. The
+// interpretation names only the observable certificate-selection behavior;
+// it does not assert which control-plane component caused it.
+type EndpointSelectionAnalysis struct {
+	RequestedSNI                string   `json:"requested_sni,omitempty"`
+	SelectedFingerprint         string   `json:"selected_fingerprint,omitempty"`
+	DefaultFingerprint          string   `json:"default_fingerprint,omitempty"`
+	CertificateChanged          bool     `json:"certificate_changed"`
+	ChainChanged                bool     `json:"chain_changed,omitempty"`
+	SANSetChanged               bool     `json:"san_set_changed,omitempty"`
+	SelectedCoversRequestedName bool     `json:"selected_covers_requested_name"`
+	DefaultCoversRequestedName  bool     `json:"default_covers_requested_name"`
+	Interpretation              string   `json:"interpretation"`
+	Evidence                    []string `json:"evidence,omitempty"`
+	Error                       string   `json:"error,omitempty"`
 }
 
 // EndpointState is the per-address longitudinal state used to tell a stable
@@ -527,16 +622,35 @@ type DNSResolverObservation struct {
 }
 
 type TopologySnapshot struct {
-	Resolvers         []DNSResolverObservation `json:"resolvers,omitempty"`
-	PublicIPs         []string                 `json:"public_ips,omitempty"`
-	ConsensusIPs      []string                 `json:"consensus_ips,omitempty"`
-	CNAMEChain        []string                 `json:"cname_chain,omitempty"`
-	HTTPSTargets      []string                 `json:"https_targets,omitempty"`
-	NSHosts           []string                 `json:"ns_hosts,omitempty"`
-	ResolverQuorum    int                      `json:"resolver_quorum"`
-	ResolverAgreement float64                  `json:"resolver_agreement"`
-	DNSSECValidated   int                      `json:"dnssec_validated,omitempty"`
-	TopologyHash      string                   `json:"topology_hash,omitempty"`
+	Resolvers               []DNSResolverObservation      `json:"resolvers,omitempty"`
+	Authoritative           []AuthoritativeDNSObservation `json:"authoritative,omitempty"`
+	PublicIPs               []string                      `json:"public_ips,omitempty"`
+	ConsensusIPs            []string                      `json:"consensus_ips,omitempty"`
+	CNAMEChain              []string                      `json:"cname_chain,omitempty"`
+	AuthoritativeIPs        []string                      `json:"authoritative_ips,omitempty"`
+	AuthoritativeCNAME      []string                      `json:"authoritative_cname,omitempty"`
+	AuthoritativeComparison string                        `json:"authoritative_comparison,omitempty"` // matches_recursive, cname_expanded, authoritative_consistent_recursive_diff, authoritative_inconsistent, transport_unavailable, unavailable
+	HTTPSTargets            []string                      `json:"https_targets,omitempty"`
+	NSHosts                 []string                      `json:"ns_hosts,omitempty"`
+	ResolverQuorum          int                           `json:"resolver_quorum"`
+	ResolverAgreement       float64                       `json:"resolver_agreement"`
+	DNSSECValidated         int                           `json:"dnssec_validated,omitempty"`
+	TopologyHash            string                        `json:"topology_hash,omitempty"`
+}
+
+// AuthoritativeDNSObservation is a non-recursive DNS answer received directly
+// from an authoritative nameserver. It separates the published zone from the
+// answer selected by public recursive resolvers or CDN steering.
+type AuthoritativeDNSObservation struct {
+	Nameserver string   `json:"nameserver"`
+	Address    string   `json:"address"`
+	Transport  string   `json:"transport,omitempty"`
+	A          []string `json:"a,omitempty"`
+	AAAA       []string `json:"aaaa,omitempty"`
+	CNAME      []string `json:"cname,omitempty"`
+	HTTPS      []string `json:"https,omitempty"`
+	Success    bool     `json:"success"`
+	Error      string   `json:"error,omitempty"`
 }
 
 type CAARecord struct {
@@ -563,20 +677,23 @@ type CTObservation struct {
 // handshake. It is a direct measurement that the served leaf was submitted to
 // a CT log; it is not an independent issuance census the way crt.sh is.
 type SCTObservation struct {
-	Version      int        `json:"version,omitempty"`
-	LogID        string     `json:"log_id,omitempty"`
-	LogURL       string     `json:"log_url,omitempty"`
-	Operator     string     `json:"operator,omitempty"`
-	LogState     string     `json:"log_state,omitempty"`
-	Qualified    bool       `json:"qualified,omitempty"`
-	ChromeListed bool       `json:"chrome_listed,omitempty"`
-	AppleListed  bool       `json:"apple_listed,omitempty"`
-	TimestampMS  uint64     `json:"timestamp_ms,omitempty"`
-	Timestamp    *time.Time `json:"timestamp,omitempty"`
-	Extensions   []byte     `json:"-"`
-	Inclusion    string     `json:"inclusion,omitempty"`
-	LeafIndex    uint64     `json:"leaf_index,omitempty"`
-	TreeSize     uint64     `json:"tree_size,omitempty"`
+	Signature         []byte     `json:"-"`
+	SignatureVerified bool       `json:"signature_verified,omitempty"`
+	STHVerified       bool       `json:"sth_verified,omitempty"`
+	Version           int        `json:"version,omitempty"`
+	LogID             string     `json:"log_id,omitempty"`
+	LogURL            string     `json:"log_url,omitempty"`
+	Operator          string     `json:"operator,omitempty"`
+	LogState          string     `json:"log_state,omitempty"`
+	Qualified         bool       `json:"qualified,omitempty"`
+	ChromeListed      bool       `json:"chrome_listed,omitempty"`
+	AppleListed       bool       `json:"apple_listed,omitempty"`
+	TimestampMS       uint64     `json:"timestamp_ms,omitempty"`
+	Timestamp         *time.Time `json:"timestamp,omitempty"`
+	Extensions        []byte     `json:"-"`
+	Inclusion         string     `json:"inclusion,omitempty"`
+	LeafIndex         uint64     `json:"leaf_index,omitempty"`
+	TreeSize          uint64     `json:"tree_size,omitempty"`
 }
 
 // RDAPNameRecord is the public registration record for the queried name.
@@ -624,13 +741,65 @@ type DirectoryObservation struct {
 }
 
 type HTTPFingerprint struct {
-	IPAddress       string   `json:"ip_address,omitempty"`
-	StatusCode      int      `json:"status_code,omitempty"`
-	Server          string   `json:"server,omitempty"`
-	Via             string   `json:"via,omitempty"`
-	Cache           string   `json:"cache,omitempty"`
-	ProviderSignals []string `json:"provider_signals,omitempty"`
-	Redirect        string   `json:"redirect,omitempty"`
+	IPAddress          string   `json:"ip_address,omitempty"`
+	RequestedSNI       string   `json:"requested_sni,omitempty"`
+	HostHeader         string   `json:"host_header,omitempty"`
+	TLSFingerprint     string   `json:"tls_fingerprint,omitempty"`
+	TLSVersion         string   `json:"tls_version,omitempty"`
+	NegotiatedProtocol string   `json:"negotiated_protocol,omitempty"`
+	StatusCode         int      `json:"status_code,omitempty"`
+	Server             string   `json:"server,omitempty"`
+	Via                string   `json:"via,omitempty"`
+	Cache              string   `json:"cache,omitempty"`
+	ProviderSignals    []string `json:"provider_signals,omitempty"`
+	Redirect           string   `json:"redirect,omitempty"`
+}
+
+// RelatedNameCandidate is a subdomain that entered or left a certificate SAN
+// set during a same-domain replacement.  It is not an assertion about the
+// system that created the name; it only supplies bounded, public active
+// measurement targets.
+type RelatedNameCandidate struct {
+	Name            string    `json:"name"`
+	FirstObservedAt time.Time `json:"first_observed_at,omitempty"`
+	LastObservedAt  time.Time `json:"last_observed_at,omitempty"`
+	AddedCount      int       `json:"added_count"`
+	RemovedCount    int       `json:"removed_count"`
+	BranchLikeLabel bool      `json:"branch_like_label,omitempty"`
+	// NeedsPriorityProbe is internal scheduling state. It keeps names with no
+	// prior public result, or only an inconclusive one, ahead of rotation.
+	NeedsPriorityProbe bool `json:"-"`
+}
+
+// RelatedNameProbe is one bounded active measurement of a name that changed
+// the monitored root's certificate SAN set.  The result says whether the name
+// is publicly resolvable and how it behaves now; it cannot recover a deleted
+// DNS record or identify the private CI/CD system that created it.
+type RelatedNameProbe struct {
+	Name            string           `json:"name"`
+	FirstObservedAt time.Time        `json:"first_observed_at,omitempty"`
+	LastObservedAt  time.Time        `json:"last_observed_at,omitempty"`
+	AddedCount      int              `json:"added_count"`
+	RemovedCount    int              `json:"removed_count"`
+	BranchLikeLabel bool             `json:"branch_like_label,omitempty"`
+	ProbedAt        time.Time        `json:"probed_at"`
+	DNSStatus       string           `json:"dns_status"` // active, no_public_address, inconclusive
+	ResolverQuorum  int              `json:"resolver_quorum,omitempty"`
+	ResolvedIPs     []string         `json:"resolved_ips,omitempty"`
+	CNAMEChain      []string         `json:"cname_chain,omitempty"`
+	TLSAnswered     bool             `json:"tls_answered"`
+	Fingerprint     string           `json:"fingerprint,omitempty"`
+	IssuerCN        string           `json:"issuer_cn,omitempty"`
+	CommonName      string           `json:"common_name,omitempty"`
+	SANs            []string         `json:"sans,omitempty"`
+	CoversOwnName   bool             `json:"covers_own_name,omitempty"`
+	CoversRootName  bool             `json:"covers_root_name,omitempty"`
+	SharesRootIP    bool             `json:"shares_root_ip,omitempty"`
+	SharesRootCNAME bool             `json:"shares_root_cname,omitempty"`
+	SharesRootLeaf  bool             `json:"shares_root_leaf,omitempty"`
+	HTTP            *HTTPFingerprint `json:"http,omitempty"`
+	EndpointProbes  []EndpointProbe  `json:"endpoint_probes,omitempty"`
+	Error           string           `json:"error,omitempty"`
 }
 
 type DeepEvidence struct {
@@ -642,8 +811,70 @@ type DeepEvidence struct {
 	HTTP           *HTTPFingerprint      `json:"http,omitempty"`
 	Directory      *DirectoryObservation `json:"directory,omitempty"`
 	EndpointProbes []EndpointProbe       `json:"endpoint_probes,omitempty"`
+	RelatedNames   []RelatedNameProbe    `json:"related_names,omitempty"`
+	GlobalProbes   *GlobalProbeEvidence  `json:"global_probes,omitempty"`
 	Errors         []string              `json:"errors,omitempty"`
 	Status         string                `json:"status"`
+}
+
+// GlobalProbeEvidence retains bounded third-party active measurements from
+// selected continents. DNS traces expose the published authoritative answer;
+// HTTPS probes show the address and certificate actually reached from that
+// location. These results distinguish a globally published bad address from
+// a region- or edge-specific serving problem, but are not an internal CDN log.
+type GlobalProbeEvidence struct {
+	HTTPSMeasurementIDs []string           `json:"https_measurement_ids,omitempty"`
+	Provider            string             `json:"provider"`
+	CollectedAt         time.Time          `json:"collected_at"`
+	DNSMeasurementID    string             `json:"dns_measurement_id,omitempty"`
+	HTTPSMeasurementID  string             `json:"https_measurement_id,omitempty"`
+	DNS                 []GlobalDNSProbe   `json:"dns,omitempty"`
+	HTTPS               []GlobalHTTPSProbe `json:"https,omitempty"`
+	Error               string             `json:"error,omitempty"`
+}
+
+type GlobalProbeLocation struct {
+	Continent string `json:"continent,omitempty"`
+	Region    string `json:"region,omitempty"`
+	Country   string `json:"country,omitempty"`
+	City      string `json:"city,omitempty"`
+	ASN       int    `json:"asn,omitempty"`
+	Network   string `json:"network,omitempty"`
+}
+
+type GlobalDNSAnswer struct {
+	Type  string `json:"type"`
+	Value string `json:"value"`
+}
+
+type GlobalDNSProbe struct {
+	Location                GlobalProbeLocation `json:"location"`
+	Status                  string              `json:"status"`
+	Resolver                string              `json:"resolver,omitempty"`
+	AuthoritativeNameserver string              `json:"authoritative_nameserver,omitempty"`
+	AuthoritativeAddress    string              `json:"authoritative_address,omitempty"`
+	Answers                 []GlobalDNSAnswer   `json:"answers,omitempty"`
+	Error                   string              `json:"error,omitempty"`
+}
+
+type GlobalHTTPSProbe struct {
+	MeasurementID     string              `json:"measurement_id,omitempty"`
+	RequestNonce      string              `json:"request_nonce,omitempty"`
+	ObservedAt        *time.Time          `json:"observed_at,omitempty"`
+	OriginFingerprint string              `json:"origin_fingerprint,omitempty"`
+	OriginProbeNonce  string              `json:"origin_probe_nonce,omitempty"`
+	OriginTLSResumed  string              `json:"origin_tls_resumed,omitempty"`
+	Location          GlobalProbeLocation `json:"location"`
+	Status            string              `json:"status"`
+	ResolvedAddress   string              `json:"resolved_address,omitempty"`
+	HTTPStatus        int                 `json:"http_status,omitempty"`
+	TLSObserved       bool                `json:"tls_observed"`
+	TLSAuthorized     bool                `json:"tls_authorized"`
+	TLSError          string              `json:"tls_error,omitempty"`
+	CommonName        string              `json:"common_name,omitempty"`
+	SANs              []string            `json:"sans,omitempty"`
+	Fingerprint       string              `json:"fingerprint,omitempty"`
+	Error             string              `json:"error,omitempty"`
 }
 
 // MeasurementSnapshot deliberately retains unchanged deep rounds. This makes
@@ -663,13 +894,121 @@ type MeasurementSnapshot struct {
 	FingerprintCount         int       `json:"fingerprint_count"`
 	TopologyJSON             string    `json:"topology_json,omitempty" gorm:"type:text"`
 	EndpointFingerprintsJSON string    `json:"endpoint_fingerprints_json,omitempty" gorm:"type:text"`
-	CAAJSON                  string    `json:"caa_json,omitempty" gorm:"type:text"`
-	CTJSON                   string    `json:"ct_json,omitempty" gorm:"type:text"`
-	SCTJSON                  string    `json:"sct_json,omitempty" gorm:"type:text"`
-	HTTPJSON                 string    `json:"http_json,omitempty" gorm:"type:text"`
-	DirectoryJSON            string    `json:"directory_json,omitempty" gorm:"type:text"`
-	ErrorsJSON               string    `json:"errors_json,omitempty" gorm:"type:text"`
-	CreatedAt                time.Time `json:"created_at"`
+	// EndpointProbesJSON keeps the full per-endpoint survey (issuer, names,
+	// validity, key) for every round, so the structure tests do not depend on
+	// a lifecycle row having been written for that round.
+	EndpointProbesJSON string    `json:"endpoint_probes_json,omitempty" gorm:"type:text"`
+	CAAJSON            string    `json:"caa_json,omitempty" gorm:"type:text"`
+	CTJSON             string    `json:"ct_json,omitempty" gorm:"type:text"`
+	SCTJSON            string    `json:"sct_json,omitempty" gorm:"type:text"`
+	HTTPJSON           string    `json:"http_json,omitempty" gorm:"type:text"`
+	DirectoryJSON      string    `json:"directory_json,omitempty" gorm:"type:text"`
+	RelatedNamesJSON   string    `json:"related_names_json,omitempty" gorm:"type:text"`
+	GlobalProbesJSON   string    `json:"global_probes_json,omitempty" gorm:"type:text"`
+	ErrorsJSON         string    `json:"errors_json,omitempty" gorm:"type:text"`
+	CreatedAt          time.Time `json:"created_at"`
+}
+
+// InternalEvidenceEvent is an operator-supplied control-plane record. Active
+// measurement never creates these rows: they are imported from CDN, DNS,
+// certificate-controller, CA/ACME, CI/CD, load-balancer, or key-management
+// logs and correlated with the public observations by the diagnosis layer.
+// RawPayload is retained so an audit can reproduce how a conclusion was made.
+type InternalEvidenceEvent struct {
+	ID                      uint      `json:"id" gorm:"primaryKey"`
+	Domain                  string    `json:"domain" gorm:"index;size:255"`
+	OccurredAt              time.Time `json:"occurred_at" gorm:"index"`
+	EventType               string    `json:"event_type" gorm:"index;size:64"`
+	SourceSystem            string    `json:"source_system" gorm:"index;size:128"`
+	SourceRecordID          string    `json:"source_record_id,omitempty" gorm:"size:255"`
+	CorrelationID           string    `json:"correlation_id,omitempty" gorm:"index;size:255"`
+	Action                  string    `json:"action,omitempty" gorm:"size:128"`
+	Status                  string    `json:"status,omitempty" gorm:"size:64"`
+	Actor                   string    `json:"actor,omitempty" gorm:"size:255"`
+	Version                 string    `json:"version,omitempty" gorm:"size:255"`
+	Environment             string    `json:"environment,omitempty" gorm:"size:64"`
+	Hostname                string    `json:"hostname,omitempty" gorm:"size:255"`
+	IPAddress               string    `json:"ip_address,omitempty" gorm:"size:64"`
+	PreviousFingerprint     string    `json:"previous_fingerprint,omitempty" gorm:"size:64"`
+	Fingerprint             string    `json:"fingerprint,omitempty" gorm:"size:64"`
+	PreviousSPKIFingerprint string    `json:"previous_spki_fingerprint,omitempty" gorm:"size:64"`
+	SPKIFingerprint         string    `json:"spki_fingerprint,omitempty" gorm:"size:64"`
+	Detail                  string    `json:"detail,omitempty" gorm:"type:text"`
+	RawPayload              string    `json:"raw_payload,omitempty" gorm:"type:jsonb"`
+	IngestedAt              time.Time `json:"ingested_at" gorm:"index"`
+}
+
+// InternalEvidenceSummary states how far the imported control-plane evidence
+// can carry a causal claim. An empty or partial summary is deliberately
+// visible to operators; public TLS observations alone cannot name a private
+// controller, release, or configuration version.
+type InternalEvidenceSummary struct {
+	Status             string     `json:"status"` // absent, partial, complete
+	Determination      string     `json:"determination"`
+	RootCauseCode      string     `json:"root_cause_code,omitempty"`
+	RootCauseLabel     string     `json:"root_cause_label,omitempty"`
+	Conclusion         string     `json:"conclusion,omitempty"`
+	Confidence         string     `json:"confidence"`
+	EventCount         int        `json:"event_count"`
+	CorrelatedEvents   int        `json:"correlated_events"`
+	SourceSystems      []string   `json:"source_systems,omitempty"`
+	EventTypes         []string   `json:"event_types,omitempty"`
+	Evidence           []string   `json:"evidence,omitempty"`
+	Missing            []string   `json:"missing,omitempty"`
+	NextRequiredEvents []string   `json:"next_required_events,omitempty"`
+	LastEventAt        *time.Time `json:"last_event_at,omitempty"`
+}
+
+// PublicKeyDeploymentCycle is a reconstructed lifecycle for certificate
+// leaves and the SPKI they carry. Times derived from NotBefore or first public
+// observation are bounds; exact key generation and deployment require an
+// imported InternalEvidenceEvent.
+type PublicKeyDeploymentCycle struct {
+	Domain              string                     `json:"domain"`
+	GeneratedAt         time.Time                  `json:"generated_at"`
+	Status              string                     `json:"status"` // complete, partial, external_only
+	Determination       string                     `json:"determination"`
+	CurrentFingerprint  string                     `json:"current_fingerprint,omitempty"`
+	CurrentSPKI         string                     `json:"current_spki,omitempty"`
+	CertificateCount    int                        `json:"certificate_count"`
+	PublicKeyCount      int                        `json:"public_key_count"`
+	SameKeyReplacements int                        `json:"same_key_replacements"`
+	Events              []PublicKeyDeploymentEvent `json:"events"`
+	Metrics             PublicKeyCycleMetrics      `json:"metrics"`
+	MissingEvidence     []string                   `json:"missing_evidence,omitempty"`
+	InternalEvidence    *InternalEvidenceSummary   `json:"internal_evidence,omitempty"`
+}
+
+type PublicKeyDeploymentEvent struct {
+	At          time.Time `json:"at"`
+	Kind        string    `json:"kind"`
+	Fingerprint string    `json:"fingerprint,omitempty"`
+	SPKI        string    `json:"spki,omitempty"`
+	Previous    string    `json:"previous,omitempty"`
+	IPAddress   string    `json:"ip_address,omitempty"`
+	Region      string    `json:"region,omitempty"`
+	Source      string    `json:"source"`
+	LowerBound  bool      `json:"lower_bound,omitempty"`
+	EvidenceID  uint      `json:"evidence_id,omitempty"`
+	Detail      string    `json:"detail,omitempty"`
+}
+
+type PublicKeyCycleMetrics struct {
+	IssuanceToFirstPublicBasis       string     `json:"issuance_to_first_public_basis,omitempty"`
+	FirstIssuedAt                    *time.Time `json:"first_issued_at,omitempty"`
+	FirstIssuedExactAt               *time.Time `json:"first_issued_exact_at,omitempty"`
+	FirstDeployedAt                  *time.Time `json:"first_deployed_at,omitempty"`
+	FirstRetiredAt                   *time.Time `json:"first_retired_at,omitempty"`
+	FirstPublicObservedAt            *time.Time `json:"first_public_observed_at,omitempty"`
+	LastChangeAt                     *time.Time `json:"last_change_at,omitempty"`
+	IssuanceToFirstPublicSeconds     *float64   `json:"issuance_to_first_public_seconds,omitempty"`
+	DeploymentToFirstPublicSeconds   *float64   `json:"deployment_to_first_public_seconds,omitempty"`
+	FirstPublicToStableSeconds       *float64   `json:"first_public_to_stable_seconds,omitempty"`
+	SuccessorToPreviousRetirementSec *float64   `json:"successor_to_previous_retirement_seconds,omitempty"`
+	ObservedSpanSeconds              *float64   `json:"observed_span_seconds,omitempty"`
+	AddressCount                     int        `json:"address_count"`
+	AddressCoverage                  float64    `json:"address_coverage"`
+	StableRoundCount                 int        `json:"stable_round_count"`
 }
 
 // WebhookPayload is sent to configured webhooks / used for alert callbacks.
@@ -720,19 +1059,22 @@ type ScheduleEntry struct {
 
 // Anomaly is a flagged irregularity found during analysis.
 type Anomaly struct {
-	Domain                    string          `json:"domain"`
-	Type                      string          `json:"type"` // revoked, expired_served, expired_observed, early_renewal, frequent_change, same_key, stale_after_change, residual, deployment_failure, unreachable, expiring_soon, ari_emergency
-	Severity                  string          `json:"severity"`
-	Description               string          `json:"description"`
-	Reason                    string          `json:"reason"`
-	Evidence                  []string        `json:"evidence,omitempty"`
-	CauseClassification       string          `json:"cause_classification"` // confirmed, inferred, unknown (mutually exclusive)
-	ConfirmedReason           string          `json:"confirmed_reason"`
-	InferredReason            string          `json:"inferred_reason"`
-	ConfirmedEvidence         []string        `json:"confirmed_evidence"`
-	InferredEvidence          []string        `json:"inferred_evidence"`
-	EvidenceScope             string          `json:"evidence_scope"`
-	EvidenceStatus            string          `json:"evidence_status"`
+	Domain              string   `json:"domain"`
+	Type                string   `json:"type"` // revoked, expired_served, expired_observed, early_renewal, frequent_change, same_key, stale_after_change, residual, deployment_failure, unreachable, expiring_soon, ari_emergency
+	Severity            string   `json:"severity"`
+	Description         string   `json:"description"`
+	Reason              string   `json:"reason,omitempty"`
+	Evidence            []string `json:"evidence,omitempty"`
+	CauseClassification string   `json:"cause_classification,omitempty"` // confirmed, inferred, unknown (mutually exclusive)
+	ConfirmedReason     string   `json:"confirmed_reason,omitempty"`
+	InferredReason      string   `json:"inferred_reason,omitempty"`
+	ConfirmedEvidence   []string `json:"confirmed_evidence,omitempty"`
+	InferredEvidence    []string `json:"inferred_evidence,omitempty"`
+	EvidenceScope       string   `json:"evidence_scope,omitempty"`
+	EvidenceStatus      string   `json:"evidence_status,omitempty"`
+	// EvidenceClass is the public evidence-strength classification used by the
+	// issue register. It deliberately carries no causal interpretation.
+	EvidenceClass             string          `json:"evidence_class,omitempty"`
 	EvidencePendingReason     string          `json:"evidence_pending_reason,omitempty"`
 	Fingerprint               string          `json:"fingerprint,omitempty"`
 	OccurrenceCount           int             `json:"occurrence_count"`
@@ -802,6 +1144,10 @@ type CauseDiagnosis struct {
 	// remaining-life name the process; inferred when those fields are present
 	// but endpoint identity is missing; unestablished when neither holds.
 	CauseStatus string `json:"cause_status,omitempty"`
+	// InternalEvidence is populated only from imported control-plane records.
+	// It is separate from external corroboration so a large public sample cannot
+	// silently masquerade as an internal root-cause observation.
+	InternalEvidence *InternalEvidenceSummary `json:"internal_evidence,omitempty"`
 }
 
 // Finding classes for the issue register.
@@ -832,13 +1178,50 @@ type Investigation struct {
 	// ProofKind is proven when every retained step is a direct measurement,
 	// inferred when the operational reading still needs a missing comparison,
 	// and mixed when some steps are proven and the mechanism is inferred.
-	ProofKind      string                   `json:"proof_kind,omitempty"`
-	Proof          []InvestigationProofStep `json:"proof,omitempty"`
-	Inference      []InvestigationProofStep `json:"inference,omitempty"`
-	ProviderGroups []ProviderExhibit        `json:"provider_groups,omitempty"`
-	ChangeSequence []ChangeExhibit          `json:"change_sequence,omitempty"`
-	Certificates   []CertificateExhibit     `json:"certificates,omitempty"`
-	CDN            *CDNEvidence             `json:"cdn,omitempty"`
+	ProofKind        string                   `json:"proof_kind,omitempty"`
+	Proof            []InvestigationProofStep `json:"proof,omitempty"`
+	Inference        []InvestigationProofStep `json:"inference,omitempty"`
+	ProviderGroups   []ProviderExhibit        `json:"provider_groups,omitempty"`
+	ChangeSequence   []ChangeExhibit          `json:"change_sequence,omitempty"`
+	RelatedNames     []RelatedNameProbe       `json:"related_names,omitempty"`
+	Certificates     []CertificateExhibit     `json:"certificates,omitempty"`
+	CDN              *CDNEvidence             `json:"cdn,omitempty"`
+	InternalEvidence *InternalEvidenceSummary `json:"internal_evidence,omitempty"`
+	// Impact is what the retained measurements imply for clients and operators.
+	// Proven effects are handshake or DNS facts; inferred effects are the
+	// strongest client-visible reading those facts support. Compromise, user
+	// harm and global outage are never written as established.
+	Impact *FindingImpact `json:"impact,omitempty"`
+}
+
+// FindingImpact is the operator-facing consequence analysis for one finding.
+type FindingImpact struct {
+	Summary         string         `json:"summary"`
+	SeverityCeiling string         `json:"severity_ceiling"`
+	Effects         []ImpactEffect `json:"effects,omitempty"`
+	NotEstablished  []string       `json:"not_established,omitempty"`
+}
+
+// Impact severity ceilings. Higher values are not a score: they cap what the
+// measurements are allowed to claim.
+const (
+	ImpactNone            = "none"
+	ImpactMeasurementOnly = "measurement_only"
+	ImpactSplitView       = "split_view"
+	ImpactPendingExpiry   = "pending_expiry"
+	ImpactExtraIssuance   = "extra_issuance"
+	ImpactKeyContinuity   = "key_continuity"
+	ImpactClientRejection = "client_rejection"
+)
+
+// ImpactEffect is one consequence that follows from the retained measurements.
+type ImpactEffect struct {
+	Kind     string   `json:"kind"` // proven or inferred
+	Code     string   `json:"code"`
+	Label    string   `json:"label"`
+	Claim    string   `json:"claim"`
+	Audience string   `json:"audience,omitempty"` // clients, operators, relying_parties
+	Evidence []string `json:"evidence,omitempty"`
 }
 
 // InvestigationProofStep is one numbered claim in the operator-facing proof.
@@ -870,14 +1253,17 @@ type ProviderExhibit struct {
 }
 
 type EndpointExhibit struct {
-	IPAddress       string `json:"ip_address"`
-	ActiveDNS       bool   `json:"active_dns"`
-	Success         bool   `json:"success"`
-	Fingerprint     string `json:"fingerprint,omitempty"`
-	SPKIFingerprint string `json:"spki_fingerprint,omitempty"`
-	IssuerCN        string `json:"issuer_cn,omitempty"`
-	KeyAlgorithm    string `json:"key_algorithm,omitempty"`
-	Error           string `json:"error,omitempty"`
+	IPAddress               string `json:"ip_address"`
+	ActiveDNS               bool   `json:"active_dns"`
+	Success                 bool   `json:"success"`
+	RequestedSNI            string `json:"requested_sni,omitempty"`
+	Fingerprint             string `json:"fingerprint,omitempty"`
+	DefaultFingerprint      string `json:"default_fingerprint,omitempty"`
+	SPKIFingerprint         string `json:"spki_fingerprint,omitempty"`
+	IssuerCN                string `json:"issuer_cn,omitempty"`
+	KeyAlgorithm            string `json:"key_algorithm,omitempty"`
+	SelectionInterpretation string `json:"selection_interpretation,omitempty"`
+	Error                   string `json:"error,omitempty"`
 }
 
 // ChangeExhibit is one counted certificate-difference event, with the endpoint
@@ -894,19 +1280,43 @@ type ChangeExhibit struct {
 	DaysUntilExpiry         int       `json:"days_until_expiry,omitempty"`
 	PreviousSPKIFingerprint string    `json:"previous_spki_fingerprint,omitempty"`
 	SPKIFingerprint         string    `json:"spki_fingerprint,omitempty"`
+	// Identity deltas make a replacement explainable from the two actual
+	// certificates, rather than from a generic change counter.  They are only
+	// populated when both retained leaves contain the relevant field.
+	PreviousIssuerCN     string   `json:"previous_issuer_cn,omitempty"`
+	IssuerCN             string   `json:"issuer_cn,omitempty"`
+	PreviousCommonName   string   `json:"previous_common_name,omitempty"`
+	CommonName           string   `json:"common_name,omitempty"`
+	PreviousKeyAlgorithm string   `json:"previous_key_algorithm,omitempty"`
+	KeyAlgorithm         string   `json:"key_algorithm,omitempty"`
+	SANsAdded            []string `json:"sans_added,omitempty"`
+	SANsRemoved          []string `json:"sans_removed,omitempty"`
+	IssuerChanged        bool     `json:"issuer_changed,omitempty"`
+	CommonNameChanged    bool     `json:"common_name_changed,omitempty"`
+	KeyAlgorithmChanged  bool     `json:"key_algorithm_changed,omitempty"`
+	PublicKeyChanged     bool     `json:"public_key_changed,omitempty"`
 }
 
 type CertificateExhibit struct {
-	Fingerprint     string     `json:"fingerprint"`
-	SPKIFingerprint string     `json:"spki_fingerprint,omitempty"`
-	SerialNumber    string     `json:"serial_number,omitempty"`
-	IssuerCN        string     `json:"issuer_cn,omitempty"`
-	CommonName      string     `json:"common_name,omitempty"`
-	SANs            []string   `json:"sans,omitempty"`
-	KeyAlgorithm    string     `json:"key_algorithm,omitempty"`
-	ValidityDays    int        `json:"validity_days,omitempty"`
-	NotBefore       *time.Time `json:"not_before,omitempty"`
-	NotAfter        *time.Time `json:"not_after,omitempty"`
+	Fingerprint        string       `json:"fingerprint"`
+	SPKIFingerprint    string       `json:"spki_fingerprint,omitempty"`
+	SerialNumber       string       `json:"serial_number,omitempty"`
+	Issuer             string       `json:"issuer,omitempty"`
+	IssuerCN           string       `json:"issuer_cn,omitempty"`
+	Subject            string       `json:"subject,omitempty"`
+	CommonName         string       `json:"common_name,omitempty"`
+	SANs               []string     `json:"sans,omitempty"`
+	SignatureAlgorithm string       `json:"signature_algorithm,omitempty"`
+	KeyAlgorithm       string       `json:"key_algorithm,omitempty"`
+	KeySize            int          `json:"key_size,omitempty"`
+	PublicKeyType      string       `json:"public_key_type,omitempty"`
+	IsCA               bool         `json:"is_ca,omitempty"`
+	SelfSigned         bool         `json:"self_signed,omitempty"`
+	ValidityDays       int          `json:"validity_days,omitempty"`
+	NotBefore          *time.Time   `json:"not_before,omitempty"`
+	NotAfter           *time.Time   `json:"not_after,omitempty"`
+	Chain              []ChainEntry `json:"chain,omitempty"`
+	PEM                string       `json:"pem,omitempty"`
 }
 
 // EvidenceCase is a bounded, source-grounded evidence chain for one domain and
@@ -940,16 +1350,19 @@ type EvidenceRound struct {
 }
 
 type EvidenceEndpoint struct {
-	IPAddress       string `json:"ip_address"`
-	ProviderGroup   string `json:"provider_group,omitempty"`
-	Fingerprint     string `json:"fingerprint,omitempty"`
-	SPKIFingerprint string `json:"spki_fingerprint,omitempty"`
-	IssuerCN        string `json:"issuer_cn,omitempty"`
-	KeyAlgorithm    string `json:"key_algorithm,omitempty"`
-	SANsHash        string `json:"sans_hash,omitempty"`
-	Success         bool   `json:"success"`
-	ActiveDNS       bool   `json:"active_dns"`
-	Error           string `json:"error,omitempty"`
+	IPAddress               string `json:"ip_address"`
+	ProviderGroup           string `json:"provider_group,omitempty"`
+	RequestedSNI            string `json:"requested_sni,omitempty"`
+	Fingerprint             string `json:"fingerprint,omitempty"`
+	DefaultFingerprint      string `json:"default_fingerprint,omitempty"`
+	SPKIFingerprint         string `json:"spki_fingerprint,omitempty"`
+	IssuerCN                string `json:"issuer_cn,omitempty"`
+	KeyAlgorithm            string `json:"key_algorithm,omitempty"`
+	SANsHash                string `json:"sans_hash,omitempty"`
+	SelectionInterpretation string `json:"selection_interpretation,omitempty"`
+	Success                 bool   `json:"success"`
+	ActiveDNS               bool   `json:"active_dns"`
+	Error                   string `json:"error,omitempty"`
 }
 
 // ChurnShape describes the *shape* of a certificate-change sequence.
@@ -979,7 +1392,14 @@ type ChurnShape struct {
 	// SameEndpointChanges counts changes where the address that served the new
 	// leaf is the address that served the previous one. Only these can establish
 	// replacement in time.
-	SameEndpointChanges    int `json:"same_endpoint_changes"`
+	SameEndpointChanges int `json:"same_endpoint_changes"`
+	// ProvenSuccessors counts distinct successor leaves among the proven
+	// same-address replacements. One renewal rolled out to several addresses
+	// is several replacements but one successor.
+	ProvenSuccessors int `json:"proven_successors"`
+	// UndatedEndpointChanges are same-address differences whose issuance dates
+	// were not retained, so they prove neither replacement nor a pool.
+	UndatedEndpointChanges int `json:"undated_endpoint_changes"`
 	CrossEndpointChanges   int `json:"cross_endpoint_changes"`
 	UnknownEndpointChanges int `json:"unknown_endpoint_changes"`
 	// EffectiveReplacements is a lower bound on real replacements: visiting N
@@ -1065,6 +1485,37 @@ type EndpointDivergence struct {
 	// partition-to-certificate assignment, compared by network partition rather
 	// than by exact address so that CDN address rotation does not reset it.
 	StableRounds int `json:"stable_rounds"`
+	// StableAddressRounds counts retained rounds (the current one included) in
+	// which every currently answering address that was probed served the same
+	// leaf as now.
+	// StableRounds compares by network partition and cannot see which address
+	// holds which leaf; this is the per-address check.
+	StableAddressRounds int `json:"stable_address_rounds"`
+	// StableAddressSpanHours is the time between the first and last retained
+	// round counted by StableAddressRounds.
+	StableAddressSpanHours float64 `json:"stable_address_span_hours"`
+	// IndependentLineages is true when no address was ever observed moving
+	// from one of the currently answering leaves to another: each leaf has its
+	// own address lineage and none is another's predecessor.
+	IndependentLineages bool `json:"independent_lineages"`
+	// AddressReturns counts addresses observed going back to a leaf they had
+	// already served, which shows several servers behind one address.
+	AddressReturns int `json:"address_returns"`
+	// AddressPools counts addresses that presented more than one leaf within a
+	// single round's repeated handshakes: direct proof of several servers.
+	AddressPools int `json:"address_pools"`
+	// UnobservableEndpoints are resolved addresses this vantage cannot reach
+	// (no IPv6 route); what they serve is unknown.
+	UnobservableEndpoints []string `json:"unobservable_endpoints,omitempty"`
+	// PooledEndpoints are the addresses counted by AddressPools, each with
+	// the leaves it presented within one round.
+	PooledEndpoints []string `json:"pooled_endpoints,omitempty"`
+	// Issuance bounds from the leaves themselves: the earliest embedded SCT
+	// (falling back to NotBefore) of the predecessor and of the earliest other
+	// current leaf. A rollout cannot have started before its successor was
+	// issued.
+	PredecessorIssuedAt *time.Time `json:"predecessor_issued_at,omitempty"`
+	SuccessorIssuedAt   *time.Time `json:"successor_issued_at,omitempty"`
 	// Strong-rollout gates are deliberately explicit. A non-zero predecessor
 	// count alone is not enough: it may be a retired IP or a legitimate second
 	// CDN. StrongEvidence is true only after all gates pass.
@@ -1074,9 +1525,30 @@ type EndpointDivergence struct {
 	ActiveEndpointCoverage       float64  `json:"active_endpoint_coverage"`
 	ActivePredecessorEndpoints   []string `json:"active_predecessor_endpoints,omitempty"`
 	RetiredPredecessorEndpoints  []string `json:"retired_predecessor_endpoints,omitempty"`
-	StrongEvidence               bool     `json:"strong_evidence"`
-	MissingEvidence              []string `json:"missing_evidence,omitempty"`
-	ReversalConditions           []string `json:"reversal_conditions,omitempty"`
+	// GlobalProbeRounds and the following fields summarize the latest retained
+	// multi-region HTTPS evidence. These probes follow each region's normal
+	// resolver path; they establish scope/corroboration, not an internal CDN
+	// configuration or a forced direct-IP result.
+	GlobalProbeRounds                  int      `json:"global_probe_rounds,omitempty"`
+	GlobalHTTPSRegions                 []string `json:"global_https_regions,omitempty"`
+	GlobalPredecessorRegions           []string `json:"global_predecessor_regions,omitempty"`
+	GlobalPredecessorEndpoints         []string `json:"global_predecessor_endpoints,omitempty"`
+	GlobalConsecutivePredecessorRounds int      `json:"global_consecutive_predecessor_rounds,omitempty"`
+	GlobalPredecessorSpanHours         float64  `json:"global_predecessor_span_hours,omitempty"`
+	// GlobalDefectiveRegions is limited to remote TLS failures whose leaf
+	// fingerprint matches a locally validated defective leaf. A remote TLS
+	// failure with an unrelated leaf is intentionally not attributed here.
+	GlobalDefectiveRegions []string `json:"global_defective_regions,omitempty"`
+	StrongEvidence         bool     `json:"strong_evidence"`
+	// Reference position of the proven overlap (PredecessorSpanHours): how
+	// many of ReferenceCompleted completed rollouts certainly finished within
+	// it, that share, and the operator's alert share it was compared with.
+	ReferenceCompleted      int      `json:"reference_completed,omitempty"`
+	ReferenceFinishedWithin int      `json:"reference_finished_within,omitempty"`
+	ReferenceShare          float64  `json:"reference_share,omitempty"`
+	AlertShare              float64  `json:"alert_share,omitempty"`
+	MissingEvidence         []string `json:"missing_evidence,omitempty"`
+	ReversalConditions      []string `json:"reversal_conditions,omitempty"`
 	// CDN is the vendor reading from DNS control-plane records and published
 	// CDN prefixes. Completeness decides whether the multi-CDN verdict may use
 	// named vendors or must stay on the /16 and /32 partition.
@@ -1089,6 +1561,7 @@ type EndpointDivergence struct {
 const (
 	DivergenceIntentionalMultiCDN = "intentional_multi_cdn"
 	DivergenceDualCertificate     = "intentional_dual_certificate"
+	DivergencePerEndpoint         = "independent_per_endpoint_certificates"
 	DivergenceStuckRollout        = "stuck_partial_rollout"
 	DivergencePropagating         = "rollout_in_progress"
 	DivergenceIntraFleet          = "intra_fleet_inconsistency"
@@ -1122,6 +1595,7 @@ type EvidenceCorroboration struct {
 	CTStatus           string  `json:"ct_status"`
 	CTNote             string  `json:"ct_note,omitempty"`
 	SCTPresented       bool    `json:"sct_presented"`
+	SCTVerified        bool    `json:"sct_verified"`
 	SCTCount           int     `json:"sct_count"`
 	SCTLogCount        int     `json:"sct_log_count"`
 	SCTQualifiedLogs   int     `json:"sct_qualified_logs"`
@@ -1134,14 +1608,21 @@ type EvidenceCorroboration struct {
 	HTTPCoverage       float64 `json:"http_coverage"`
 	EndpointCoverage   float64 `json:"endpoint_coverage"`
 	ResolverAgreement  float64 `json:"resolver_agreement"`
-	DirectoryCoverage  float64 `json:"directory_coverage"`
-	DirectoryStatus    string  `json:"directory_status,omitempty"`
-	DirectoryNote      string  `json:"directory_note,omitempty"`
-	NSCoverage         float64 `json:"ns_coverage"`
-	NSRDAPAgreement    string  `json:"ns_rdap_agreement,omitempty"`
-	DNSSECValidated    bool    `json:"dnssec_validated,omitempty"`
-	DNSSECNote         string  `json:"dnssec_note,omitempty"`
-	TimingNote         string  `json:"timing_note,omitempty"`
+	// Global probes are an independent external vantage. They are counted only
+	// when remote HTTPS observations corroborate the same predecessor or
+	// locally validated defective leaf.
+	GlobalProbeRegions       int     `json:"global_probe_regions,omitempty"`
+	GlobalPredecessorRegions int     `json:"global_predecessor_regions,omitempty"`
+	GlobalDefectiveRegions   int     `json:"global_defective_regions,omitempty"`
+	GlobalProbeNote          string  `json:"global_probe_note,omitempty"`
+	DirectoryCoverage        float64 `json:"directory_coverage"`
+	DirectoryStatus          string  `json:"directory_status,omitempty"`
+	DirectoryNote            string  `json:"directory_note,omitempty"`
+	NSCoverage               float64 `json:"ns_coverage"`
+	NSRDAPAgreement          string  `json:"ns_rdap_agreement,omitempty"`
+	DNSSECValidated          bool    `json:"dnssec_validated,omitempty"`
+	DNSSECNote               string  `json:"dnssec_note,omitempty"`
+	TimingNote               string  `json:"timing_note,omitempty"`
 	// ConfidenceCeiling is the highest confidence the available corroboration
 	// can support, regardless of how strongly a hypothesis scores.
 	ConfidenceCeiling string `json:"confidence_ceiling"`
@@ -1283,13 +1764,29 @@ type CertificateFilter struct {
 // ---------------------------------------------------------------------------
 
 type Config struct {
-	Server     ServerConfig     `mapstructure:"server"`
-	Database   DatabaseConfig   `mapstructure:"database"`
-	Scanner    ScannerConfig    `mapstructure:"scanner"`
-	Scheduler  SchedulerConfig  `mapstructure:"scheduler"`
-	Tranco     TrancoConfig     `mapstructure:"tranco"`
-	LocalLists LocalListsConfig `mapstructure:"local_lists"`
-	Alerts     AlertsConfig     `mapstructure:"alerts"`
+	Server      ServerConfig         `mapstructure:"server"`
+	Database    DatabaseConfig       `mapstructure:"database"`
+	Scanner     ScannerConfig        `mapstructure:"scanner"`
+	Scheduler   SchedulerConfig      `mapstructure:"scheduler"`
+	Propagation CDNPropagationConfig `mapstructure:"propagation"`
+	Tranco      TrancoConfig         `mapstructure:"tranco"`
+	LocalLists  LocalListsConfig     `mapstructure:"local_lists"`
+	Alerts      AlertsConfig         `mapstructure:"alerts"`
+	Analysis    AnalysisConfig       `mapstructure:"analysis"`
+}
+
+// AnalysisConfig holds operator standards used by the diagnosis. They are
+// standards, not measurements: the page states them as such next to the
+// measured values they are applied to.
+type AnalysisConfig struct {
+	// RolloutAlertShare: an open rollout is called stuck when its proven
+	// overlap is longer than this share of completed rollouts in the reference
+	// distribution certainly took. 0 disables the stuck verdict; open
+	// rollouts are then reported with their measured position only.
+	RolloutAlertShare float64 `mapstructure:"rollout_alert_share"`
+	// RolloutReferenceRefresh is how often the reference distribution of
+	// completed rollouts is recomputed from the retained snapshots.
+	RolloutReferenceRefresh time.Duration `mapstructure:"rollout_reference_refresh"`
 }
 
 type ServerConfig struct {
@@ -1337,32 +1834,53 @@ type ScannerConfig struct {
 	ARIProviders              []ARIProviderConfig `mapstructure:"ari_providers"`
 	DNSResolvers              []string            `mapstructure:"dns_resolvers"`
 	MaxEndpointSamples        int                 `mapstructure:"max_endpoint_samples"`
-	EndpointProbeConcurrency  int                 `mapstructure:"endpoint_probe_concurrency"`
-	CheckCAA                  bool                `mapstructure:"check_caa"`
-	CheckCT                   bool                `mapstructure:"check_ct"`
-	CTTimeout                 time.Duration       `mapstructure:"ct_timeout"`
-	CTEndpoint                string              `mapstructure:"ct_endpoint"`
-	CheckHTTPFingerprint      bool                `mapstructure:"check_http_fingerprint"`
-	CheckRDAP                 bool                `mapstructure:"check_rdap"`
-	RDAPTimeout               time.Duration       `mapstructure:"rdap_timeout"`
-	RDAPEndpoint              string              `mapstructure:"rdap_endpoint"`
-	CheckASN                  bool                `mapstructure:"check_asn"`
-	CheckRIPEstat             bool                `mapstructure:"check_ripestat"`
-	RIPEstatEndpoint          string              `mapstructure:"ripestat_endpoint"`
-	CheckOfficialPrefixes     bool                `mapstructure:"check_official_prefixes"`
-	CloudflareIPv4URL         string              `mapstructure:"cloudflare_ipv4_url"`
-	CloudflareIPv6URL         string              `mapstructure:"cloudflare_ipv6_url"`
-	FastlyPublicIPURL         string              `mapstructure:"fastly_public_ip_url"`
-	CloudfrontIPURL           string              `mapstructure:"cloudfront_ip_url"`
-	CheckChromeLogList        bool                `mapstructure:"check_chrome_log_list"`
-	ChromeLogListURL          string              `mapstructure:"chrome_log_list_url"`
-	CheckAppleLogList         bool                `mapstructure:"check_apple_log_list"`
-	AppleLogListURL           string              `mapstructure:"apple_log_list_url"`
-	AWSIPRangesURL            string              `mapstructure:"aws_ip_ranges_url"`
-	BunnyEdgeListURL          string              `mapstructure:"bunny_edge_list_url"`
-	CheckSCTInclusion         bool                `mapstructure:"check_sct_inclusion"`
-	CheckCertSpotter          bool                `mapstructure:"check_certspotter"`
-	CertSpotterEndpoint       string              `mapstructure:"certspotter_endpoint"`
+	// EndpointHandshakes is how many TLS handshakes an endpoint survey makes
+	// per address; more than one can prove several leaves behind one address.
+	EndpointHandshakes       int `mapstructure:"endpoint_handshakes"`
+	EndpointProbeConcurrency int `mapstructure:"endpoint_probe_concurrency"`
+	// RelatedNameProbeLimit bounds active follow-up of SAN names that changed
+	// during a root-domain replacement. Successive deep rounds rotate through
+	// the candidate set instead of repeatedly probing the same prefix.
+	RelatedNameProbeLimit int `mapstructure:"related_name_probe_limit"`
+	// RelatedNameProbeTimeout is a separate budget for the active SAN-name
+	// follow-up. It prevents a slow CT/revocation lookup on the root scan from
+	// cancelling DNS/TLS evidence for the changed names.
+	RelatedNameProbeTimeout time.Duration `mapstructure:"related_name_probe_timeout"`
+	// CheckGlobalProbes enables bounded multi-continent DNS traces and HTTPS
+	// handshakes through Globalping during a deep/manual measurement.
+	CheckGlobalProbes    bool          `mapstructure:"check_global_probes"`
+	GlobalProbeEndpoint  string        `mapstructure:"global_probe_endpoint"`
+	GlobalProbeToken     string        `mapstructure:"global_probe_token"`
+	GlobalProbeTimeout   time.Duration `mapstructure:"global_probe_timeout"`
+	GlobalProbeLocations []string      `mapstructure:"global_probe_locations"`
+	// GlobalProbeScanTestsPerHour caps cross-region work triggered by routine
+	// scanner enrichment, preserving provider capacity for propagation rounds.
+	GlobalProbeScanTestsPerHour int           `mapstructure:"global_probe_scan_tests_per_hour"`
+	CheckCAA                    bool          `mapstructure:"check_caa"`
+	CheckCT                     bool          `mapstructure:"check_ct"`
+	CTTimeout                   time.Duration `mapstructure:"ct_timeout"`
+	CTEndpoint                  string        `mapstructure:"ct_endpoint"`
+	CheckHTTPFingerprint        bool          `mapstructure:"check_http_fingerprint"`
+	CheckRDAP                   bool          `mapstructure:"check_rdap"`
+	RDAPTimeout                 time.Duration `mapstructure:"rdap_timeout"`
+	RDAPEndpoint                string        `mapstructure:"rdap_endpoint"`
+	CheckASN                    bool          `mapstructure:"check_asn"`
+	CheckRIPEstat               bool          `mapstructure:"check_ripestat"`
+	RIPEstatEndpoint            string        `mapstructure:"ripestat_endpoint"`
+	CheckOfficialPrefixes       bool          `mapstructure:"check_official_prefixes"`
+	CloudflareIPv4URL           string        `mapstructure:"cloudflare_ipv4_url"`
+	CloudflareIPv6URL           string        `mapstructure:"cloudflare_ipv6_url"`
+	FastlyPublicIPURL           string        `mapstructure:"fastly_public_ip_url"`
+	CloudfrontIPURL             string        `mapstructure:"cloudfront_ip_url"`
+	CheckChromeLogList          bool          `mapstructure:"check_chrome_log_list"`
+	ChromeLogListURL            string        `mapstructure:"chrome_log_list_url"`
+	CheckAppleLogList           bool          `mapstructure:"check_apple_log_list"`
+	AppleLogListURL             string        `mapstructure:"apple_log_list_url"`
+	AWSIPRangesURL              string        `mapstructure:"aws_ip_ranges_url"`
+	BunnyEdgeListURL            string        `mapstructure:"bunny_edge_list_url"`
+	CheckSCTInclusion           bool          `mapstructure:"check_sct_inclusion"`
+	CheckCertSpotter            bool          `mapstructure:"check_certspotter"`
+	CertSpotterEndpoint         string        `mapstructure:"certspotter_endpoint"`
 }
 
 // ARIProviderConfig identifies a CA's ACME directory using configured issuer
@@ -1498,7 +2016,7 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
-	if c.Scanner.MaxEndpointSamples < 0 || c.Scanner.EndpointProbeConcurrency < 0 {
+	if c.Scanner.MaxEndpointSamples < 0 || c.Scanner.EndpointProbeConcurrency < 0 || c.Scanner.RelatedNameProbeLimit < 0 || c.Scanner.RelatedNameProbeTimeout < 0 {
 		return fmt.Errorf("scanner endpoint sampling values must not be negative")
 	}
 	if c.Scanner.CheckCT && c.Scanner.CTTimeout <= 0 {
@@ -1517,6 +2035,21 @@ func (c *Config) Validate() error {
 		parsed, err := url.Parse(strings.TrimSpace(c.Scanner.RDAPEndpoint))
 		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
 			return fmt.Errorf("scanner.rdap_endpoint must be an absolute HTTPS URL")
+		}
+	}
+	if strings.TrimSpace(c.Scanner.GlobalProbeEndpoint) != "" {
+		parsed, err := url.Parse(strings.TrimSpace(c.Scanner.GlobalProbeEndpoint))
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+			return fmt.Errorf("scanner.global_probe_endpoint must be an absolute HTTPS URL")
+		}
+	}
+	if c.Scanner.CheckGlobalProbes && c.Scanner.GlobalProbeTimeout <= 0 {
+		return fmt.Errorf("scanner.global_probe_timeout must be positive when global probes are enabled")
+	}
+	for _, location := range c.Scanner.GlobalProbeLocations {
+		location = strings.ToUpper(strings.TrimSpace(location))
+		if location != "AF" && location != "AS" && location != "EU" && location != "NA" && location != "OC" && location != "SA" {
+			return fmt.Errorf("scanner.global_probe_locations contains unsupported continent %q", location)
 		}
 	}
 	for _, item := range []struct {
@@ -1564,6 +2097,19 @@ func (c *Config) Validate() error {
 	for _, days := range append(append([]int{}, c.Scheduler.Milestones...), c.Scheduler.PostExpiryChecks...) {
 		if days < 0 {
 			return fmt.Errorf("scheduler milestone values must not be negative")
+		}
+	}
+	if c.Propagation.Enabled {
+		if c.Propagation.WatchWindow < 0 || c.Propagation.WatchWindow > 30*24*time.Hour || c.Propagation.PollInterval < 30*time.Second || c.Propagation.PollInterval > 24*time.Hour || c.Propagation.MaxDuration <= 0 || c.Propagation.MaxDuration > 30*24*time.Hour || c.Propagation.Timeout <= 0 || c.Propagation.StableRounds < 1 || c.Propagation.StableRounds > 100 || c.Propagation.MaxActive < 1 || c.Propagation.MaxActive > 128 {
+			return fmt.Errorf("propagation configuration is incomplete or invalid")
+		}
+		if len(NormalizePropagationLocations(c.Propagation.Locations)) == 0 {
+			return fmt.Errorf("propagation.locations must contain at least one continent")
+		}
+		for _, location := range NormalizePropagationLocations(c.Propagation.Locations) {
+			if location != "AF" && location != "AS" && location != "EU" && location != "NA" && location != "OC" && location != "SA" {
+				return fmt.Errorf("propagation.locations contains unsupported continent %q", location)
+			}
 		}
 	}
 

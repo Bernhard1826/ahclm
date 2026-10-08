@@ -49,6 +49,23 @@ func (s *Scanner) fetchCertSpotter(ctx context.Context, result *models.ScanResul
 }
 
 func (s *Scanner) fetchCertSpotterURL(ctx context.Context, endpoint string) ([]models.CTObservation, error) {
+	gate := s.certSpotter
+	if gate != nil {
+		if value, ok := gate.cached(endpoint, time.Now()); ok {
+			return value.([]models.CTObservation), nil
+		}
+		wait, gateErr := gate.reserve(time.Now())
+		if gateErr != nil {
+			return nil, gateErr
+		}
+		if wait > 0 {
+			select {
+			case <-time.After(wait):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+	}
 	requestCtx, cancel := context.WithTimeout(ctx, s.config.CTTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint, nil)
@@ -67,6 +84,9 @@ func (s *Scanner) fetchCertSpotterURL(ctx context.Context, endpoint string) ([]m
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if gate != nil {
+		gate.observe(resp, time.Now())
+	}
 	if resp.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 8<<10))
 		return nil, fmt.Errorf("CertSpotter returned HTTP %d", resp.StatusCode)
@@ -102,6 +122,13 @@ func (s *Scanner) fetchCertSpotterURL(ctx context.Context, endpoint string) ([]m
 			}
 		}
 		entries = append(entries, entry)
+	}
+	if gate != nil {
+		ttl := time.Duration(0)
+		if strings.Contains(endpoint, "cert_sha256=") {
+			ttl = certificateLookupTTL
+		}
+		gate.storeFor(endpoint, entries, time.Now(), ttl)
 	}
 	return entries, nil
 }

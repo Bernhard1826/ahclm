@@ -1,6 +1,7 @@
 package database
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -8,6 +9,68 @@ import (
 
 	"ahclm/internal/models"
 )
+
+func TestCertificateExhibitCarriesFullInventory(t *testing.T) {
+	now := time.Date(2026, 9, 11, 0, 0, 0, 0, time.UTC)
+	chain, _ := json.Marshal([]models.ChainEntry{
+		{CommonName: "sectigo.com", IssuerCN: "Sectigo Public Server Authentication CA OV R36", NotAfter: now.Add(90 * 24 * time.Hour), IsCA: false},
+		{CommonName: "Sectigo Public Server Authentication CA OV R36", IssuerCN: "AAA Certificate Services", NotAfter: now.Add(365 * 24 * time.Hour), IsCA: true},
+	})
+	der := []byte{0x30, 0x03, 0x02, 0x01, 0x05}
+	item := models.Anomaly{Domain: "sectigo.com", Type: "same_key"}
+	context := diagnosisContext{
+		state: &models.DomainCertificate{Domain: "sectigo.com", CurrentFingerprint: "leaf-new", LastEndpointIP: "192.0.2.1"},
+		observations: []models.CertObservation{{
+			ObservationType: models.ObsSameKey, ObservedAt: now,
+			Fingerprint: "leaf-new", PreviousFingerprint: "leaf-old",
+			SPKIFingerprint: "spki-same", PreviousSPKIFingerprint: "spki-same",
+			IPAddress: "192.0.2.1", PreviousIPAddress: "192.0.2.1",
+			ChangeClass: models.ChangeClassReplacement,
+		}},
+		certificates: map[string]models.Certificate{
+			"leaf-new": {
+				Fingerprint: "leaf-new", SPKIFingerprint: "spki-same", SerialNumber: "0B066FAD",
+				Issuer:   "CN=Sectigo Public Server Authentication CA OV R36,O=Sectigo Limited",
+				IssuerCN: "Sectigo Public Server Authentication CA OV R36",
+				Subject:  "CN=sectigo.com,O=Sectigo Limited", CommonName: "sectigo.com",
+				NotBefore: now, NotAfter: now.Add(90 * 24 * time.Hour),
+				SignatureAlgo: "SHA256-RSA", KeyAlgorithm: "RSA", KeySize: 4096, PublicKeyType: "RSA",
+				SANs: `["sectigo.com","comodoca.com"]`, ValidityDays: 90, Chain: string(chain),
+				RawCert: base64.StdEncoding.EncodeToString(der),
+			},
+			"leaf-old": {
+				Fingerprint: "leaf-old", SPKIFingerprint: "spki-same", SerialNumber: "OLD",
+				IssuerCN: "Sectigo Public Server Authentication CA OV R36", CommonName: "sectigo.com",
+				NotBefore: now.Add(-30 * 24 * time.Hour), NotAfter: now.Add(60 * 24 * time.Hour),
+				KeyAlgorithm: "RSA", KeySize: 4096, ValidityDays: 90,
+			},
+		},
+	}
+	diagnosis := inferSameKeyDiagnosis(item, context)
+	investigation := buildInvestigation(item, context, diagnosis)
+	var current *models.CertificateExhibit
+	for i := range investigation.Certificates {
+		if investigation.Certificates[i].Fingerprint == "leaf-new" {
+			current = &investigation.Certificates[i]
+			break
+		}
+	}
+	if current == nil {
+		t.Fatalf("current leaf missing: %#v", investigation.Certificates)
+	}
+	if current.Subject == "" || current.Issuer == "" || current.SerialNumber != "0B066FAD" {
+		t.Fatalf("subject/issuer/serial not filled: %#v", current)
+	}
+	if len(current.SANs) != 2 || current.KeySize != 4096 || current.SignatureAlgorithm == "" {
+		t.Fatalf("SAN/key/signature incomplete: %#v", current)
+	}
+	if len(current.Chain) != 2 {
+		t.Fatalf("chain = %#v", current.Chain)
+	}
+	if !strings.Contains(current.PEM, "BEGIN CERTIFICATE") {
+		t.Fatalf("PEM missing: %q", current.PEM)
+	}
+}
 
 func TestInvestigationClassifiesMultiCDNAsExpected(t *testing.T) {
 	mapJSON := func(value map[string]string) string { encoded, _ := json.Marshal(value); return string(encoded) }
@@ -42,7 +105,10 @@ func TestInvestigationFlagsIntraFleetAsIncident(t *testing.T) {
 		{IPAddress: "165.189.241.136", Success: true, Fingerprint: "b", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "names"},
 	}
 	encoded, _ := json.Marshal(probes)
-	assignment, _ := json.Marshal(map[string]string{"165.189.150.147": "a", "165.189.241.136": "b"})
+	// Earlier rounds saw the same two leaves on other addresses of the same
+	// /16: the network serves two leaves, but no address kept its own, so
+	// this is not an independent certificate per endpoint.
+	assignment, _ := json.Marshal(map[string]string{"165.189.150.148": "a", "165.189.241.137": "b"})
 	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 	item := models.Anomaly{Domain: "split.example", Type: models.ObsDeploymentFailure}
 	context := diagnosisContext{
@@ -193,6 +259,45 @@ func TestCertificateExhibitsFillMissingLeafFromProbe(t *testing.T) {
 	}
 }
 
+func TestChangeExhibitsCarryCertificateDeltas(t *testing.T) {
+	at := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+	changes := []models.CertObservation{{
+		ObservationType:         models.ObsChange,
+		ObservedAt:              at,
+		PreviousFingerprint:     "old",
+		Fingerprint:             "new",
+		PreviousIPAddress:       "192.0.2.10",
+		IPAddress:               "192.0.2.10",
+		PreviousSPKIFingerprint: "old-key",
+		SPKIFingerprint:         "new-key",
+	}}
+	context := diagnosisContext{
+		observations: changes,
+		certificates: map[string]models.Certificate{
+			"old": {Fingerprint: "old", IssuerCN: "Issuer A", CommonName: "old.example", KeyAlgorithm: "ECDSA", SANs: `["example.com","old.example"]`, SPKIFingerprint: "old-key"},
+			"new": {Fingerprint: "new", IssuerCN: "Issuer B", CommonName: "new.example", KeyAlgorithm: "RSA", SANs: `["example.com","new.example"]`, SPKIFingerprint: "new-key"},
+		},
+	}
+	exhibits := changeExhibits(context)
+	if len(exhibits) != 1 {
+		t.Fatalf("change exhibits = %#v", exhibits)
+	}
+	got := exhibits[0]
+	if !got.IssuerChanged || !got.CommonNameChanged || !got.KeyAlgorithmChanged || !got.PublicKeyChanged {
+		t.Fatalf("missing identity delta flags: %#v", got)
+	}
+	if strings.Join(got.SANsAdded, ",") != "new.example" || strings.Join(got.SANsRemoved, ",") != "old.example" {
+		t.Fatalf("SAN delta = +%v -%v", got.SANsAdded, got.SANsRemoved)
+	}
+	investigation := &models.Investigation{ChangeSequence: exhibits}
+	evidence := strings.Join(transitionIdentityEvidence(investigation, "same_endpoint", 3), " ")
+	for _, want := range []string{"SAN added: new.example", "SAN removed: old.example", "Issuer A → Issuer B", "ECDSA → RSA", "public key changed"} {
+		if !strings.Contains(evidence, want) {
+			t.Fatalf("transition evidence %q does not contain %q", evidence, want)
+		}
+	}
+}
+
 func TestDiagnosisTypeForHonoursRequestedFinding(t *testing.T) {
 	rows := []models.CertObservation{
 		{ObservationType: models.ObsDeploymentFailure},
@@ -318,9 +423,35 @@ func TestIssueRegisterOmitsExpectedAndKeepsProblems(t *testing.T) {
 		{name: "unclassified problem", item: models.Anomaly{Type: "revoked"}, keep: true},
 		{name: "expected class", item: models.Anomaly{FindingClass: models.FindingExpected}, keep: false},
 		{name: "ntp pool name mismatch", item: models.Anomaly{
-			Type: "hostname_mismatch", FindingClass: models.FindingExpected,
+			Domain: "3.pool.ntp.org",
+			Type:   "hostname_mismatch", FindingClass: models.FindingExpected,
 			Diagnosis: &models.CauseDiagnosis{PrimaryCode: tlsCauseNonHTTPSIdentity, BenignExplanation: "NTP pool alias"},
 		}, keep: false},
+		{name: "confirmed ntp pool incident is retained", item: models.Anomaly{
+			Domain: "2.pool.ntp.org",
+			Type:   "frequent_change", FindingClass: models.FindingIncident,
+			Diagnosis: &models.CauseDiagnosis{PrimaryCode: "incident_driven_reissue", CauseStatus: "established", ChurnShape: &models.ChurnShape{SameEndpointChanges: 2, ProvenSuccessors: 2, ChangeEvents: 12}},
+		}, keep: true},
+		{name: "Microsoft telemetry endpoint", item: models.Anomaly{
+			Domain: "watson.events.data.microsoft.com", Type: models.ObsDeploymentFailure, FindingClass: models.FindingIncident,
+			Diagnosis: &models.CauseDiagnosis{PrimaryCode: models.DivergenceDefectiveEndpoint, Divergence: &models.EndpointDivergence{DistinctLeaves: 2}},
+		}, keep: true},
+		{name: "Microsoft telemetry subdomain", item: models.Anomaly{
+			Domain: "watson.telemetry.microsoft.com", Type: models.ObsDeploymentFailure, FindingClass: models.FindingIncident,
+			Diagnosis: &models.CauseDiagnosis{PrimaryCode: models.DivergenceDefectiveEndpoint, Divergence: &models.EndpointDivergence{DistinctLeaves: 2}},
+		}, keep: true},
+		{name: "Facebook CDN service name", item: models.Anomaly{
+			Domain: "fbcdn.net", Type: models.ObsDeploymentFailure, FindingClass: models.FindingIncident,
+			Diagnosis: &models.CauseDiagnosis{PrimaryCode: models.DivergenceDefectiveEndpoint, Divergence: &models.EndpointDivergence{DistinctLeaves: 2}},
+		}, keep: true},
+		{name: "TikTok delivery service name", item: models.Anomaly{
+			Domain: "tiktokv.com", Type: models.ObsDeploymentFailure, FindingClass: models.FindingIncident,
+			Diagnosis: &models.CauseDiagnosis{PrimaryCode: models.DivergenceDefectiveEndpoint, Divergence: &models.EndpointDivergence{DistinctLeaves: 2}},
+		}, keep: true},
+		{name: "confirmed Google replacement is retained", item: models.Anomaly{
+			Domain: "google.cn", Type: "early_renewal", FindingClass: models.FindingIncident,
+			Diagnosis: &models.CauseDiagnosis{PrimaryCode: "early_renewal_replacement", CauseStatus: "established", ChurnShape: &models.ChurnShape{SameEndpointChanges: 2, MedianRemainingDays: 64, MedianValidityDays: 83}},
+		}, keep: true},
 		{name: "site name mismatch", item: models.Anomaly{
 			Type: "hostname_mismatch", FindingClass: models.FindingIncident,
 			Diagnosis: &models.CauseDiagnosis{PrimaryCode: tlsCauseNameMismatch},
@@ -339,6 +470,12 @@ func TestIssueRegisterOmitsExpectedAndKeepsProblems(t *testing.T) {
 			Type: models.ObsDeploymentFailure, FindingClass: models.FindingIncident,
 			Diagnosis: &models.CauseDiagnosis{PrimaryCode: models.DivergenceIntraFleet, Divergence: &models.EndpointDivergence{DistinctLeaves: 2, IntraGroupConflicts: 1}},
 		}, keep: true},
+		{name: "deployment same-name CDN pool", item: models.Anomaly{
+			Type: models.ObsDeploymentFailure, FindingClass: models.FindingIncident,
+			Diagnosis: &models.CauseDiagnosis{PrimaryCode: models.DivergenceIntraFleet, Divergence: &models.EndpointDivergence{
+				DistinctLeaves: 2, FunctionallyEquivalent: true, AddressPools: 1, AddressReturns: 1,
+			}},
+		}, keep: false},
 		{name: "propagating mixed diversity", item: models.Anomaly{
 			Type: models.ObsDeploymentFailure, FindingClass: models.FindingIncident,
 			Diagnosis: &models.CauseDiagnosis{PrimaryCode: models.DivergencePropagating, Divergence: &models.EndpointDivergence{DistinctLeaves: 2, IntraGroupConflicts: 1}},
@@ -353,12 +490,12 @@ func TestIssueRegisterOmitsExpectedAndKeepsProblems(t *testing.T) {
 		}, keep: false},
 		{name: "stale stuck predecessor", item: models.Anomaly{
 			Type: models.ObsStaleAfterChange, FindingClass: models.FindingIncident,
-			Diagnosis: &models.CauseDiagnosis{PrimaryCode: models.DivergenceStuckRollout, Divergence: &models.EndpointDivergence{DistinctLeaves: 2, ActivePredecessorEndpoints: []string{"192.0.2.1"}}},
+			Diagnosis: &models.CauseDiagnosis{PrimaryCode: models.DivergenceStuckRollout, Divergence: &models.EndpointDivergence{DistinctLeaves: 2, ActivePredecessorEndpoints: []string{"192.0.2.1"}, StrongEvidence: true}},
 		}, keep: true},
 		{name: "stale in-flight with active predecessor", item: models.Anomaly{
 			Type: models.ObsStaleAfterChange, FindingClass: models.FindingInsufficient,
 			Diagnosis: &models.CauseDiagnosis{PrimaryCode: models.DivergencePropagating, Divergence: &models.EndpointDivergence{DistinctLeaves: 2, ActivePredecessorEndpoints: []string{"192.0.2.1"}}},
-		}, keep: true},
+		}, keep: false},
 		{name: "stale mixed leaves without leftover predecessor", item: models.Anomaly{
 			Type: models.ObsStaleAfterChange, FindingClass: models.FindingIncident,
 			Diagnosis: &models.CauseDiagnosis{PrimaryCode: models.DivergenceDefectiveEndpoint, Divergence: &models.EndpointDivergence{DistinctLeaves: 2, DefectiveEndpoints: []string{"192.0.2.1"}}},
@@ -366,6 +503,13 @@ func TestIssueRegisterOmitsExpectedAndKeepsProblems(t *testing.T) {
 		{name: "stale intra-fleet without leftover predecessor", item: models.Anomaly{
 			Type: models.ObsStaleAfterChange, FindingClass: models.FindingIncident,
 			Diagnosis: &models.CauseDiagnosis{PrimaryCode: models.DivergenceIntraFleet, Divergence: &models.EndpointDivergence{DistinctLeaves: 2, IntraGroupConflicts: 1}},
+		}, keep: false},
+		{name: "stale same-name CDN pool", item: models.Anomaly{
+			Type: models.ObsStaleAfterChange, FindingClass: models.FindingIncident,
+			Diagnosis: &models.CauseDiagnosis{PrimaryCode: models.DivergenceStuckRollout, Divergence: &models.EndpointDivergence{
+				DistinctLeaves: 2, FunctionallyEquivalent: true, AddressPools: 1, AddressReturns: 1,
+				ActivePredecessorEndpoints: []string{"192.0.2.1"},
+			}},
 		}, keep: false},
 		{name: "stale retired predecessor only", item: models.Anomaly{
 			Type: models.ObsStaleAfterChange, FindingClass: models.FindingInsufficient,
@@ -379,10 +523,14 @@ func TestIssueRegisterOmitsExpectedAndKeepsProblems(t *testing.T) {
 			Type: "frequent_change", FindingClass: models.FindingInsufficient,
 			Diagnosis: &models.CauseDiagnosis{PrimaryCode: "automated_renewal_policy", CauseStatus: "inferred", ChurnShape: &models.ChurnShape{SameEndpointChanges: 0, ChangeEvents: 8}},
 		}, keep: false},
-		{name: "frequent extra issuance on same endpoint", item: models.Anomaly{
+		{name: "frequent automated renewal is an operational detail", item: models.Anomaly{
 			Type: "frequent_change", FindingClass: models.FindingIncident,
-			Diagnosis: &models.CauseDiagnosis{PrimaryCode: "automated_renewal_policy", CauseStatus: "established", ChurnShape: &models.ChurnShape{SameEndpointChanges: 4, ChangeEvents: 8}},
-		}, keep: true},
+			Diagnosis: &models.CauseDiagnosis{PrimaryCode: "automated_renewal_policy", CauseStatus: "established", ChurnShape: &models.ChurnShape{SameEndpointChanges: 4, ProvenSuccessors: 4, ChangeEvents: 8}},
+		}, keep: false},
+		{name: "preissued rolling deployment is an operational detail", item: models.Anomaly{
+			Type: "frequent_change", FindingClass: models.FindingIncident,
+			Diagnosis: &models.CauseDiagnosis{PrimaryCode: "preissued_rolling_pipeline", CauseStatus: "established", ChurnShape: &models.ChurnShape{SameEndpointChanges: 4, ProvenSuccessors: 4, ChangeEvents: 8}},
+		}, keep: false},
 		{name: "same-key with measured SPKI pair", item: models.Anomaly{
 			Type: "same_key", FindingClass: models.FindingIncident,
 			Diagnosis: &models.CauseDiagnosis{PrimaryCode: "same_key_reissue", CauseStatus: "established", ChurnShape: &models.ChurnShape{ChangeEvents: 2, DistinctLeaves: 3, DistinctSPKIs: 1, SameEndpointChanges: 2}},
@@ -390,6 +538,10 @@ func TestIssueRegisterOmitsExpectedAndKeepsProblems(t *testing.T) {
 		{name: "same-key without retained pair", item: models.Anomaly{
 			Type: "same_key", FindingClass: models.FindingInsufficient,
 			Diagnosis: &models.CauseDiagnosis{PrimaryCode: "same_key_unestablished", CauseStatus: "unestablished"},
+		}, keep: false},
+		{name: "concurrent same-key overlap", item: models.Anomaly{
+			Type: "same_key", FindingClass: models.FindingInsufficient,
+			Diagnosis: &models.CauseDiagnosis{PrimaryCode: "concurrent_same_key", CauseStatus: "inferred", ChurnShape: &models.ChurnShape{ChangeEvents: 27, RevisitEvents: 26, DistinctSPKIs: 1, SameEndpointChanges: 0}},
 		}, keep: false},
 		{name: "early renewal same-address predecessor remaining", item: models.Anomaly{
 			Type: "early_renewal", FindingClass: models.FindingIncident,
@@ -453,8 +605,8 @@ func TestInvestigationProofIsStepwiseForDiversityStaleAndChurn(t *testing.T) {
 	t.Run("propagating mix keeps the observation proven and the process inferred", func(t *testing.T) {
 		now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 		probes, _ := json.Marshal([]models.EndpointProbe{
-			{IPAddress: "192.0.2.1", Success: true, Fingerprint: "old", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n"},
-			{IPAddress: "192.0.2.2", Success: true, Fingerprint: "new", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n"},
+			{IPAddress: "192.0.2.1", Success: true, Fingerprint: "old", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n", NotBefore: issuedOld()},
+			{IPAddress: "192.0.2.2", Success: true, Fingerprint: "new", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n", NotBefore: issuedNew()},
 		})
 		item := models.Anomaly{Domain: "cutover.example", Type: models.ObsDeploymentFailure}
 		context := diagnosisContext{
@@ -483,6 +635,7 @@ func TestInvestigationProofIsStepwiseForDiversityStaleAndChurn(t *testing.T) {
 	})
 
 	t.Run("stale stuck predecessor is a proven chain", func(t *testing.T) {
+		testRolloutReference(t, 0.99, repeatHours(10, 100)...)
 		mapJSON := func(value map[string]string) string { encoded, _ := json.Marshal(value); return string(encoded) }
 		topologyJSON := func(ips []string) string {
 			encoded, _ := json.Marshal(models.TopologySnapshot{ConsensusIPs: ips, PublicIPs: ips, ResolverQuorum: 2, ResolverAgreement: 1})
@@ -491,8 +644,8 @@ func TestInvestigationProofIsStepwiseForDiversityStaleAndChurn(t *testing.T) {
 		now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 		assignment := mapJSON(map[string]string{"192.0.2.1": "old", "192.0.2.2": "new"})
 		probes, _ := json.Marshal([]models.EndpointProbe{
-			{IPAddress: "192.0.2.1", Success: true, Fingerprint: "old", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n"},
-			{IPAddress: "192.0.2.2", Success: true, Fingerprint: "new", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n"},
+			{IPAddress: "192.0.2.1", Success: true, Fingerprint: "old", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n", NotBefore: issuedOld()},
+			{IPAddress: "192.0.2.2", Success: true, Fingerprint: "new", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n", NotBefore: issuedNew()},
 		})
 		topology := topologyJSON([]string{"192.0.2.1", "192.0.2.2"})
 		item := models.Anomaly{Domain: "stuck.example", Type: models.ObsStaleAfterChange}
@@ -505,6 +658,7 @@ func TestInvestigationProofIsStepwiseForDiversityStaleAndChurn(t *testing.T) {
 				{ObservedAt: now.Add(-24 * time.Hour), ResolverQuorum: 2, ResolverAgreement: 1, EndpointFingerprintsJSON: assignment, TopologyJSON: topology},
 				{ObservedAt: now.Add(-48 * time.Hour), ResolverQuorum: 2, ResolverAgreement: 1, EndpointFingerprintsJSON: assignment, TopologyJSON: topology},
 				{ObservedAt: now.Add(-72 * time.Hour), ResolverQuorum: 2, ResolverAgreement: 1, EndpointFingerprintsJSON: assignment, TopologyJSON: topology},
+				{ObservedAt: now.Add(-96 * time.Hour), ResolverQuorum: 2, ResolverAgreement: 1, EndpointFingerprintsJSON: mapJSON(map[string]string{"192.0.2.1": "old", "192.0.2.2": "old"}), TopologyJSON: topology},
 			},
 		}
 		diagnosis := inferTopologyDiagnosis(item, context)
@@ -530,8 +684,8 @@ func TestInvestigationProofIsStepwiseForDiversityStaleAndChurn(t *testing.T) {
 	t.Run("stale in-flight cutover does not repeat proven endpoint lines as inference", func(t *testing.T) {
 		now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 		probes, _ := json.Marshal([]models.EndpointProbe{
-			{IPAddress: "192.0.2.1", Success: true, Fingerprint: "old", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n"},
-			{IPAddress: "192.0.2.2", Success: true, Fingerprint: "new", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n"},
+			{IPAddress: "192.0.2.1", Success: true, Fingerprint: "old", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n", NotBefore: issuedOld()},
+			{IPAddress: "192.0.2.2", Success: true, Fingerprint: "new", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n", NotBefore: issuedNew()},
 		})
 		item := models.Anomaly{Domain: "washingtonpost.example", Type: models.ObsStaleAfterChange}
 		context := diagnosisContext{

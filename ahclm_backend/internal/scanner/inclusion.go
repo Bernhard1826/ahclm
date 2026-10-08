@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"ahclm/internal/models"
 )
@@ -24,13 +25,16 @@ const (
 )
 
 func (s *Scanner) verifySCTInclusions(ctx context.Context, chain []*x509.Certificate, observations []models.SCTObservation) []models.SCTObservation {
-	if s == nil || !s.config.CheckSCTInclusion || len(observations) == 0 || len(chain) == 0 || chain[0] == nil {
+	if s == nil || len(observations) == 0 || len(chain) == 0 || chain[0] == nil {
 		return observations
 	}
 	out := append([]models.SCTObservation(nil), observations...)
 	var wg sync.WaitGroup
 	for i := range out {
-		if strings.TrimSpace(out[i].LogURL) == "" {
+		out[i].SignatureVerified = verifySCTSignature(chain, out[i])
+		out[i].STHVerified = false
+		out[i].Inclusion = models.SCTInclusionUnchecked
+		if !out[i].SignatureVerified || s.config == nil || !s.config.CheckSCTInclusion || strings.TrimSpace(out[i].LogURL) == "" {
 			if out[i].Inclusion == "" {
 				out[i].Inclusion = models.SCTInclusionUnchecked
 			}
@@ -46,6 +50,7 @@ func (s *Scanner) verifySCTInclusions(ctx context.Context, chain []*x509.Certifi
 			}
 			if included {
 				out[index].Inclusion = models.SCTInclusionProven
+				out[index].STHVerified = true
 				out[index].LeafIndex = leafIndex
 				out[index].TreeSize = treeSize
 				return
@@ -58,31 +63,44 @@ func (s *Scanner) verifySCTInclusions(ctx context.Context, chain []*x509.Certifi
 }
 
 func (s *Scanner) proveSCTInclusion(ctx context.Context, chain []*x509.Certificate, observation models.SCTObservation) (bool, uint64, uint64, error) {
-	logURL := strings.TrimRight(strings.TrimSpace(observation.LogURL), "/")
+	entry, ok := models.DatasetLogByID(observation.LogID)
+	if !ok || !verifySCTSignature(chain, observation) {
+		return false, 0, 0, fmt.Errorf("SCT signature or trusted log key unavailable")
+	}
+	logURL := strings.TrimRight(strings.TrimSpace(entry.URL), "/")
 	if logURL == "" {
 		return false, 0, 0, fmt.Errorf("SCT has no log URL")
 	}
-	sth, err := s.fetchSTH(ctx, logURL)
+	sth, err := s.fetchSTH(ctx, logURL, observation.LogID)
 	if err != nil {
 		return false, 0, 0, err
+	}
+	if sth.Timestamp < observation.TimestampMS {
+		return false, 0, 0, fmt.Errorf("STH predates SCT")
 	}
 	hashes := merkleLeafHashes(chain, observation)
 	if len(hashes) == 0 {
 		return false, 0, 0, fmt.Errorf("no Merkle leaf hash could be built")
 	}
+	var proofErr error
 	for _, hash := range hashes {
 		proof, err := s.fetchInclusionProof(ctx, logURL, hash, sth.TreeSize)
 		if err != nil {
+			proofErr = err
 			continue
 		}
 		if verifyMerkleInclusion(hash, proof.LeafIndex, sth.TreeSize, proof.AuditPath, sth.SHA256RootHash) {
 			return true, proof.LeafIndex, sth.TreeSize, nil
 		}
 	}
-	return false, 0, sth.TreeSize, nil
+	if proofErr != nil {
+		return false, 0, sth.TreeSize, proofErr
+	}
+	return false, 0, sth.TreeSize, fmt.Errorf("no valid inclusion proof; absence from the log is not established")
 }
 
 type signedTreeHead struct {
+	Timestamp      uint64
 	TreeSize       uint64
 	SHA256RootHash []byte
 }
@@ -92,13 +110,15 @@ type inclusionProof struct {
 	AuditPath [][]byte
 }
 
-func (s *Scanner) fetchSTH(ctx context.Context, logURL string) (signedTreeHead, error) {
+func (s *Scanner) fetchSTH(ctx context.Context, logURL, logID string) (signedTreeHead, error) {
 	raw, err := s.getCTJSON(ctx, logURL+"/ct/v1/get-sth")
 	if err != nil {
 		return signedTreeHead{}, err
 	}
 	var payload struct {
 		TreeSize          uint64 `json:"tree_size"`
+		Timestamp         uint64 `json:"timestamp"`
+		Signature         string `json:"tree_head_signature"`
 		SHA256RootHashB64 string `json:"sha256_root_hash"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
@@ -108,7 +128,19 @@ func (s *Scanner) fetchSTH(ctx context.Context, logURL string) (signedTreeHead, 
 	if err != nil || len(root) != 32 {
 		return signedTreeHead{}, fmt.Errorf("invalid STH root hash")
 	}
-	return signedTreeHead{TreeSize: payload.TreeSize, SHA256RootHash: root}, nil
+	sig, err := base64.StdEncoding.DecodeString(payload.Signature)
+	if err != nil || payload.TreeSize == 0 || payload.Timestamp == 0 || payload.Timestamp > uint64(time.Now().Add(5*time.Minute).UnixMilli()) {
+		return signedTreeHead{}, fmt.Errorf("invalid signed tree head")
+	}
+	body := make([]byte, 50)
+	body[1] = 1 // tree_hash signature type, RFC 6962 section 3.5
+	binary.BigEndian.PutUint64(body[2:10], payload.Timestamp)
+	binary.BigEndian.PutUint64(body[10:18], payload.TreeSize)
+	copy(body[18:], root)
+	if !verifyLogSignature(logID, body, sig) {
+		return signedTreeHead{}, fmt.Errorf("STH signature verification failed")
+	}
+	return signedTreeHead{TreeSize: payload.TreeSize, SHA256RootHash: root, Timestamp: payload.Timestamp}, nil
 }
 
 func (s *Scanner) fetchInclusionProof(ctx context.Context, logURL, leafHash string, treeSize uint64) (inclusionProof, error) {
@@ -146,9 +178,9 @@ func (s *Scanner) getCTJSON(ctx context.Context, endpoint string) ([]byte, error
 	}
 	req.Header.Set("User-Agent", ua)
 	req.Header.Set("Accept", "application/json")
-	client := s.client
+	client := s.evidenceClient
 	if client == nil {
-		client = http.DefaultClient
+		client = &http.Client{Timeout: 10 * time.Second}
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -182,8 +214,17 @@ func merkleLeafHashes(chain []*x509.Certificate, observation models.SCTObservati
 }
 
 func merkleLeafHash(entryType int, timestampMS uint64, extensions, payload, issuerKeyHash []byte) (string, bool) {
-	if len(payload) == 0 {
+	body, ok := ctSignedEntry(entryType, timestampMS, extensions, payload, issuerKeyHash)
+	if !ok {
 		return "", false
+	}
+	sum := sha256.Sum256(append([]byte{0x00}, body...))
+	return base64.StdEncoding.EncodeToString(sum[:]), true
+}
+
+func ctSignedEntry(entryType int, timestampMS uint64, extensions, payload, issuerKeyHash []byte) ([]byte, bool) {
+	if len(payload) == 0 || len(payload) > 0xffffff || len(extensions) > 65535 {
+		return nil, false
 	}
 	body := make([]byte, 0, 16+len(payload)+len(extensions)+len(issuerKeyHash))
 	body = append(body, 0) // MerkleTreeLeaf version
@@ -191,10 +232,10 @@ func merkleLeafHash(entryType int, timestampMS uint64, extensions, payload, issu
 	var ts [8]byte
 	binary.BigEndian.PutUint64(ts[:], timestampMS)
 	body = append(body, ts[:]...)
-	body = append(body, byte(entryType))
+	body = append(body, 0, byte(entryType))
 	if entryType == ctEntryPrecert {
 		if len(issuerKeyHash) != 32 {
-			return "", false
+			return nil, false
 		}
 		body = append(body, issuerKeyHash...)
 	}
@@ -204,8 +245,7 @@ func merkleLeafHash(entryType int, timestampMS uint64, extensions, payload, issu
 	binary.BigEndian.PutUint16(extLen[:], uint16(len(extensions)))
 	body = append(body, extLen[:]...)
 	body = append(body, extensions...)
-	sum := sha256.Sum256(append([]byte{0x00}, body...))
-	return base64.StdEncoding.EncodeToString(sum[:]), true
+	return body, true
 }
 
 func appendUint24(dst []byte, value int) []byte {

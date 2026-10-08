@@ -11,6 +11,7 @@ func TestParseSCTReadsLogIDAndTimestamp(t *testing.T) {
 	raw[0] = 0
 	copy(raw[1:33], bytesFromHex("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"))
 	binary.BigEndian.PutUint64(raw[33:41], 1_700_000_000_000)
+	raw = append(raw, 4, 3, 0, 1, 0) // structurally complete; not a verified signature
 	observation, ok := parseSCT(raw)
 	if !ok {
 		t.Fatal("expected a parseable SCT")
@@ -28,6 +29,7 @@ func TestParseSCTListReadsLengthPrefixedEntries(t *testing.T) {
 	item[0] = 0
 	copy(item[1:33], bytesFromHex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
 	binary.BigEndian.PutUint64(item[33:41], 42)
+	item = append(item, 4, 3, 0, 1, 0)
 	list := make([]byte, 2+2+len(item))
 	binary.BigEndian.PutUint16(list[0:2], uint16(2+len(item)))
 	binary.BigEndian.PutUint16(list[2:4], uint16(len(item)))

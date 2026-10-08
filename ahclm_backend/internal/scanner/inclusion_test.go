@@ -50,6 +50,7 @@ func TestSCTParseKeepsExtensions(t *testing.T) {
 	raw[42] = 2
 	raw[43] = 9
 	raw[44] = 8
+	raw = append(raw, 4, 3, 0, 1, 0) // structurally complete; not a verified signature
 	observation, ok := parseSCT(raw)
 	if !ok {
 		t.Fatal("expected parseable SCT")

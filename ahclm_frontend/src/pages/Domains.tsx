@@ -1,3 +1,4 @@
+import { statusLabel } from '@/lib/labels';
 import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
@@ -28,8 +29,8 @@ export default function Domains() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-white">Domains</h1>
-          <p className="text-slate-400 mt-1">Monitored domains and their current certificate state</p>
+          <h1 className="text-2xl font-bold text-white">域名</h1>
+          <p className="text-slate-400 mt-1">监测域名及其当前证书状态</p>
         </div>
       </div>
 
@@ -40,7 +41,7 @@ export default function Domains() {
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
             <input
               className="input pl-9"
-              placeholder="Search domain..."
+              placeholder="搜索域名…"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && setFilter((f) => ({ ...f, domain: search, page: 1 }))}
@@ -48,27 +49,27 @@ export default function Domains() {
           </div>
           <select className="input w-auto" value={filter.status ?? ''}
             onChange={(e) => setFilter((f) => ({ ...f, status: e.target.value, page: 1 }))}>
-            <option value="">All statuses</option>
-            <option value="active">Active</option>
-            <option value="unreachable">Unreachable</option>
-            <option value="dormant">Dormant</option>
+            <option value="">全部状态</option>
+            <option value="active">活跃</option>
+            <option value="unreachable">无法访问</option>
+            <option value="dormant">休眠</option>
           </select>
           <select className="input w-auto" value={filter.revocation ?? ''}
             onChange={(e) => setFilter((f) => ({ ...f, revocation: e.target.value, page: 1 }))}>
-            <option value="">Any revocation</option>
-            <option value="good">Good</option>
-            <option value="revoked">Revoked</option>
-            <option value="unknown">Unknown</option>
+            <option value="">全部吊销状态</option>
+            <option value="good">正常</option>
+            <option value="revoked">已吊销</option>
+            <option value="unknown">未知</option>
           </select>
           <select className="input w-auto" value={`${filter.sort_by}:${filter.sort_order}`}
             onChange={(e) => {
               const [sb, so] = e.target.value.split(':');
               setFilter((f) => ({ ...f, sort_by: sb, sort_order: so as 'asc' | 'desc', page: 1 }));
             }}>
-            <option value="tranco_rank:asc">Rank ↑</option>
-            <option value="next_scan_at:asc">Next scan ↑</option>
-            <option value="last_scanned_at:desc">Last scanned ↓</option>
-            <option value="change_count:desc">Most changes</option>
+            <option value="tranco_rank:asc">排名 ↑</option>
+            <option value="next_scan_at:asc">下次扫描 ↑</option>
+            <option value="last_scanned_at:desc">最近扫描 ↓</option>
+            <option value="change_count:desc">变更最多</option>
           </select>
         </div>
       </div>
@@ -80,14 +81,14 @@ export default function Domains() {
             <thead>
               <tr>
                 <th>#</th>
-                <th>Domain</th>
-                <th>Status</th>
-                <th>Revocation</th>
-                <th>Issuer</th>
-                <th>Expires</th>
-                <th>Changes</th>
-                <th>Last scan</th>
-                <th>Next scan</th>
+                <th>域名</th>
+                <th>状态</th>
+                <th>吊销状态</th>
+                <th>签发者</th>
+                <th>到期时间</th>
+                <th>变更次数</th>
+                <th>最近扫描</th>
+                <th>下次扫描</th>
               </tr>
             </thead>
             <tbody>
@@ -96,7 +97,7 @@ export default function Domains() {
               )}
               {!isLoading && rows.length === 0 && (
                 <tr><td colSpan={9} className="text-center py-8 text-slate-500">
-                  No domains yet. Fetch the Tranco list or run a scan.
+                  暂无域名，请获取 Tranco 列表或执行扫描。
                 </td></tr>
               )}
               {rows.map((d) => (
@@ -106,12 +107,12 @@ export default function Domains() {
                     <Link to={`/domains/${encodeURIComponent(d.domain)}`} className="text-primary-400 hover:underline flex items-center gap-2">
                       <Globe className="h-4 w-4 opacity-60" />{d.domain}
                       {d.ari_emergency && (
-                        <span className="status-badge critical" title="CA moved the ARI renewal window to now">ARI!</span>
+                        <span className="status-badge critical" title="CA 已将 ARI 续签窗口提前至当前">ARI!</span>
                       )}
                     </Link>
                   </td>
-                  <td><span className={`status-badge ${d.status}`}>{d.status}</span></td>
-                  <td><span className={`status-badge ${d.revocation_status}`}>{d.revocation_status}</span></td>
+                  <td><span className={`status-badge ${d.status}`}>{statusLabel(d.status)}</span></td>
+                  <td><span className={`status-badge ${d.revocation_status}`}>{statusLabel(d.revocation_status)}</span></td>
                   <td className="text-slate-400 truncate max-w-[160px]">{d.issuer || '—'}</td>
                   <td>
                     {d.not_after ? (
@@ -132,15 +133,15 @@ export default function Domains() {
       {pg && pg.total > 0 && (
         <div className="flex items-center justify-between text-sm">
           <span className="text-slate-400">
-            {(pg.page - 1) * pg.per_page + 1}–{Math.min(pg.page * pg.per_page, pg.total)} of {pg.total}
+            {(pg.page - 1) * pg.per_page + 1}–{Math.min(pg.page * pg.per_page, pg.total)} / 共 {pg.total}
           </span>
           <div className="flex gap-2">
-            <button className="btn btn-secondary" disabled={pg.page <= 1}
+            <button aria-label="上一页" className="btn btn-secondary" disabled={pg.page <= 1}
               onClick={() => setFilter((f) => ({ ...f, page: (f.page ?? 1) - 1 }))}>
               <ChevronLeft className="h-4 w-4" />
             </button>
             <span className="px-3 py-2">{pg.page} / {pg.total_pages}</span>
-            <button className="btn btn-secondary" disabled={pg.page >= pg.total_pages}
+            <button aria-label="下一页" className="btn btn-secondary" disabled={pg.page >= pg.total_pages}
               onClick={() => setFilter((f) => ({ ...f, page: (f.page ?? 1) + 1 }))}>
               <ChevronRight className="h-4 w-4" />
             </button>

@@ -112,7 +112,8 @@ func parseVerifiedCRL(raw []byte, issuer *x509.Certificate, now time.Time) *x509
 	if err != nil {
 		return nil
 	}
-	if !crl.NextUpdate.IsZero() && !crl.NextUpdate.After(now) {
+	if crl.ThisUpdate.IsZero() || crl.ThisUpdate.After(now.Add(5*time.Minute)) ||
+		crl.NextUpdate.IsZero() || !crl.NextUpdate.After(now) || crl.NextUpdate.Before(crl.ThisUpdate) {
 		return nil
 	}
 	if err := crl.CheckSignatureFrom(issuer); err != nil {

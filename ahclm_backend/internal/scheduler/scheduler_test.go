@@ -100,6 +100,29 @@ func TestComputeNextScan_AlignsToARINextPoll(t *testing.T) {
 	}
 }
 
+func TestRenewalWatcherUsesIndependentWindowAndARIStart(t *testing.T) {
+	now := base
+	notAfter := now.Add(20 * time.Hour)
+	window := 24 * time.Hour
+	if !renewalWatcherEligible(now, notAfter, nil, window) {
+		t.Fatal("certificate without ARI should enter watcher window")
+	}
+	if renewalWatcherEligible(now, now.Add(30*time.Hour), nil, window) {
+		t.Fatal("watcher should not use the broader ordinary near-expiry window")
+	}
+	ariStart := now.Add(time.Hour)
+	if renewalWatcherEligible(now, notAfter, &ariStart, window) {
+		t.Fatal("watcher must wait for the ARI window start")
+	}
+	ariStart = now.Add(-time.Hour)
+	if !renewalWatcherEligible(now, notAfter, &ariStart, window) {
+		t.Fatal("watcher should start after ARI opens inside the expiry window")
+	}
+	if renewalWatcherEligible(now, now, nil, window) {
+		t.Fatal("expired certificate must not start another watcher")
+	}
+}
+
 func TestComputeNextScanWithEvidence_AlignsToRevocationPoll(t *testing.T) {
 	cfg := testCfg()
 	notAfter := base.Add(100 * 24 * time.Hour)
@@ -142,6 +165,29 @@ func TestEvidenceCandidateAfter(t *testing.T) {
 	nearExpiryResult := &models.ScanResult{Success: true, Cert: &nearExpiryCert}
 	if !evidenceCandidateAfter(&nearExpiry, nearExpiryResult, base) {
 		t.Fatal("near-expiry certificate should trigger deep evidence")
+	}
+}
+
+func TestCDNVendorResultRecognizesMultipleProviders(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want string
+	}{
+		{name: "www.example.com.cdn.cloudflare.net", want: "cloudflare"},
+		{name: "global.prod.fastly.net", want: "fastly"},
+		{name: "d111111abcdef8.cloudfront.net", want: "cloudfront"},
+	} {
+		result := &models.ScanResult{Topology: &models.TopologySnapshot{CNAMEChain: []string{tc.name}}}
+		if got := cdnVendorResult(result); got != tc.want {
+			t.Errorf("cdnVendorResult(%q) = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+	result := &models.ScanResult{Topology: &models.TopologySnapshot{CNAMEChain: []string{
+		"global.prod.fastly.net",
+		"www.example.com.cdn.cloudflare.net",
+	}}}
+	if got := cdnVendorResult(result); got != "multi-cdn" {
+		t.Fatalf("multi-provider result = %q, want multi-cdn", got)
 	}
 }
 
@@ -256,5 +302,29 @@ func TestPriorityForExpiry(t *testing.T) {
 	}
 	if p := priorityForExpiry(base, base.Add(-24*time.Hour)); p != 85 {
 		t.Fatalf("expired priority = %d, want 85", p)
+	}
+}
+
+func TestInconclusiveProbeDoesNotForceRecheck(t *testing.T) {
+	if hasActionableTLSFinding([]models.TLSFinding{{Code: "endpoint_probe_inconclusive"}}) {
+		t.Fatal("an inconclusive probe forced an hourly recheck")
+	}
+	if !hasActionableTLSFinding([]models.TLSFinding{{Code: "hostname_mismatch"}}) {
+		t.Fatal("a real TLS finding did not force a recheck")
+	}
+}
+
+func TestRolloutInProgressFromAddressChange(t *testing.T) {
+	previous := []models.MeasurementSnapshot{{EndpointFingerprintsJSON: `{"198.18.0.1":"a","8.8.8.8":"a"}`}}
+	result := &models.ScanResult{EndpointProbes: []models.EndpointProbe{
+		{IPAddress: "198.18.0.1", Success: true, Fingerprint: "a"},
+		{IPAddress: "8.8.8.8", Success: true, Fingerprint: "b"},
+	}}
+	if !rolloutInProgress(result, previous, nil) {
+		t.Fatal("an address moving to a new leaf beside the old one is a rollout in progress")
+	}
+	steady := []models.MeasurementSnapshot{{EndpointFingerprintsJSON: `{"198.18.0.1":"a","8.8.8.8":"b"}`}}
+	if rolloutInProgress(result, steady, nil) {
+		t.Fatal("a steady two-leaf assignment was treated as a rollout")
 	}
 }

@@ -53,6 +53,10 @@ func analyzeChurnShapeWithSnapshots(changes []models.CertObservation, certs map[
 	universe := make(map[string]struct{}, len(changes)+1)
 	spkis := make(map[string]struct{})
 	sequence := make([]string, 0, len(changes))
+	dates := leafIssuanceDates(certs, changes, snapshots)
+	readings := classifyChanges(changes, dates)
+	var newestIssued time.Time
+	successors := make(map[string]struct{})
 	for index, change := range changes {
 		if previous := strings.TrimSpace(change.PreviousFingerprint); previous != "" {
 			universe[previous] = struct{}{}
@@ -61,22 +65,40 @@ func analyzeChurnShapeWithSnapshots(changes []models.CertObservation, certs map[
 		if fingerprint == "" {
 			continue
 		}
+		// Seeing a leaf again anywhere is a return only when it is older than
+		// the newest leaf already seen, or when dates are unknown. The newest
+		// leaf reaching another address is propagation, not a return.
+		_, seenBefore := universe[fingerprint]
+		issued, dated := dates[fingerprint]
+		returning := seenBefore && (!dated || issued.Before(newestIssued))
+		for _, leaf := range []string{strings.TrimSpace(change.PreviousFingerprint), fingerprint} {
+			if at, ok := dates[leaf]; ok && at.After(newestIssued) {
+				newestIssued = at
+			}
+		}
 		universe[fingerprint] = struct{}{}
 		sequence = append(sequence, fingerprint)
-		if _, repeat := seen[fingerprint]; repeat {
-			shape.RevisitEvents++
-		}
 		seen[fingerprint] = struct{}{}
 		if change.SPKIFingerprint != "" {
 			spkis[change.SPKIFingerprint] = struct{}{}
 		}
-		if coexistingLeaves(change) {
+		if coexistingLeaves(change) || sameRoundAddressSplit(change) {
 			shape.CoexistenceProofs++
 		}
-		switch endpointRelation(changes, index) {
-		case endpointSame:
+		reading := readings[index]
+		if returning || reading.Regression || reading.Kind == changePool {
+			shape.RevisitEvents++
+		}
+		switch reading.Kind {
+		case changeReplacement:
 			shape.SameEndpointChanges++
-		case endpointDifferent:
+			successors[fingerprint] = struct{}{}
+		case changePool:
+			// Several leaves served by one address at once: not a replacement.
+			shape.CrossEndpointChanges++
+		case changeUndated:
+			shape.UndatedEndpointChanges++
+		case changeOtherAddr:
 			shape.CrossEndpointChanges++
 		default:
 			shape.UnknownEndpointChanges++
@@ -87,6 +109,7 @@ func analyzeChurnShapeWithSnapshots(changes []models.CertObservation, certs map[
 			shape.AlternationEvents++
 		}
 	}
+	shape.ProvenSuccessors = len(successors)
 	shape.DistinctLeaves = len(seen)
 	shape.DistinctSPKIs = len(spkis)
 	if len(sequence) > 0 {
@@ -237,30 +260,49 @@ func issuanceCadenceDays(times []time.Time) float64 {
 }
 
 func interpretChurnShape(shape models.ChurnShape) string {
+	pool := shape.CoexistenceProofs > 0 || shape.RevisitEvents > 0
 	switch {
 	case shape.ChangeEvents < 2:
 		return models.ChurnUndetermined
-	// A round that saw the predecessor and the successor at the same time has
-	// proven they are deployed concurrently. No cadence argument can override a
-	// direct observation.
-	case shape.CoexistenceProofs > 0:
-		return models.ChurnSpatialMultiplexing
-	case shape.RevisitRatio >= 0.25:
-		return models.ChurnSpatialMultiplexing
-	case shape.RevisitEvents > 0:
+	// A same-address comparison is the only evidence of either mechanism:
+	// a later-issued successor proves replacement in time; two leaves at once
+	// or a step back to an older leaf proves concurrent deployment. When both
+	// are observed, both mechanisms are present. No ratio decides between them.
+	case pool && shape.SameEndpointChanges > 0:
 		return models.ChurnMixed
-	// Monotone from here on. Only a same-endpoint comparison can turn that into
-	// a replacement claim; a monotone sequence sampled from changing addresses
-	// is equally consistent with a large pool that we never sampled twice.
-	case shape.SameEndpointChanges > shape.CrossEndpointChanges:
-		return models.ChurnTemporalReplacement
-	case shape.CrossEndpointChanges > 0 && shape.SameEndpointChanges == 0:
-		return models.ChurnMixed
+	case pool:
+		return models.ChurnSpatialMultiplexing
 	case shape.SameEndpointChanges > 0:
 		return models.ChurnTemporalReplacement
+	case shape.CrossEndpointChanges > 0:
+		return models.ChurnMixed
 	default:
 		return models.ChurnUndetermined
 	}
+}
+
+// sameRoundAddressSplit reports whether this row's own endpoint survey reached
+// the main-handshake address and got a different leaf from it seconds later.
+func sameRoundAddressSplit(change models.CertObservation) bool {
+	ip := strings.TrimSpace(change.IPAddress)
+	if ip == "" || strings.TrimSpace(change.EndpointProbes) == "" {
+		return false
+	}
+	var probes []models.EndpointProbe
+	if json.Unmarshal([]byte(change.EndpointProbes), &probes) != nil {
+		return false
+	}
+	for _, probe := range probes {
+		if !probe.Success || probe.IPAddress != ip || probe.Fingerprint == "" {
+			continue
+		}
+		// The probe's own repeated handshakes to this address gave several
+		// leaves, or its leaf differs from the main handshake's.
+		if len(probe.OtherFingerprints) > 0 || probe.Fingerprint != change.Fingerprint {
+			return true
+		}
+	}
+	return false
 }
 
 // coexistingLeaves reports whether this change observation's own endpoint survey
@@ -310,6 +352,9 @@ const (
 // served what is now the predecessor, which makes the comparison recomputable
 // for rows written before the field existed.
 func endpointRelation(changes []models.CertObservation, index int) endpointComparison {
+	if changes[index].EndpointAttributionUncertain {
+		return endpointUnknown
+	}
 	current := strings.TrimSpace(changes[index].IPAddress)
 	if current == "" {
 		return endpointUnknown
@@ -367,10 +412,12 @@ func recoverChangeEndpoints(changes []models.CertObservation, snapshots []models
 			}
 		}
 		if strings.TrimSpace(change.PreviousIPAddress) == "" {
-			if ip := nearestEndpointFor(byFingerprint[strings.TrimSpace(change.PreviousFingerprint)], change.ObservedAt); ip != "" {
+			ip, ambiguous := nearestEndpointSelection(byFingerprint[strings.TrimSpace(change.PreviousFingerprint)], change.ObservedAt)
+			if ip != "" {
 				change.PreviousIPAddress = ip
 				recovered++
 			}
+			change.EndpointAttributionUncertain = ambiguous
 		}
 	}
 	return recovered
@@ -379,10 +426,16 @@ func recoverChangeEndpoints(changes []models.CertObservation, snapshots []models
 const recoveredEndpointWindow = 6 * time.Hour
 
 func nearestEndpointFor(appearances []leafAppearance, at time.Time) string {
+	ip, _ := nearestEndpointSelection(appearances, at)
+	return ip
+}
+
+func nearestEndpointSelection(appearances []leafAppearance, at time.Time) (string, bool) {
 	if len(appearances) == 0 || at.IsZero() {
-		return ""
+		return "", false
 	}
 	bestIP := ""
+	ambiguous := false
 	bestDelta := time.Duration(0)
 	found := false
 	for _, item := range appearances {
@@ -400,12 +453,15 @@ func nearestEndpointFor(appearances []leafAppearance, at time.Time) string {
 			found = true
 			bestDelta = delta
 			bestIP = item.ip
+			ambiguous = false
+		} else if delta == bestDelta && item.ip != bestIP {
+			ambiguous = true
 		}
 	}
-	if !found {
-		return ""
+	if !found || ambiguous {
+		return "", ambiguous
 	}
-	return bestIP
+	return bestIP, false
 }
 
 func issuerFamily(cert models.Certificate) string {
@@ -585,7 +641,7 @@ func analyzeCTCorroboration(snapshots []models.MeasurementSnapshot, shape models
 	sources := ctSources(snapshots)
 	sourceNote := ""
 	if len(sources) > 1 {
-		sourceNote = " Independent CT indexes (" + strings.Join(sources, ", ") + ") agree on the issuance count."
+		sourceNote = " Records were retrieved from CT indexes: " + strings.Join(sources, ", ") + "; agreement and completeness were not established."
 	} else if len(sources) == 1 {
 		sourceNote = " Issuances were retrieved from " + sources[0] + "."
 	}
@@ -593,9 +649,9 @@ func analyzeCTCorroboration(snapshots []models.MeasurementSnapshot, shape models
 	case issuances == 0:
 		return coverage, entries, issuances, models.CTUnavailable, "CT documents were retrieved but contained no dated issuance inside the observed window."
 	case shape.ChangeEvents > 0 && issuances*2 < shape.ChangeEvents:
-		return coverage, entries, issuances, models.CTContradicted,
+		return coverage, entries, issuances, models.CTUnavailable,
 			"Certificate Transparency records " + itoa(issuances) + " issuance(s) for this name, far fewer than the " + itoa(shape.ChangeEvents) +
-				" changes counted by scanning. The excess cannot be replacements and is consistent with sampling concurrently deployed certificates." + sourceNote
+				" changes counted by scanning. Incomplete indexes and certificates issued before deployment prevent this count from disproving observed replacements." + sourceNote
 	default:
 		return coverage, entries, issuances, models.CTCorroborated,
 			"Certificate Transparency records " + itoa(issuances) + " issuance(s), consistent with " + itoa(shape.EffectiveReplacements) + " measured replacement(s)." + sourceNote

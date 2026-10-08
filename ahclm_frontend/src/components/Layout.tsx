@@ -12,19 +12,21 @@ import {
   Menu,
   X,
   Activity,
+  Radar,
 } from 'lucide-react';
 import { useState } from 'react';
 
 const navigation = [
-  { name: 'Dashboard', href: '/dashboard', icon: LayoutDashboard },
-  { name: 'Domains', href: '/domains', icon: Globe },
-  { name: 'Schedule', href: '/schedule', icon: CalendarClock },
-  { name: 'Analytics', href: '/analytics', icon: BarChart3 },
-  { name: 'Anomalies', href: '/anomalies', icon: AlertTriangle },
-  { name: 'Scanning', href: '/scanning', icon: Scan },
+  { name: '总览', href: '/dashboard', icon: LayoutDashboard },
+  { name: '域名', href: '/domains', icon: Globe },
+  { name: '调度', href: '/schedule', icon: CalendarClock },
+  { name: '分析', href: '/analytics', icon: BarChart3 },
+  { name: '异常', href: '/anomalies', icon: AlertTriangle },
+  { name: '扫描', href: '/scanning', icon: Scan },
+  { name: 'CDN 传播', href: '/cdn-propagation', icon: Radar },
   { name: 'Tranco', href: '/tranco', icon: ListOrdered },
-  { name: 'Alerts', href: '/alerts', icon: Bell },
-  { name: 'Settings', href: '/settings', icon: Settings },
+  { name: '告警', href: '/alerts', icon: Bell },
+  { name: '设置', href: '/settings', icon: Settings },
 ];
 
 export default function Layout() {
@@ -43,6 +45,8 @@ export default function Layout() {
         <button
           type="button"
           className="p-2 text-slate-400 hover:text-white"
+          aria-label={mobileMenuOpen ? '关闭菜单' : '打开菜单'}
+          aria-expanded={mobileMenuOpen}
           onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
         >
           {mobileMenuOpen ? <X className="h-6 w-6" /> : <Menu className="h-6 w-6" />}
@@ -84,7 +88,7 @@ export default function Layout() {
             {!isAnomalyRoute && (
               <div>
                 <h1 className="font-bold text-lg">AHCLM</h1>
-                <p className="text-xs text-slate-400">Certificate Lifecycle Monitor</p>
+                <p className="text-xs text-slate-400">证书生命周期监测</p>
               </div>
             )}
           </div>
@@ -117,8 +121,8 @@ export default function Layout() {
           {!isAnomalyRoute && (
             <div className="p-4 border-t border-slate-700">
               <p className="text-xs text-slate-500 text-center">
-                Adaptive HTTPS Certificate<br />
-                Lifecycle Monitoring System
+                自适应 HTTPS 证书<br />
+                生命周期监测系统
               </p>
             </div>
           )}

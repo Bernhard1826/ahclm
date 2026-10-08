@@ -29,6 +29,209 @@ func TestAnomalyCauseIsMutuallyExclusive(t *testing.T) {
 	}
 }
 
+func TestSummaryCacheKeepsRecentlyInvalidatedSnapshotDuringCooldown(t *testing.T) {
+	now := time.Now()
+	want := []models.Anomaly{{Domain: "cached.example", Type: "revoked"}}
+	db := &Database{
+		anomalySummaryCache:         want,
+		anomalySummaryCacheAt:       now.Add(-time.Minute),
+		anomalySummaryInvalidatedAt: now.Add(-time.Second),
+	}
+
+	got, err := db.cachedAnomalySummary()
+	if err != nil {
+		t.Fatalf("cachedAnomalySummary returned an error: %v", err)
+	}
+	if len(got) != 1 || got[0].Domain != "cached.example" {
+		t.Fatalf("recently invalidated snapshot = %#v, want cached finding", got)
+	}
+}
+
+func TestSummaryCacheCoalescesRepeatedInvalidations(t *testing.T) {
+	db := &Database{
+		anomalySummaryCache:   []models.Anomaly{{Domain: "cached.example"}},
+		anomalySummaryCacheAt: time.Now(),
+	}
+	db.invalidateAnomalyCache()
+	firstInvalidation := db.anomalySummaryInvalidatedAt
+	if firstInvalidation.IsZero() {
+		t.Fatal("first invalidation was not recorded")
+	}
+
+	time.Sleep(time.Millisecond)
+	db.invalidateAnomalyCache()
+	if !db.anomalySummaryInvalidatedAt.Equal(firstInvalidation) {
+		t.Fatalf("repeated invalidation moved refresh deadline from %s to %s", firstInvalidation, db.anomalySummaryInvalidatedAt)
+	}
+	if len(db.anomalySummaryCache) != 1 {
+		t.Fatal("invalidation discarded the reusable summary snapshot")
+	}
+}
+
+func TestStripAnomalyAnalysisKeepsOnlyObservedEvidence(t *testing.T) {
+	items := []models.Anomaly{{
+		Reason:                "cause text",
+		CauseClassification:   "inferred",
+		ConfirmedReason:       "direct explanation",
+		InferredReason:        "hypothesis",
+		Evidence:              []string{"same_ip_replacements=3", "inference=possible", "same_ip_replacements=3"},
+		ConfirmedEvidence:     []string{"observed_at=2026-10-05T09:00:00Z"},
+		InferredEvidence:      []string{"inference=possible"},
+		EvidenceScope:         "scope",
+		EvidenceStatus:        "pending",
+		EvidencePendingReason: "additional probe pending",
+		Diagnosis:             &models.CauseDiagnosis{PrimaryCode: "hypothesis"},
+		FindingClass:          models.FindingInsufficient,
+	}}
+
+	stripAnomalyAnalysis(items)
+	item := items[0]
+	if item.Reason != "" || item.CauseClassification != "" || item.ConfirmedReason != "" || item.InferredReason != "" {
+		t.Fatalf("cause fields remained: %#v", item)
+	}
+	if item.Diagnosis != nil || item.FindingClass != "" || item.EvidenceStatus != "" || item.EvidenceScope != "" {
+		t.Fatalf("analysis metadata remained: %#v", item)
+	}
+	if len(item.InferredEvidence) != 0 || len(item.Evidence) != 1 || item.Evidence[0] != "same_ip_replacements=3" {
+		t.Fatalf("non-observed evidence was not removed: %#v", item.Evidence)
+	}
+	if len(item.ConfirmedEvidence) != 1 || item.ConfirmedEvidence[0] != "observed_at=2026-10-05T09:00:00Z" {
+		t.Fatalf("direct evidence was changed: %#v", item.ConfirmedEvidence)
+	}
+	if item.EvidencePendingReason != "additional probe pending" {
+		t.Fatalf("evidence note was removed: %q", item.EvidencePendingReason)
+	}
+}
+
+func TestAnomalyEvidenceClass(t *testing.T) {
+	tests := []struct {
+		name  string
+		item  models.Anomaly
+		class string
+	}{
+		{name: "direct certificate condition", item: models.Anomaly{Type: "hostname_mismatch"}, class: "deterministic"},
+		{name: "diagnosed incident", item: models.Anomaly{Type: "same_key", FindingClass: models.FindingIncident}, class: "deterministic"},
+		{name: "retained candidate", item: models.Anomaly{Type: "stale_after_change", FindingClass: models.FindingInsufficient}, class: "speculative"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			items := []models.Anomaly{tt.item}
+			stripAnomalyAnalysis(items)
+			if got := items[0].EvidenceClass; got != tt.class {
+				t.Fatalf("evidence class = %q, want %q", got, tt.class)
+			}
+		})
+	}
+}
+
+func TestClassifySummaryFindingsUsesEvidenceStrength(t *testing.T) {
+	items := []models.Anomaly{
+		{Type: models.ObsDeploymentFailure, OccurrenceCount: 3, Evidence: []string{"endpoint_probes=[...]"}},
+		{Type: models.ObsDeploymentFailure, OccurrenceCount: 2, Evidence: []string{`endpoint_probes=[{"success":true,"fingerprint":"defective-leaf","findings":[{"code":"hostname_mismatch"}],"covers_requested_name":false}]`}},
+		{Type: models.ObsStaleAfterChange, OccurrenceCount: 3, Evidence: []string{"endpoint_comparison=unknown", "endpoint_probes=[...]"}},
+		{Type: models.ObsStaleAfterChange, OccurrenceCount: 3, Evidence: []string{"endpoint_comparison=different_endpoint", "endpoint_probes=[...]"}},
+		{Type: models.ObsSameKey, OccurrenceCount: 2, Evidence: []string{"previous_fingerprint=old", "new_fingerprint=new", "endpoint_comparison=same_endpoint"}},
+		{Type: "early_renewal", OccurrenceCount: 1},
+	}
+	classifySummaryFindings(items)
+	if items[0].FindingClass != models.FindingInsufficient {
+		t.Fatalf("mixed endpoint candidate class = %q, want insufficient", items[0].FindingClass)
+	}
+	if items[1].FindingClass != models.FindingIncident {
+		t.Fatalf("direct endpoint defect should be deterministic, got class %q", items[1].FindingClass)
+	}
+	if items[2].FindingClass != models.FindingInsufficient {
+		t.Fatalf("unknown stale endpoint should remain speculative, got class %q", items[2].FindingClass)
+	}
+	if items[3].FindingClass != models.FindingIncident {
+		t.Fatalf("explicit stale endpoint comparison class = %q, want incident", items[3].FindingClass)
+	}
+	if items[4].FindingClass != models.FindingIncident {
+		t.Fatalf("same endpoint same-key class = %q, want incident", items[4].FindingClass)
+	}
+	if items[5].FindingClass != "" {
+		t.Fatalf("single early renewal should not be retained, got class %q", items[5].FindingClass)
+	}
+}
+
+func TestSummaryEndpointDefectsRequireObservedPrimaryCertificate(t *testing.T) {
+	tests := []struct {
+		name     string
+		evidence string
+		class    string
+	}{
+		{"observed hostname mismatch", `endpoint_probes=[{"success":true,"fingerprint":"leaf","covers_requested_name":false}]`, "deterministic"},
+		{"observed expiry finding", `endpoint_probes=[{"success":true,"fingerprint":"leaf","covers_requested_name":true,"findings":[{"code":"expired_endpoint"}]}]`, "deterministic"},
+		{"unreachable IPv6", `endpoint_probes=[{"success":false,"unobservable":true,"covers_requested_name":false,"error":"vantage has no IPv6 route"}]`, "speculative"},
+		{"failed handshake", `endpoint_probes=[{"success":false,"covers_requested_name":false}]`, "speculative"},
+		{"missing certificate", `endpoint_probes=[{"success":true,"covers_requested_name":false}]`, "speculative"},
+		{"legacy missing hostname check", `endpoint_probes=[{"success":true,"fingerprint":"leaf"}]`, "speculative"},
+		{"no SNI control mismatch", `endpoint_probes=[{"success":true,"fingerprint":"leaf","covers_requested_name":true,"selection_probes":[{"variant":"no_sni","success":true,"fingerprint":"default-leaf","covers_requested_name":false,"findings":[{"code":"hostname_mismatch"}]}]}]`, "speculative"},
+		{"default certificate comparison", `endpoint_probes=[{"success":true,"fingerprint":"leaf","covers_requested_name":true,"selection_analysis":{"selected_covers_requested_name":true,"default_covers_requested_name":false}}]`, "speculative"},
+		{"valid primary plus unreachable address", `endpoint_probes=[{"success":true,"fingerprint":"leaf","covers_requested_name":true},{"success":false,"unobservable":true,"covers_requested_name":false}]`, "speculative"},
+		{"unobservable row with retained identity", `endpoint_probes=[{"success":true,"unobservable":true,"fingerprint":"leaf","covers_requested_name":false}]`, "speculative"},
+		{"malformed evidence", `endpoint_probes=[{"success":true,"fingerprint":"leaf","covers_requested_name":false}`, "speculative"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			items := []models.Anomaly{{Type: models.ObsDeploymentFailure, OccurrenceCount: 2, Evidence: []string{tt.evidence}}}
+			classifySummaryFindings(items)
+			stripAnomalyAnalysis(items)
+			if got := items[0].EvidenceClass; got != tt.class {
+				t.Fatalf("evidence class = %q, want %q", got, tt.class)
+			}
+		})
+	}
+}
+
+func TestSummaryRetainsHighLikelihoodCandidatesAcrossLifecycleTypes(t *testing.T) {
+	items := []models.Anomaly{
+		{Type: models.ObsDeploymentFailure, OccurrenceCount: 2, Evidence: []string{"endpoint_probes=[...]"}},
+		{Type: models.ObsStaleAfterChange, OccurrenceCount: 2, Evidence: []string{"endpoint_probes=[...]", "endpoint_comparison=unknown"}},
+		{Type: models.ObsSameKey, OccurrenceCount: 2, Evidence: []string{"previous_fingerprint=old", "new_fingerprint=new", "endpoint_comparison=unknown"}},
+		{Type: "frequent_change", OccurrenceCount: 2, Evidence: []string{"distinct_replacement_leaves=2"}},
+		{Type: "early_renewal", OccurrenceCount: 2, Evidence: []string{"distinct_replacement_leaves=2"}},
+	}
+	classifySummaryFindings(items)
+	for _, item := range items {
+		if item.FindingClass != models.FindingInsufficient {
+			t.Fatalf("%s class = %q, want insufficient", item.Type, item.FindingClass)
+		}
+		if !isIssueRegisterFinding(item) {
+			t.Fatalf("%s speculative candidate was filtered from issue register", item.Type)
+		}
+	}
+}
+
+func TestAnomalyDiagnosisSubsetOnlyIncludesLifecycleFindings(t *testing.T) {
+	items := []models.Anomaly{
+		{Domain: "expired.example", Type: "expired_served"},
+		{Domain: "revoked.example", Type: "revoked"},
+		{Domain: "changed.example", Type: "frequent_change"},
+		{Domain: "stale.example", Type: models.ObsStaleAfterChange},
+		{Domain: "diverse.example", Type: models.ObsDeploymentFailure},
+		{Domain: "same-key.example", Type: models.ObsSameKey},
+		{Domain: "early.example", Type: "early_renewal"},
+	}
+	got := anomalyDiagnosisSubset(items)
+	if len(got) != 5 {
+		t.Fatalf("diagnosis subset length = %d, want 5: %#v", len(got), got)
+	}
+	want := map[string]bool{
+		"changed.example": true, "stale.example": true, "diverse.example": true,
+		"same-key.example": true, "early.example": true,
+	}
+	for _, item := range got {
+		if !want[item.Domain] {
+			t.Errorf("unexpected diagnosis row %s/%s", item.Domain, item.Type)
+		}
+		delete(want, item.Domain)
+	}
+	if len(want) != 0 {
+		t.Errorf("lifecycle findings omitted from diagnosis subset: %v", want)
+	}
+}
+
 func TestInferChurnDiagnosisFindsCadencedAutomatedRenewal(t *testing.T) {
 	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	changes := make([]models.CertObservation, 0, 4)
@@ -59,12 +262,49 @@ func TestInferChurnDiagnosisLeavesIrregularReplacementUnexplained(t *testing.T) 
 		{ObservationType: models.ObsChange, ObservedAt: t0.Add(3 * 24 * time.Hour), Fingerprint: "c", PreviousFingerprint: "b", PreviousSPKIFingerprint: "spki-b", SPKIFingerprint: "spki-c", DaysUntilExpiry: 160, IPAddress: "192.0.2.1"},
 		{ObservationType: models.ObsChange, ObservedAt: t0.Add(17 * 24 * time.Hour), Fingerprint: "d", PreviousFingerprint: "c", PreviousSPKIFingerprint: "spki-c", SPKIFingerprint: "spki-d", DaysUntilExpiry: 140, IPAddress: "192.0.2.1"},
 	}
-	diagnosis := inferChurnDiagnosis(models.Anomaly{Type: "frequent_change"}, diagnosisContext{observations: changes})
+	diagnosis := inferChurnDiagnosis(models.Anomaly{Type: "frequent_change"}, diagnosisContext{observations: changes, certificates: datedCerts("a", "b", "c", "d")})
 	if diagnosis.PrimaryCode == "key_security_rotation" {
 		t.Fatalf("a different public key was treated as a cause: %#v", diagnosis)
 	}
 	if diagnosis.PrimaryCode != "replacement_mechanism_unestablished" {
 		t.Fatalf("primary diagnosis = %q, want an unestablished replacement process: %#v", diagnosis.PrimaryCode, diagnosis)
+	}
+}
+
+func TestIncidentDrivenReissueRequiresRetainedIncidentSignal(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	changes := []models.CertObservation{
+		{ObservationType: models.ObsChange, ObservedAt: t0, Fingerprint: "b", PreviousFingerprint: "a", PreviousSPKIFingerprint: "spki-a", SPKIFingerprint: "spki-b", DaysUntilExpiry: 89, IPAddress: "192.0.2.1"},
+		{ObservationType: models.ObsChange, ObservedAt: t0.Add(2 * time.Hour), Fingerprint: "c", PreviousFingerprint: "b", PreviousSPKIFingerprint: "spki-b", SPKIFingerprint: "spki-c", DaysUntilExpiry: 89, IPAddress: "192.0.2.1"},
+		{ObservationType: models.ObsChange, ObservedAt: t0.Add(4 * time.Hour), Fingerprint: "d", PreviousFingerprint: "c", PreviousSPKIFingerprint: "spki-c", SPKIFingerprint: "spki-d", DaysUntilExpiry: 89, IPAddress: "192.0.2.1"},
+	}
+	diagnosis := inferChurnDiagnosis(models.Anomaly{Type: "frequent_change"}, diagnosisContext{observations: changes, certificates: datedCerts("a", "b", "c", "d")})
+	if diagnosis.PrimaryCode == "incident_driven_reissue" {
+		t.Fatalf("replacement without revocation or ARI emergency was labeled incident-driven: %#v", diagnosis)
+	}
+	for _, hypothesis := range diagnosis.Hypotheses {
+		if hypothesis.Code == "incident_driven_reissue" && hypothesis.Score != 0 {
+			t.Fatalf("incident hypothesis score = %.2f without incident evidence", hypothesis.Score)
+		}
+	}
+}
+
+func TestIncidentTriggerEvidenceNamesRevocationWithoutInventingReason(t *testing.T) {
+	at := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+	evidence := strings.Join(incidentTriggerEvidence(diagnosisContext{observations: []models.CertObservation{{
+		ObservationType:  models.ObsRevocationChange,
+		ObservedAt:       at,
+		Fingerprint:      "revoked-leaf",
+		RevocationStatus: models.RevocationRevoked,
+		RevocationReason: "unspecified",
+	}}}, 1), " ")
+	for _, want := range []string{"incident_signal=1", "revocation_observed", "fingerprint=revoked-leaf", "reason=unspecified"} {
+		if !strings.Contains(evidence, want) {
+			t.Fatalf("trigger evidence %q does not contain %q", evidence, want)
+		}
+	}
+	if strings.Contains(evidence, "private-key") || strings.Contains(evidence, "compromise") {
+		t.Fatalf("trigger evidence invented a revocation cause: %q", evidence)
 	}
 }
 
@@ -232,7 +472,7 @@ func TestRecoverChangeEndpointsFromSnapshots(t *testing.T) {
 		{ObservedAt: t0, EndpointFingerprintsJSON: `{"192.0.2.1":"new-a"}`},
 		{ObservedAt: t0.Add(24 * time.Hour), EndpointFingerprintsJSON: `{"192.0.2.1":"new-b"}`},
 	}
-	shape := analyzeChurnShapeWithSnapshots(changes, nil, snapshots)
+	shape := analyzeChurnShapeWithSnapshots(changes, datedCerts("old-a", "new-a", "new-b"), snapshots)
 	if shape.SameEndpointChanges < 1 {
 		t.Fatalf("snapshot recovery did not produce a same-endpoint comparison: %#v", shape)
 	}
@@ -334,7 +574,9 @@ func TestDivergenceUsesNamedVendorsWhenEveryEndpointIsIdentified(t *testing.T) {
 
 func TestDivergenceSameNamedCDNAcrossPrefixesIsNotMultiCDN(t *testing.T) {
 	mapJSON := func(value map[string]string) string { encoded, _ := json.Marshal(value); return string(encoded) }
-	assignment := mapJSON(map[string]string{"104.16.7.9": "a", "172.64.1.10": "b"})
+	// Earlier rounds saw the same leaves on other addresses of the same
+	// prefixes, so the per-address assignment is not stable (edge rotation).
+	assignment := mapJSON(map[string]string{"104.16.7.10": "a", "172.64.1.11": "b"})
 	probes := []models.EndpointProbe{
 		{IPAddress: "104.16.7.9", Success: true, Fingerprint: "a", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n"},
 		{IPAddress: "172.64.1.10", Success: true, Fingerprint: "b", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n"},
@@ -493,8 +735,8 @@ func TestDivergenceDefectiveEndpointInsideOneNetworkRemainsAnIncident(t *testing
 func TestDivergenceSeparatesStuckRolloutFromPropagation(t *testing.T) {
 	now := time.Now()
 	probes := []models.EndpointProbe{
-		{IPAddress: "192.0.2.1", Success: true, Fingerprint: "old", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n"},
-		{IPAddress: "192.0.2.2", Success: true, Fingerprint: "new", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n"},
+		{IPAddress: "192.0.2.1", Success: true, Fingerprint: "old", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n", NotBefore: issuedOld()},
+		{IPAddress: "192.0.2.2", Success: true, Fingerprint: "new", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n", NotBefore: issuedNew()},
 	}
 	inFlight := analyzeEndpointDivergence(probes, nil, "old", now.Add(-2*time.Hour), now)
 	if inFlight.Verdict != models.DivergencePropagating {
@@ -507,6 +749,7 @@ func TestDivergenceSeparatesStuckRolloutFromPropagation(t *testing.T) {
 }
 
 func TestDivergenceRequiresSameActiveEndpointAcrossRounds(t *testing.T) {
+	testRolloutReference(t, 0.99, repeatHours(10, 100)...)
 	mapJSON := func(value map[string]string) string { encoded, _ := json.Marshal(value); return string(encoded) }
 	topologyJSON := func(ips []string) string {
 		encoded, _ := json.Marshal(models.TopologySnapshot{ConsensusIPs: ips, PublicIPs: ips, ResolverQuorum: 2, ResolverAgreement: 1})
@@ -515,13 +758,16 @@ func TestDivergenceRequiresSameActiveEndpointAcrossRounds(t *testing.T) {
 	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 	assignment := mapJSON(map[string]string{"192.0.2.1": "old", "192.0.2.2": "new"})
 	probes := []models.EndpointProbe{
-		{IPAddress: "192.0.2.1", Success: true, Fingerprint: "old", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n"},
-		{IPAddress: "192.0.2.2", Success: true, Fingerprint: "new", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n"},
+		{IPAddress: "192.0.2.1", Success: true, Fingerprint: "old", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n", NotBefore: issuedOld()},
+		{IPAddress: "192.0.2.2", Success: true, Fingerprint: "new", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n", NotBefore: issuedNew()},
 	}
 	snapshots := []models.MeasurementSnapshot{
 		{ObservedAt: now.Add(-24 * time.Hour), ResolverQuorum: 2, ResolverAgreement: 1, EndpointFingerprintsJSON: assignment, TopologyJSON: topologyJSON([]string{"192.0.2.1", "192.0.2.2"})},
 		{ObservedAt: now.Add(-48 * time.Hour), ResolverQuorum: 2, ResolverAgreement: 1, EndpointFingerprintsJSON: assignment, TopologyJSON: topologyJSON([]string{"192.0.2.1", "192.0.2.2"})},
 		{ObservedAt: now.Add(-72 * time.Hour), ResolverQuorum: 2, ResolverAgreement: 1, EndpointFingerprintsJSON: assignment, TopologyJSON: topologyJSON([]string{"192.0.2.1", "192.0.2.2"})},
+		// Before the replacement both addresses served the predecessor, so
+		// 192.0.2.2 is observed moving from it to the successor.
+		{ObservedAt: now.Add(-96 * time.Hour), ResolverQuorum: 2, ResolverAgreement: 1, EndpointFingerprintsJSON: mapJSON(map[string]string{"192.0.2.1": "old", "192.0.2.2": "old"}), TopologyJSON: topologyJSON([]string{"192.0.2.1", "192.0.2.2"})},
 	}
 	divergence := analyzeEndpointDivergence(probes, snapshots, "old", now.Add(-96*time.Hour), now)
 	if !divergence.StrongEvidence || divergence.Verdict != models.DivergenceStuckRollout {
@@ -540,10 +786,13 @@ func TestDivergenceDoesNotTreatRetiredPredecessorAsActive(t *testing.T) {
 	topology, _ := json.Marshal(models.TopologySnapshot{ConsensusIPs: []string{"198.51.100.1"}, PublicIPs: []string{"198.51.100.1"}, ResolverQuorum: 2, ResolverAgreement: 1})
 	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 	probes := []models.EndpointProbe{
-		{IPAddress: "192.0.2.1", Success: true, Fingerprint: "old", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n"},
-		{IPAddress: "198.51.100.1", Success: true, Fingerprint: "new", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n"},
+		{IPAddress: "192.0.2.1", Success: true, Fingerprint: "old", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n", NotBefore: issuedOld()},
+		{IPAddress: "198.51.100.1", Success: true, Fingerprint: "new", IssuerCN: "CA", KeyAlgorithm: "RSA", SANsHash: "n", NotBefore: issuedNew()},
 	}
-	divergence := analyzeEndpointDivergence(probes, []models.MeasurementSnapshot{{ObservedAt: now.Add(-48 * time.Hour), ResolverQuorum: 2, ResolverAgreement: 1, EndpointFingerprintsJSON: mapJSON(map[string]string{"192.0.2.1": "old", "198.51.100.1": "new"}), TopologyJSON: string(topology)}}, "old", now.Add(-96*time.Hour), now)
+	divergence := analyzeEndpointDivergence(probes, []models.MeasurementSnapshot{
+		{ObservedAt: now.Add(-48 * time.Hour), ResolverQuorum: 2, ResolverAgreement: 1, EndpointFingerprintsJSON: mapJSON(map[string]string{"192.0.2.1": "old", "198.51.100.1": "new"}), TopologyJSON: string(topology)},
+		{ObservedAt: now.Add(-96 * time.Hour), ResolverQuorum: 2, ResolverAgreement: 1, EndpointFingerprintsJSON: mapJSON(map[string]string{"192.0.2.1": "old", "198.51.100.1": "old"}), TopologyJSON: string(topology)},
+	}, "old", now.Add(-96*time.Hour), now)
 	if divergence.StrongEvidence || divergence.Verdict == models.DivergenceStuckRollout {
 		t.Fatalf("retired predecessor was promoted to a stuck rollout: %#v", divergence)
 	}

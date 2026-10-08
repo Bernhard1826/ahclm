@@ -2,6 +2,8 @@ package scheduler
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -15,6 +17,7 @@ import (
 	"ahclm/internal/database"
 	"ahclm/internal/domainlist"
 	"ahclm/internal/models"
+	"ahclm/internal/propagation"
 	"ahclm/internal/scanner"
 	"ahclm/internal/tranco"
 )
@@ -40,10 +43,13 @@ type Scheduler struct {
 	trancoMu   sync.Mutex // serializes refreshes and population pruning
 	dispatchMu sync.Mutex // closes the pause/dispatch race during refresh
 
-	nowFn func() time.Time
+	nowFn       func() time.Time
+	afterCommit func(func())
+	resultErr   error
 
 	onScanComplete func(*models.ScanResult)
 	onAlert        func(*models.WebhookPayload)
+	propagation    *propagation.Manager
 }
 
 // SetLocalLists supplies the optional file-backed population. It is set by
@@ -51,6 +57,13 @@ type Scheduler struct {
 // compatible with existing callers and tests.
 func (s *Scheduler) SetLocalLists(cfg *models.LocalListsConfig) {
 	s.localLists = cfg
+}
+
+// SetPropagationManager attaches the independent CDN propagation worker. The
+// scheduler only creates an experiment after a same-endpoint replacement; the
+// worker owns all Globalping calls and follow-up rounds.
+func (s *Scheduler) SetPropagationManager(manager *propagation.Manager) {
+	s.propagation = manager
 }
 
 const (
@@ -216,6 +229,74 @@ func (s *Scheduler) scanOne(dc *models.DomainCertificate) {
 // events occurred, appends observations only for those, updates the domain's
 // current state and recomputes NextScanAt.
 func (s *Scheduler) processResult(dc *models.DomainCertificate, result *models.ScanResult) {
+	if dc == nil || result == nil {
+		return
+	}
+	var committed models.DomainCertificate
+	var effects []func()
+	err := s.db.WithDomainScanTransaction(dc.Domain, func(db *database.Database, current *models.DomainCertificate) error {
+		worker := &Scheduler{config: s.config, scanCfg: s.scanCfg, db: db, nowFn: s.nowFn, propagation: s.propagation}
+		worker.afterCommit = func(effect func()) { effects = append(effects, effect) }
+		if s.onAlert != nil {
+			worker.onAlert = func(p *models.WebhookPayload) { effects = append(effects, func() { s.onAlert(p) }) }
+		}
+		if s.onScanComplete != nil {
+			worker.onScanComplete = func(r *models.ScanResult) { effects = append(effects, func() { s.onScanComplete(r) }) }
+		}
+		observed := result.ScannedAt
+		if observed.IsZero() {
+			observed = s.now()
+			result.ScannedAt = observed
+		}
+		latest := current.LastScannedAt
+		if current.LastObservationAt != nil {
+			latest = *current.LastObservationAt
+		}
+		if !latest.IsZero() && observed.Before(latest) {
+			// Retain late evidence, but do not turn it into a backwards change or
+			// replace the state from a newer observation.
+			if result.Success {
+				if _, _, err := db.UpsertCertificate(result.Cert); err != nil {
+					return err
+				}
+				snapshotState := *current
+				worker.recordMeasurement(&snapshotState, result, "late_result")
+			}
+			current.ScanCount++
+			stat := models.DailyScanStat{TotalScans: 1}
+			if result.Success {
+				stat.SuccessfulScans = 1
+				stat.TotalScanMs = result.ScanDuration.Milliseconds()
+			} else {
+				stat.FailedScans = 1
+			}
+			if err := db.SaveDomainCertificate(current); err != nil {
+				return err
+			}
+			if err := db.BumpDailyStat(stat); err != nil {
+				return err
+			}
+			if worker.onScanComplete != nil {
+				worker.onScanComplete(result)
+			}
+		} else {
+			current.LastObservationAt = &observed
+			worker.processCurrentResult(current, result)
+		}
+		committed = *current
+		return worker.resultErr
+	})
+	if err != nil {
+		log.Printf("scheduler: commit result for %s: %v", dc.Domain, err)
+		return
+	}
+	*dc = committed
+	for _, effect := range effects {
+		effect()
+	}
+}
+
+func (s *Scheduler) processCurrentResult(dc *models.DomainCertificate, result *models.ScanResult) {
 	now := s.now()
 	stat := models.DailyScanStat{TotalScans: 1}
 
@@ -247,7 +328,9 @@ func (s *Scheduler) processResult(dc *models.DomainCertificate, result *models.S
 		}
 		dc.Priority = unreachablePriority
 		s.save(dc)
-		_ = s.db.BumpDailyStat(stat)
+		if err := s.db.BumpDailyStat(stat); err != nil {
+			s.resultErr = err
+		}
 		if s.onScanComplete != nil {
 			s.onScanComplete(result)
 		}
@@ -269,13 +352,33 @@ func (s *Scheduler) processResult(dc *models.DomainCertificate, result *models.S
 
 	cert, isNew, err := s.db.UpsertCertificate(result.Cert)
 	if err != nil {
+		s.resultErr = err
 		log.Printf("scheduler: upsert certificate for %s: %v", dc.Domain, err)
 		return
 	}
 	if isNew {
 		stat.NewCerts = 1
 	}
+	// Replacement observations must carry the persisted certificate ID even
+	// when this leaf was already known from another domain or earlier round.
+	result.Cert = cert
 
+	// All entry points (including manual scans) retain findings from every
+	// correct-SNI handshake, not just the initial connection.
+	for _, probe := range result.EndpointProbes {
+		for _, finding := range probe.Findings {
+			found := false
+			for _, existing := range result.TLSFindings {
+				if existing.Code == finding.Code && existing.IPAddress == finding.IPAddress && existing.Fingerprint == finding.Fingerprint {
+					found = true
+					break
+				}
+			}
+			if !found {
+				result.TLSFindings = append(result.TLSFindings, finding)
+			}
+		}
+	}
 	curDays := models.DaysUntil(cert.NotAfter, now)
 	findingsJSON, _ := json.Marshal(result.TLSFindings)
 	if string(findingsJSON) != dc.TLSFindings && (len(result.TLSFindings) > 0 || (dc.TLSFindings != "" && dc.TLSFindings != "null" && dc.TLSFindings != "[]")) {
@@ -321,7 +424,7 @@ func (s *Scheduler) processResult(dc *models.DomainCertificate, result *models.S
 		dc.TopologyResolverAgreement = result.Topology.ResolverAgreement
 	}
 
-	replacements := sameIPReplacements(previousEndpointStates, currentEndpointLeaves(result))
+	replacements := withoutSplitAddresses(withoutReturningLeaves(sameIPReplacements(previousEndpointStates, currentEndpointLeaves(result)), previousSnapshots), result)
 	switch {
 	case !hasPrev:
 		s.appendObs(s.newObs(dc.Domain, cert, models.ObsInitial, "", curDays, result))
@@ -329,36 +432,45 @@ func (s *Scheduler) processResult(dc *models.DomainCertificate, result *models.S
 		stat.ChangesDetected = 1
 		dc.ChangeCount += len(replacements)
 		dc.LastChangedAt = &now
-		obs := s.newObs(dc.Domain, cert, models.ObsChange, "", curDays, result)
-		obs.PreviousFingerprint = replacements[0].Previous
-		obs.PreviousIPAddress = replacements[0].IP
-		obs.ChangeClass = models.ChangeClassReplacement
-		if len(replacements) == 1 {
-			obs.Notes = "Same endpoint " + replacements[0].IP + " served a different leaf than in the previous round."
-		} else {
-			obs.Notes = fmt.Sprintf("%d live endpoints replaced their leaf in this round; new or retired addresses are not counted.", len(replacements))
-		}
-		if previous, e := s.db.GetCertificateByFingerprint(obs.PreviousFingerprint); e == nil {
-			obs.PreviousSPKIFingerprint = previous.SPKIFingerprint
-			if obs.PreviousSPKIFingerprint == "" {
-				obs.PreviousSPKIFingerprint = models.SPKIFingerprintFromRaw(previous.RawCert)
+		for _, replacement := range replacements {
+			next := s.endpointCertificate(replacement, result)
+			endpointResult := *result
+			endpointResult.Cert = next
+			endpointResult.ConnectionInfo = &models.ConnectionInfo{IPAddress: replacement.IP}
+			// The main handshake's revocation verdict is not evidence for a
+			// different endpoint leaf.
+			if next.Fingerprint != cert.Fingerprint {
+				endpointResult.RevocationStatus = models.RevocationNotChecked
+				endpointResult.RevocationCheckedVia = models.CheckedViaNone
+				endpointResult.RevocationCheckedAt = nil
+				endpointResult.RevokedAt = nil
+				endpointResult.RevocationReason = ""
 			}
+			days := 0
+			if !next.NotAfter.IsZero() {
+				days = models.DaysUntil(next.NotAfter, now)
+			}
+			obs := s.newObs(dc.Domain, next, models.ObsChange, "", days, &endpointResult)
+			obs.PreviousFingerprint = replacement.Previous
+			obs.PreviousIPAddress = replacement.IP
+			obs.ChangeClass = models.ChangeClassReplacement
+			obs.Notes = "Same endpoint " + replacement.IP + " served a different leaf than in the previous round."
+			if previous, err := s.db.GetCertificateByFingerprint(replacement.Previous); err == nil {
+				obs.PreviousSPKIFingerprint = previous.SPKIFingerprint
+				if obs.PreviousSPKIFingerprint == "" {
+					obs.PreviousSPKIFingerprint = models.SPKIFingerprintFromRaw(previous.RawCert)
+				}
+			}
+			s.appendObs(obs)
+			if obs.PreviousSPKIFingerprint != "" && obs.PreviousSPKIFingerprint == next.SPKIFingerprint {
+				sameKey := *obs
+				sameKey.ID = 0
+				sameKey.ObservationType = models.ObsSameKey
+				sameKey.Notes = "The leaf changed at this endpoint while its SPKI remained unchanged; this is not evidence of private-key compromise."
+				s.appendObs(&sameKey)
+			}
+			s.fireAlert("certificate_changed", dc.Domain, next, "", "Certificate changed on endpoint "+replacement.IP)
 		}
-		s.appendObs(obs)
-		if obs.PreviousSPKIFingerprint != "" && obs.PreviousSPKIFingerprint == cert.SPKIFingerprint {
-			sameKey := s.newObs(dc.Domain, cert, models.ObsSameKey, "", curDays, result)
-			sameKey.PreviousFingerprint = obs.PreviousFingerprint
-			sameKey.PreviousSPKIFingerprint = obs.PreviousSPKIFingerprint
-			sameKey.ChangeClass = models.ChangeClassReplacement
-			// The reason text claims same-key replacement "at the observed
-			// endpoint". Carry the endpoint that served the predecessor so that
-			// claim stays reproducible from the row alone.
-			sameKey.PreviousIPAddress = obs.PreviousIPAddress
-			sameKey.Notes = "The leaf certificate changed on the same endpoint while the SPKI fingerprint remained unchanged; this confirms same-key replacement, not private-key compromise."
-			s.appendObs(sameKey)
-		}
-		s.fireAlert("certificate_changed", dc.Domain, cert, "",
-			fmt.Sprintf("Certificate for %s changed on the same endpoint", dc.Domain))
 	}
 
 	// A stale event requires a quorum-confirmed DNS transition *and* direct
@@ -379,7 +491,12 @@ func (s *Scheduler) processResult(dc *models.DomainCertificate, result *models.S
 			obs := s.newObs(dc.Domain, cert, models.ObsDeploymentFailure, "", curDays, result)
 			encoded, _ := json.Marshal(result.EndpointProbes)
 			obs.EndpointProbes = string(encoded)
-			obs.PreviousFingerprint = prevFP
+			// Only a leaf the main handshake actually moved away from is a
+			// predecessor. The unchanged main-handshake leaf is the leaf of the
+			// first sorted address, not an older certificate.
+			if certificateChanged {
+				obs.PreviousFingerprint = prevFP
+			}
 			obs.Notes = "Sampled current DNS endpoints served different leaf fingerprints. This proves certificate diversity, not deployment failure; intentional CDN or dual-certificate configurations may explain it."
 			s.appendObs(obs)
 		}
@@ -519,7 +636,7 @@ func (s *Scheduler) processResult(dc *models.DomainCertificate, result *models.S
 	if result.RevokedAt != nil {
 		dc.RevokedAt = result.RevokedAt
 		dc.RevocationReason = result.RevocationReason
-	} else if result.RevocationStatus != models.RevocationRevoked {
+	} else if certificateChanged || result.RevocationStatus == models.RevocationGood {
 		dc.RevokedAt = nil
 		dc.RevocationReason = ""
 	}
@@ -599,7 +716,13 @@ func (s *Scheduler) processResult(dc *models.DomainCertificate, result *models.S
 		ariNextPoll = dc.ARINextPollAt
 	}
 	dc.NextScanAt = computeNextScanWithEvidence(s.config, now, cert.NotAfter, dc.ARIWindowStart, ariNextPoll, dc.RevocationNextCheckAt, dc.ARIEmergency)
-	if len(result.TLSFindings) > 0 || (hasMixedDeployment(result.EndpointProbes) && dc.EndpointDiversityStatus == "transitioning") {
+	// Recheck soon only when a later round can add evidence: a real TLS
+	// finding, or a rollout in progress whose duration and ordering are only
+	// as precise as the gap between rounds. An inconclusive probe (timeout,
+	// sampling cap) or an address this vantage cannot reach does not get
+	// better by being asked again an hour later.
+	rolloutActive := rolloutInProgress(result, previousSnapshots, replacements)
+	if hasActionableTLSFinding(result.TLSFindings) || rolloutActive {
 		recheck := now.Add(s.config.MinGap)
 		if recheck.Before(dc.NextScanAt) {
 			dc.NextScanAt = recheck
@@ -609,6 +732,11 @@ func (s *Scheduler) processResult(dc *models.DomainCertificate, result *models.S
 		dc.NextScanAt = *dc.ResidualNextCheckAt
 	}
 	dc.Priority = priorityForExpiry(now, cert.NotAfter)
+	// A rollout in progress is measured only while it lasts: queue its
+	// recheck ahead of routine baseline rounds so the hour gap is kept.
+	if rolloutActive && dc.Priority < rolloutPriority {
+		dc.Priority = rolloutPriority
+	}
 	if dc.RevocationStatus == models.RevocationRevoked && dc.Priority < 95 {
 		dc.Priority = 95
 	}
@@ -616,10 +744,45 @@ func (s *Scheduler) processResult(dc *models.DomainCertificate, result *models.S
 		dc.Priority = 95
 	}
 	s.save(dc)
-	_ = s.db.BumpDailyStat(stat)
+	propagate := func() {
+		if s.propagation != nil {
+			if renewalWatcherEligible(now, cert.NotAfter, dc.ARIWindowStart, s.propagation.WatchWindow()) {
+				watchSince := now
+				if dc.ARIWindowStart != nil && !now.Before(*dc.ARIWindowStart) {
+					watchSince = *dc.ARIWindowStart
+				}
+				vendor := cdnVendorResult(result)
+				if _, err := s.propagation.StartRenewalWatcher(dc.Domain, vendor, watchSince, cert.NotAfter); err != nil {
+					log.Printf("scheduler: start CDN edge watcher for %s (%s): %v", dc.Domain, vendor, err)
+				}
+			}
+		}
+		if len(replacements) > 0 && s.propagation != nil {
+			replacement := replacements[0]
+			if _, err := s.propagation.StartOnCertificateChange(dc.Domain, replacement.Previous, replacement.Current, now, cdnVendorResult(result)); err != nil {
+				log.Printf("scheduler: start CDN propagation experiment for %s: %v", dc.Domain, err)
+			}
+		}
+	}
+	if s.afterCommit != nil {
+		s.afterCommit(propagate)
+	} else {
+		propagate()
+	}
+	if err := s.db.BumpDailyStat(stat); err != nil {
+		s.resultErr = err
+	}
 	if s.onScanComplete != nil {
 		s.onScanComplete(result)
 	}
+}
+
+func renewalWatcherEligible(now, notAfter time.Time, ariWindowStart *time.Time, watchWindow time.Duration) bool {
+	remaining := notAfter.Sub(now)
+	if watchWindow <= 0 || remaining <= 0 || remaining > watchWindow {
+		return false
+	}
+	return ariWindowStart == nil || !now.Before(*ariWindowStart)
 }
 
 // classifyCertificateChange decides what a fingerprint difference between two
@@ -634,6 +797,31 @@ type sameIPReplacement struct {
 	IP       string
 	Previous string
 	Current  string
+}
+
+func (s *Scheduler) endpointCertificate(replacement sameIPReplacement, result *models.ScanResult) *models.Certificate {
+	if result.Cert != nil && result.Cert.Fingerprint == replacement.Current {
+		return result.Cert
+	}
+	if cert, err := s.db.GetCertificateByFingerprint(replacement.Current); err == nil {
+		return cert
+	}
+	cert := &models.Certificate{Fingerprint: replacement.Current}
+	for _, p := range result.EndpointProbes {
+		if p.IPAddress != replacement.IP || p.Fingerprint != replacement.Current {
+			continue
+		}
+		cert.SPKIFingerprint = p.SPKIFingerprint
+		cert.CommonName, cert.IssuerCN, cert.SerialNumber = p.CommonName, p.IssuerCN, p.SerialNumber
+		cert.SANs = marshalString(p.SANs)
+		if p.NotBefore != nil {
+			cert.NotBefore = *p.NotBefore
+		}
+		if p.NotAfter != nil {
+			cert.NotAfter = *p.NotAfter
+		}
+	}
+	return cert
 }
 
 func parseEndpointStatesJSON(raw string) map[string]models.EndpointState {
@@ -690,6 +878,80 @@ func sameIPReplacements(previous map[string]models.EndpointState, current map[st
 	}
 	sort.Slice(replacements, func(i, j int) bool { return replacements[i].IP < replacements[j].IP })
 	return replacements
+}
+
+// withoutReturningLeaves drops "replacements" whose new leaf this same address
+// already served in a retained earlier round. Renewal does not return to a
+// retired certificate; an address switching back to one is a pool of servers
+// behind that address being sampled. The newest leaf reaching another address
+// is propagation and is kept.
+func withoutReturningLeaves(replacements []sameIPReplacement, previous []models.MeasurementSnapshot) []sameIPReplacement {
+	if len(replacements) == 0 || len(previous) == 0 {
+		return replacements
+	}
+	served := make(map[string]map[string]struct{})
+	for _, snapshot := range previous {
+		for address, leaf := range endpointFingerprintSetFromSnapshot(snapshot) {
+			if served[address] == nil {
+				served[address] = make(map[string]struct{})
+			}
+			served[address][leaf] = struct{}{}
+		}
+		var probes []models.EndpointProbe
+		if json.Unmarshal([]byte(snapshot.EndpointProbesJSON), &probes) == nil {
+			for _, p := range probes {
+				if !p.Success || p.IPAddress == "" {
+					continue
+				}
+				if served[p.IPAddress] == nil {
+					served[p.IPAddress] = map[string]struct{}{}
+				}
+				for _, fp := range append([]string{p.Fingerprint}, p.OtherFingerprints...) {
+					if fp != "" {
+						served[p.IPAddress][fp] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+	kept := replacements[:0]
+	for _, replacement := range replacements {
+		if _, returning := served[replacement.IP][replacement.Current]; !returning {
+			kept = append(kept, replacement)
+		}
+	}
+	return kept
+}
+
+// withoutSplitAddresses drops addresses that gave the main handshake and the
+// endpoint probe different leaves in this round: the address serves several
+// leaves at once, so its difference from the last round is not a replacement.
+func withoutSplitAddresses(replacements []sameIPReplacement, result *models.ScanResult) []sameIPReplacement {
+	if len(replacements) == 0 || result == nil || result.Cert == nil || result.ConnectionInfo == nil {
+		return replacements
+	}
+	mainIP := strings.TrimSpace(result.ConnectionInfo.IPAddress)
+	split := make(map[string]bool)
+	for _, probe := range result.EndpointProbes {
+		if !probe.Success || probe.Fingerprint == "" {
+			continue
+		}
+		// Several handshakes to this address in this round gave different
+		// leaves, or the main handshake and the probe disagreed on it.
+		if len(probe.OtherFingerprints) > 0 || (probe.IPAddress == mainIP && probe.Fingerprint != result.Cert.Fingerprint) {
+			split[probe.IPAddress] = true
+		}
+	}
+	if len(split) == 0 {
+		return replacements
+	}
+	kept := replacements[:0]
+	for _, replacement := range replacements {
+		if !split[replacement.IP] {
+			kept = append(kept, replacement)
+		}
+	}
+	return kept
 }
 
 func classifyCertificateChange(result *models.ScanResult, previousFingerprint, currentFingerprint, previousIP, currentIP string) string {
@@ -966,10 +1228,37 @@ func (s *Scheduler) recordMeasurement(dc *models.DomainCertificate, result *mode
 			})
 		}
 	}
+	for _, probe := range endpoints {
+		leaves := append([]models.EndpointProbe{probe}, probe.OtherLeaves...)
+		for _, leaf := range leaves {
+			der, err := base64.StdEncoding.DecodeString(leaf.RawCert)
+			if err != nil || len(der) == 0 {
+				continue
+			}
+			parsed, err := x509.ParseCertificate(der)
+			if err != nil || models.Fingerprint(parsed) != leaf.Fingerprint {
+				continue
+			}
+			if _, _, err := s.db.UpsertCertificate(models.FromX509Cert(parsed, observedAt)); err != nil {
+				s.resultErr = err
+				log.Printf("scheduler: store endpoint leaf: %v", err)
+			}
+		}
+	}
 	fingerprintMap := endpointFingerprintSet(endpoints)
 	allFingerprints := make(map[string]struct{})
 	for _, fp := range fingerprintMap {
 		allFingerprints[fp] = struct{}{}
+	}
+	for _, probe := range endpoints {
+		if !probe.Success {
+			continue
+		}
+		for _, fp := range probe.OtherFingerprints {
+			if fp != "" {
+				allFingerprints[fp] = struct{}{}
+			}
+		}
 	}
 	snapshot := models.MeasurementSnapshot{
 		Domain: dc.Domain, ObservedAt: observedAt, Trigger: trigger,
@@ -985,18 +1274,24 @@ func (s *Scheduler) recordMeasurement(dc *models.DomainCertificate, result *mode
 		snapshot.TopologyJSON = marshalString(result.Topology)
 	}
 	snapshot.EndpointFingerprintsJSON = marshalString(fingerprintMap)
+	if len(endpoints) > 0 {
+		snapshot.EndpointProbesJSON = marshalString(endpoints)
+	}
 	if result.DeepEvidence != nil {
 		snapshot.CAAJSON = marshalString(result.DeepEvidence.CAA)
 		snapshot.CTJSON = marshalString(result.DeepEvidence.CT)
 		snapshot.SCTJSON = marshalString(result.DeepEvidence.SCTs)
 		snapshot.HTTPJSON = marshalString(result.DeepEvidence.HTTP)
 		snapshot.DirectoryJSON = marshalString(result.DeepEvidence.Directory)
+		snapshot.RelatedNamesJSON = marshalString(result.DeepEvidence.RelatedNames)
+		snapshot.GlobalProbesJSON = marshalString(result.DeepEvidence.GlobalProbes)
 		snapshot.ErrorsJSON = marshalString(result.DeepEvidence.Errors)
 	}
 	if strings.TrimSpace(snapshot.SCTJSON) == "" && result.ConnectionInfo != nil && len(result.ConnectionInfo.SCTs) > 0 {
 		snapshot.SCTJSON = marshalString(result.ConnectionInfo.SCTs)
 	}
 	if err := s.db.SaveMeasurementSnapshot(&snapshot); err != nil {
+		s.resultErr = err
 		log.Printf("scheduler: save measurement snapshot for %s: %v", dc.Domain, err)
 	}
 	// Maintain a compact per-address state on the domain row for fast API reads.
@@ -1009,7 +1304,16 @@ func (s *Scheduler) recordMeasurement(dc *models.DomainCertificate, result *mode
 		at := observedAt
 		dc.LastDeepMeasurementAt = &at
 	}
-	if len(fingerprintMap) == 0 {
+	splitAddress := false
+	for _, p := range endpoints {
+		if p.Success && len(p.OtherFingerprints) > 0 {
+			splitAddress = true
+		}
+	}
+	if splitAddress {
+		dc.EndpointDiversityStatus = "concurrent_leaves"
+		dc.EndpointDiversityRounds = 0
+	} else if len(fingerprintMap) == 0 {
 		dc.EndpointDiversityStatus = "unknown"
 	} else if len(allFingerprints) < 2 {
 		dc.EndpointDiversityStatus = "uniform"
@@ -1163,14 +1467,96 @@ func copyObservationTime(value *time.Time) *time.Time {
 
 func (s *Scheduler) appendObs(obs *models.CertObservation) {
 	if err := s.db.AppendObservation(obs); err != nil {
+		s.resultErr = err
 		log.Printf("scheduler: append observation (%s/%s): %v", obs.Domain, obs.ObservationType, err)
 	}
 }
 
 func (s *Scheduler) save(dc *models.DomainCertificate) {
 	if err := s.db.SaveDomainCertificate(dc); err != nil {
+		s.resultErr = err
 		log.Printf("scheduler: save domain %s: %v", dc.Domain, err)
 	}
+}
+
+func cdnVendorResult(result *models.ScanResult) string {
+	if result == nil {
+		return ""
+	}
+	var vendors []string
+	if result.Topology != nil {
+		vendors = append(vendors, models.CDNVendorsFromNames(result.Topology.CNAMEChain)...)
+		vendors = append(vendors, models.CDNVendorsFromNames(result.Topology.HTTPSTargets)...)
+		vendors = append(vendors, models.CDNVendorsFromNames(result.Topology.NSHosts)...)
+	}
+	if result.DeepEvidence != nil {
+		vendors = append(vendors, models.CDNVendorFromHTTPFingerprint(result.DeepEvidence.HTTP)...)
+		if result.DeepEvidence.Directory != nil {
+			for _, endpoint := range result.DeepEvidence.Directory.Endpoints {
+				if endpoint.Vendor != "" {
+					vendors = append(vendors, endpoint.Vendor)
+				}
+			}
+		}
+	}
+	for _, endpoint := range result.EndpointProbes {
+		if vendor := models.CDNVendorFromAddress(endpoint.IPAddress); vendor != "" {
+			vendors = append(vendors, vendor)
+		}
+	}
+	if result.ConnectionInfo != nil {
+		if vendor := models.CDNVendorFromAddress(result.ConnectionInfo.IPAddress); vendor != "" {
+			vendors = append(vendors, vendor)
+		}
+	}
+	sort.Strings(vendors)
+	first := ""
+	for i, vendor := range vendors {
+		if vendor == "" || (i > 0 && vendor == vendors[i-1]) {
+			continue
+		}
+		if first != "" {
+			return "multi-cdn"
+		}
+		first = vendor
+	}
+	return first
+}
+
+// rolloutPriority queues rechecks of a rollout in progress ahead of routine
+// baseline rounds (30) and of certificates more than a week from expiry.
+const rolloutPriority = 75
+
+func hasActionableTLSFinding(findings []models.TLSFinding) bool {
+	for _, finding := range findings {
+		if finding.Code != "endpoint_probe_inconclusive" {
+			return true
+		}
+	}
+	return false
+}
+
+// rolloutInProgress reports whether this round shows a certificate change
+// still moving across the domain's addresses: an address replaced its leaf
+// since its last observation, or several leaves are served and at least one
+// address serves a different leaf than in the previous round.
+func rolloutInProgress(result *models.ScanResult, previous []models.MeasurementSnapshot, replacements []sameIPReplacement) bool {
+	if result == nil {
+		return false
+	}
+	if len(replacements) > 0 {
+		return true
+	}
+	if !hasMixedDeployment(result.EndpointProbes) || len(previous) == 0 {
+		return false
+	}
+	before := endpointFingerprintSetFromSnapshot(previous[0])
+	for address, leaf := range endpointFingerprintSet(result.EndpointProbes) {
+		if was, ok := before[address]; ok && was != leaf {
+			return true
+		}
+	}
+	return false
 }
 
 func hasMixedDeployment(probes []models.EndpointProbe) bool {
@@ -1246,15 +1632,18 @@ func (s *Scheduler) scanForScheduler(ctx context.Context, dc *models.DomainCerti
 	if due || evidenceCandidateAfter(dc, result, now) {
 		result.MeasurementTrigger = "candidate"
 		s.scanner.Enrich(ctx, result)
+		s.attachRelatedNameEvidence(ctx, dc, result)
 	}
 	if endpointProbeCandidate(dc, result) {
 		// Probe both sides of a topology transition. Retired addresses are not
 		// part of the current DNS answer, but they are exactly where stale edge
 		// configuration can be proven or falsified.
-		result.EndpointProbes = s.scanner.ProbeEndpoints(ctx, dc.Domain, appendUniqueIPs(parseIPs(dc.ResolvedIPs), result.ResolvedIPs...))
+		result.EndpointProbes = s.scanner.ProbeEndpointsRotated(ctx, dc.Domain, appendUniqueIPs(parseIPs(dc.ResolvedIPs), result.ResolvedIPs...), dc.ScanCount)
 		result.MeasurementTrigger = "endpoint_survey"
 		for _, probe := range result.EndpointProbes {
-			if !probe.Success {
+			// An address this vantage cannot reach is unobserved, not a
+			// failed endpoint; it is kept on the probe, not raised as a finding.
+			if !probe.Success && !probe.Unobservable {
 				result.TLSFindings = append(result.TLSFindings, models.TLSFinding{Code: "endpoint_probe_inconclusive", Detail: "Additional endpoint probe did not obtain a certificate: " + probe.Error, IPAddress: probe.IPAddress})
 			}
 			for _, finding := range probe.Findings {
@@ -1380,7 +1769,7 @@ func (s *Scheduler) ScanNow(domain string) (*models.ScanResult, error) {
 	job := s.startJob(domain, "manual_scan", s.now())
 	ctx, cancel := context.WithTimeout(context.Background(), s.config.ScanTimeout)
 	defer cancel()
-	result, err := s.scanner.ScanWithRetry(ctx, domain)
+	result, err := s.scanner.ScanFreshWithRetry(ctx, domain)
 	if err != nil {
 		result = &models.ScanResult{
 			Domain:                domain,
@@ -1395,11 +1784,49 @@ func (s *Scheduler) ScanNow(domain string) (*models.ScanResult, error) {
 		}
 	}
 	if result != nil && result.Success && (dc.CurrentFingerprint == "" || dc.CurrentFingerprint != result.Cert.Fingerprint || endpointProbeCandidate(dc, result)) {
-		result.EndpointProbes = s.scanner.ProbeEndpoints(ctx, domain, appendUniqueIPs(parseIPs(dc.ResolvedIPs), result.ResolvedIPs...))
+		result.EndpointProbes = s.scanner.ProbeEndpointsRotated(ctx, domain, appendUniqueIPs(parseIPs(dc.ResolvedIPs), result.ResolvedIPs...), dc.ScanCount)
+	}
+	if result != nil && result.Success {
+		s.attachRelatedNameEvidence(ctx, dc, result)
 	}
 	s.processResult(dc, result)
 	s.finishJob(job, result)
 	return result, nil
+}
+
+// attachRelatedNameEvidence follows certificate SAN transitions outward to
+// the current public DNS/TLS/HTTP state of those names. This runs only during
+// a deep/manual round and stays bounded by scanner.related_name_probe_limit.
+func (s *Scheduler) attachRelatedNameEvidence(ctx context.Context, dc *models.DomainCertificate, result *models.ScanResult) {
+	if s == nil || s.db == nil || s.scanner == nil || dc == nil || result == nil || result.DeepEvidence == nil || s.scanCfg == nil || s.scanCfg.RelatedNameProbeLimit <= 0 {
+		return
+	}
+	// Ask for a wider historical window than one probe round. The scanner
+	// rotates over it using ScanCount, so large preview-name sets are covered
+	// over successive deep measurements without unbounded fan-out.
+	candidates, err := s.db.GetRelatedNameCandidates(dc.Domain, s.scanCfg.RelatedNameProbeLimit*8)
+	if err != nil {
+		result.DeepEvidence.Errors = append(result.DeepEvidence.Errors, "related SAN candidates: "+err.Error())
+		return
+	}
+	if len(candidates) == 0 {
+		return
+	}
+	rotation := dc.ScanCount
+	for _, candidate := range candidates {
+		if candidate.NeedsPriorityProbe {
+			// Resolve incomplete public evidence first; only rotate once every
+			// changed name has a conclusive public DNS outcome.
+			rotation = 0
+			break
+		}
+	}
+	// Root scans can spend their complete deadline on CT or revocation. Changed
+	// SAN follow-up gets its own bounded budget so a timeout there is recorded
+	// as a root-scan limitation, not as a false statement about the subdomain.
+	probeCtx, cancel := context.WithTimeout(context.Background(), s.scanCfg.RelatedNameProbeTimeout)
+	defer cancel()
+	result.DeepEvidence.RelatedNames = s.scanner.ProbeRelatedNames(probeCtx, dc.Domain, candidates, rotation, result.Topology, result.Cert, result.DeepEvidence.HTTP)
 }
 
 // ScanBatchNow scans many domains concurrently and persists each result. Batch
@@ -1435,7 +1862,7 @@ func (s *Scheduler) ScanBatchNow(domains []string, workers int) ([]*models.ScanR
 			}
 			job := s.startJob(d, "manual_batch_scan", s.now())
 			ctx, cancel := context.WithTimeout(context.Background(), s.config.ScanTimeout)
-			result, err := s.scanner.ScanWithRetry(ctx, d)
+			result, err := s.scanner.ScanFreshWithRetry(ctx, d)
 			if err != nil {
 				result = &models.ScanResult{
 					Domain:                d,
@@ -1452,8 +1879,12 @@ func (s *Scheduler) ScanBatchNow(domains []string, workers int) ([]*models.ScanR
 				errs = append(errs, err)
 				mu.Unlock()
 			}
-			if result != nil && result.Success && (dc.CurrentFingerprint == "" || dc.CurrentFingerprint != result.Cert.Fingerprint || endpointProbeCandidate(dc, result)) {
-				result.EndpointProbes = s.scanner.ProbeEndpoints(ctx, d, appendUniqueIPs(parseIPs(dc.ResolvedIPs), result.ResolvedIPs...))
+			// An explicit batch scan is an operator-requested evidence round, so
+			// sample endpoints even when the leaf and single-address topology look
+			// unchanged. This is how one-address cases receive SNI/no-SNI controls.
+			if result != nil && result.Success && result.Cert != nil {
+				result.EndpointProbes = s.scanner.ProbeEndpointsRotated(ctx, d, appendUniqueIPs(parseIPs(dc.ResolvedIPs), result.ResolvedIPs...), dc.ScanCount)
+				s.attachRelatedNameEvidence(ctx, dc, result)
 			}
 			cancel()
 			s.processResult(dc, result)

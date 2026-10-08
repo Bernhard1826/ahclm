@@ -67,7 +67,7 @@ func TestSCTCorroborationNamesChromeAndAppleLists(t *testing.T) {
 
 func TestSCTCorroborationCountsInclusionProofs(t *testing.T) {
 	scts, _ := json.Marshal([]models.SCTObservation{
-		{LogID: "aa", Inclusion: models.SCTInclusionProven, ChromeListed: true, Qualified: true},
+		{LogID: "aa", Inclusion: models.SCTInclusionProven, SignatureVerified: true, STHVerified: true, ChromeListed: true, Qualified: true},
 	})
 	presented, _, _, _, _, included, note := analyzeSCTCorroboration([]models.MeasurementSnapshot{{SCTJSON: string(scts)}})
 	if !presented || included != 1 || !strings.Contains(note, "inclusion") {

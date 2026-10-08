@@ -52,7 +52,7 @@ func confidenceCeiling(corroboration *models.EvidenceCorroboration, discriminate
 		return "low"
 	}
 	independent := 0
-	if corroboration.CTStatus == models.CTCorroborated || corroboration.CTStatus == models.CTContradicted || corroboration.SCTPresented || corroboration.SCTInclusionProofs > 0 {
+	if corroboration.CTStatus == models.CTCorroborated || corroboration.SCTVerified || corroboration.SCTInclusionProofs > 0 {
 		independent++
 	}
 	if corroboration.EndpointCoverage >= 0.5 {
@@ -65,6 +65,13 @@ func confidenceCeiling(corroboration *models.EvidenceCorroboration, discriminate
 		independent++
 	}
 	if corroboration.DNSSECValidated {
+		independent++
+	}
+	// A matching result from an external multi-region probe is independent of
+	// this collector's local resolver and network. Mere remote reachability is
+	// not enough: it must corroborate the same predecessor or locally validated
+	// defective leaf.
+	if corroboration.GlobalProbeRegions >= 2 && (corroboration.GlobalPredecessorRegions > 0 || corroboration.GlobalDefectiveRegions > 0) {
 		independent++
 	}
 	if discriminated {

@@ -1,3 +1,4 @@
+import { reasonLabel } from '@/lib/labels';
 import { useQuery } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { CalendarClock } from 'lucide-react';
@@ -27,25 +28,25 @@ export default function Schedule() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-bold text-white">Adaptive Scan Schedule</h1>
+        <h1 className="text-2xl font-bold text-white">自适应扫描调度</h1>
         <p className="text-slate-400 mt-1">
-          Each domain is rescanned as its certificate approaches expiry milestones
-          {sched?.milestones ? ` (${sched.milestones.join(', ')} days before expiry)` : ''}.
+          证书接近到期里程碑时，会对相应域名进行复扫
+          {sched?.milestones ? `（到期前 ${sched.milestones.join('、')} 天）` : ''}。
         </p>
       </div>
 
       <div className="card flex flex-wrap gap-6 items-center">
         <div>
-          <p className="text-sm text-slate-400">Scheduler</p>
+          <p className="text-sm text-slate-400">调度器</p>
           <p className="text-xl font-bold">
             <span className={`status-badge ${sched?.paused ? 'warning' : 'good'}`}>
-              {sched?.enabled ? (sched?.paused ? 'paused' : 'running') : 'disabled'}
+              {sched?.enabled ? (sched?.paused ? '已暂停' : '运行中') : '已禁用'}
             </span>
           </p>
         </div>
-        <div><p className="text-sm text-slate-400">Due now</p><p className="text-xl font-bold">{sched?.queue_status?.pending ?? '—'}</p></div>
-        <div><p className="text-sm text-slate-400">Running</p><p className="text-xl font-bold">{sched?.queue_status?.running ?? '—'}</p></div>
-        <div><p className="text-sm text-slate-400">Completed today</p><p className="text-xl font-bold">{sched?.queue_status?.completed ?? '—'}</p></div>
+        <div><p className="text-sm text-slate-400">待扫描</p><p className="text-xl font-bold">{sched?.queue_status?.pending ?? '—'}</p></div>
+        <div><p className="text-sm text-slate-400">运行中</p><p className="text-xl font-bold">{sched?.queue_status?.running ?? '—'}</p></div>
+        <div><p className="text-sm text-slate-400">今日已完成</p><p className="text-xl font-bold">{sched?.queue_status?.completed ?? '—'}</p></div>
       </div>
 
       <div className="card p-0 overflow-hidden">
@@ -53,18 +54,18 @@ export default function Schedule() {
           <table className="table">
             <thead>
               <tr>
-                <th>Next scan</th>
-                <th>When</th>
-                <th>Domain</th>
-                <th>Reason</th>
-                <th>Expires in</th>
-                <th>Priority</th>
+                <th>下次扫描</th>
+                <th>距现在</th>
+                <th>域名</th>
+                <th>原因</th>
+                <th>距到期</th>
+                <th>优先级</th>
               </tr>
             </thead>
             <tbody>
               {isLoading && <tr><td colSpan={6} className="text-center py-8"><div className="spinner mx-auto" /></td></tr>}
               {!isLoading && entries.length === 0 && (
-                <tr><td colSpan={6} className="text-center py-8 text-slate-500">No scans scheduled yet.</td></tr>
+                <tr><td colSpan={6} className="text-center py-8 text-slate-500">暂无扫描计划。</td></tr>
               )}
               {entries.map((e) => (
                 <tr key={e.domain}>
@@ -75,7 +76,7 @@ export default function Schedule() {
                       <CalendarClock className="h-4 w-4 opacity-60" />{e.domain}
                     </Link>
                   </td>
-                  <td className="text-slate-300">{e.reason}</td>
+                  <td className="text-slate-300">{reasonLabel(e.reason)}</td>
                   <td>{e.current_fingerprint ? fmtDays(e.days_until_expiry) : '—'}</td>
                   <td><span className={`status-badge ${priorityBadge(e.priority)}`}>{e.priority}</span></td>
                 </tr>

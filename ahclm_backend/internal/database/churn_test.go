@@ -48,8 +48,10 @@ func TestChurnShapeDetectsAlternatingCertificatePool(t *testing.T) {
 	if shape.EffectiveReplacements != 1 {
 		t.Fatalf("effective replacements = %d, want 1 for a two-certificate pool", shape.EffectiveReplacements)
 	}
-	if shape.RevisitEvents != 44 || shape.AlternationEvents != 44 {
-		t.Fatalf("revisit/alternation counts = %d/%d, want 44/44: %#v", shape.RevisitEvents, shape.AlternationEvents, shape)
+	// Only the first change reaches a new leaf; the other 45 return to one of
+	// the two, including the first change's predecessor.
+	if shape.RevisitEvents != 45 || shape.AlternationEvents != 44 {
+		t.Fatalf("revisit/alternation counts = %d/%d, want 45/44: %#v", shape.RevisitEvents, shape.AlternationEvents, shape)
 	}
 }
 
@@ -124,7 +126,7 @@ func TestChurnShapeKeepsMonotoneSameEndpointAsReplacement(t *testing.T) {
 		changeRow(t0.Add(30*24*time.Hour), "leaf-1", "leaf-2", "spki-1", "spki-2", "192.0.2.1"),
 		changeRow(t0.Add(60*24*time.Hour), "leaf-2", "leaf-3", "spki-2", "spki-3", "192.0.2.1"),
 	}
-	shape := analyzeChurnShape(changes, nil)
+	shape := analyzeChurnShape(changes, datedCerts("leaf-0", "leaf-1", "leaf-2", "leaf-3"))
 	if shape.Interpretation != models.ChurnTemporalReplacement {
 		t.Fatalf("interpretation = %q, want temporal replacement: %#v", shape.Interpretation, shape)
 	}
@@ -146,8 +148,11 @@ func TestInferChurnDiagnosisRecognizesShortLivedAutomation(t *testing.T) {
 		previous := "leaf-" + string(rune('a'+index))
 		current := "leaf-" + string(rune('b'+index))
 		changes = append(changes, changeRow(t0.Add(time.Duration(index*48)*time.Hour), previous, current, "spki-shared", "spki-shared", "192.0.2.1"))
-		certs[current] = models.Certificate{Fingerprint: current, Issuer: "CA", IssuerCN: "CA", ValidityDays: 6, NotBefore: t0, NotAfter: t0.Add(6 * 24 * time.Hour)}
-		certs[previous] = certs[current]
+		issued := t0.Add(time.Duration(index*48) * time.Hour)
+		certs[current] = models.Certificate{Fingerprint: current, Issuer: "CA", IssuerCN: "CA", ValidityDays: 6, NotBefore: issued, NotAfter: issued.Add(6 * 24 * time.Hour)}
+		if _, ok := certs[previous]; !ok {
+			certs[previous] = models.Certificate{Fingerprint: previous, Issuer: "CA", IssuerCN: "CA", ValidityDays: 6, NotBefore: issued.Add(-48 * time.Hour), NotAfter: issued.Add(4 * 24 * time.Hour)}
+		}
 	}
 	diagnosis := inferChurnDiagnosis(models.Anomaly{Type: "frequent_change"}, diagnosisContext{observations: changes, certificates: certs})
 	if diagnosis.PrimaryCode != "short_lived_certificate_automation" {
@@ -161,10 +166,8 @@ func TestInferChurnDiagnosisRecognizesShortLivedAutomation(t *testing.T) {
 	}
 }
 
-// Certificate Transparency is the only independent record of issuance. When it
-// logs far fewer issuances than the scan counted changes, the excess cannot be
-// replacements.
-func TestCTCorroborationContradictsInflatedChangeCount(t *testing.T) {
+// An incomplete CT index cannot disprove changes observed at endpoints.
+func TestCTCountCannotDisproveObservedReplacements(t *testing.T) {
 	observed := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
 	issued := observed.Add(-10 * 24 * time.Hour)
 	entries, _ := json.Marshal([]models.CTObservation{
@@ -177,8 +180,8 @@ func TestCTCorroborationContradictsInflatedChangeCount(t *testing.T) {
 	if issuances != 2 {
 		t.Fatalf("issuances = %d, want 2 distinct serials", issuances)
 	}
-	if status != models.CTContradicted {
-		t.Fatalf("status = %q, want the count to be contradicted", status)
+	if status != models.CTUnavailable {
+		t.Fatalf("status = %q, want insufficient CT evidence", status)
 	}
 	if note == "" {
 		t.Fatal("a contradiction must say what it contradicts")
@@ -203,7 +206,7 @@ func TestConfidenceCeilingRequiresIndependentChannels(t *testing.T) {
 	if got := confidenceCeiling(full, true, true); got != "high" {
 		t.Fatalf("ceiling = %q, want high when every channel is present", got)
 	}
-	sctOnly := &models.EvidenceCorroboration{CTStatus: models.CTUnavailable, SCTPresented: true, EndpointCoverage: 0.8}
+	sctOnly := &models.EvidenceCorroboration{CTStatus: models.CTUnavailable, SCTPresented: true, SCTVerified: true, EndpointCoverage: 0.8}
 	if got := confidenceCeiling(sctOnly, false, false); got != "medium" {
 		t.Fatalf("ceiling = %q, want handshake SCTs to count as the issuance channel", got)
 	}
